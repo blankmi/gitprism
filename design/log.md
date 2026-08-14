@@ -23,3 +23,14 @@
 **Update**: Added the `playbooks/` bundle and [playbooks/0001](playbooks/0001-gitlab-pipeline-triggers.md) — GitLab CI trigger setup (push for source→dest, push-piggyback + manual + schedule for dest→source) is deployment guidance, not a gitprism architecture decision, since the tool is trigger-agnostic by construction.
 
 **Update**: Decided [decisions/0010](decisions/0010-preserve-author-stamp-committer.md) (preserve author, gitprism stamps committer — matching git's own cherry-pick/rebase convention) and [decisions/0011](decisions/0011-exclude-list-is-gitignore-syntax.md) (exclude-list is `.gitprismignore`, exact `.gitignore` syntax, self-excluding by default). These close out the remaining open questions from `requirements/0001`.
+
+## 2026-08-14
+
+**Update**: First code lands. All architecture decisions were stable and no
+requirements were open, so this was a scaffolding choice, not a design decision:
+`cargo init`, `clap` (derive) for the CLI, `anyhow` for error handling. Three
+subcommands stubbed out matching the design directly — `setup` (decisions/0006),
+`sync` (playbooks/0001 — one command, both directions, per configured pair),
+`resolve <pair>` (decisions/0008) — each currently just fails loudly with "not yet
+implemented" rather than pretending to work. No git logic yet; no config format
+decided yet (`--config` flag exists but nothing parses it).
