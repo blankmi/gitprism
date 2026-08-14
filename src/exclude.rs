@@ -6,7 +6,6 @@
 //! gitprism's own control files — `.gitprismignore` and `.gitprism.toml`
 //! (decisions/0012) — as excluded, whether or not they're listed.
 
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -34,19 +33,6 @@ impl ExcludeList {
             .context("building .gitprismignore matcher")?;
 
         Ok(ExcludeList { matcher })
-    }
-
-    /// Load `.gitprismignore` from `root` (the directory it lives in). A
-    /// missing file means nothing is excluded beyond the file's own automatic
-    /// self-exclusion — analogous to a repo with no `.gitignore` at all.
-    pub fn load(root: &Path) -> Result<ExcludeList> {
-        let path = root.join(FILENAME);
-
-        match fs::read_to_string(&path) {
-            Ok(contents) => Self::from_contents(&contents),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::from_contents(""),
-            Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
-        }
     }
 
     /// Whether `path` (relative to source's root) must not reach dest.
@@ -78,8 +64,6 @@ impl ExcludeList {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
-
     use super::*;
 
     #[test]
@@ -134,24 +118,4 @@ mod tests {
         assert!(list.is_excluded(Path::new(crate::config::FILENAME), false));
     }
 
-    #[test]
-    fn load_treats_a_missing_file_as_no_exclusions() {
-        let dir = tempdir().unwrap();
-
-        let list = ExcludeList::load(dir.path()).expect("missing .gitprismignore is not an error");
-
-        assert!(!list.is_excluded(Path::new("anything.txt"), false));
-        assert!(list.is_excluded(Path::new(FILENAME), false));
-    }
-
-    #[test]
-    fn load_reads_patterns_from_the_file_on_disk() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join(FILENAME), "secret.txt\n").unwrap();
-
-        let list = ExcludeList::load(dir.path()).unwrap();
-
-        assert!(list.is_excluded(Path::new("secret.txt"), false));
-        assert!(!list.is_excluded(Path::new("public.txt"), false));
-    }
 }

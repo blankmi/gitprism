@@ -5,7 +5,7 @@
 //!
 //! - `setup`   — the one-time graft in decisions/0006.
 //! - `sync`    — the recurring job in playbooks/0001; handles both sync
-//!               directions for every configured branch pair in one run.
+//!   directions for every configured branch pair in one run.
 //! - `resolve` — the conflict-resolution helper in decisions/0008.
 
 use std::path::PathBuf;

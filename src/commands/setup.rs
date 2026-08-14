@@ -90,9 +90,8 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     // Mirrors `.gitprism.toml`'s own bootstrap handling (decisions/0012): the
     // user prepares both control files locally, uncommitted, before running
-    // `setup`. A missing `.gitprismignore` is not an error — same as
-    // `ExcludeList::load` already treats it elsewhere — it just means nothing
-    // is excluded yet.
+    // `setup`. A missing `.gitprismignore` is not an error — it just means
+    // nothing is excluded yet.
     let ignore_path = source_root.join(exclude::FILENAME);
     let ignore_raw = match fs::read_to_string(&ignore_path) {
         Ok(contents) => contents,
