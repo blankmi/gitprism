@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod exclude;
 
 use clap::Parser;
 
