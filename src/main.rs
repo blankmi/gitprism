@@ -2,6 +2,9 @@ mod cli;
 mod commands;
 mod config;
 mod exclude;
+mod git;
+
+use std::path::Path;
 
 use clap::Parser;
 
@@ -11,7 +14,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Setup => commands::setup::run(&cli.config),
+        Commands::Setup => commands::setup::run(Path::new("."), &cli.config),
         Commands::Sync => commands::sync::run(&cli.config),
         Commands::Resolve { pair } => commands::resolve::run(&cli.config, pair),
     }

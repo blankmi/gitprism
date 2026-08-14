@@ -7,6 +7,7 @@ status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-14T00:00:00Z }
 verified:
   - { by: "human:michael.blank@evia.de", at: 2026-08-14T00:00:00Z }
+  - { by: "human:michael.blank@evia.de", at: 2026-08-14T01:00:00Z }
 ---
 
 # Context
@@ -34,7 +35,11 @@ same as any other source-only file.
 This does surface one wrinkle `.gitprismignore` didn't have:
 [decisions/0006](0006-setup-uses-real-shared-history.md) makes `setup` the operation
 that creates source's *first* commit. There is no committed history for a versioned
-config to live in yet at the moment `setup` needs to read it.
+config to live in yet at the moment `setup` needs to read it — but, same as `git`
+itself never auto-`init`s a repository for any other command, that's a gap in
+*history*, not in the repository's existence: the user runs `git init` (or already
+has) exactly once, same precondition any other git command has, and `setup` reads
+`.gitprism.toml` off disk into that empty repo, not into thin air.
 
 # Decision
 
@@ -50,13 +55,19 @@ config to live in yet at the moment `setup` needs to read it.
   convention as `.gitprismignore` itself
   ([decisions/0011](0011-exclude-list-is-gitignore-syntax.md)'s "Consequences"
   flagged this exact case: future gitprism control files should follow suit).
-* **Bootstrap sequencing for `setup`**: the user writes `.gitprism.toml` locally,
-  uncommitted — there is no repo yet to commit it into. `gitprism setup --config
-  <path>` reads it straight off disk, fetches dest, and creates source's first commit
-  with dest's tree plus `.gitprism.toml` and `.gitprismignore`, parented on dest's tip.
-  Every subsequent command reads the config from source's committed tree like any
-  other versioned file — no separate "first run" config path to maintain past that
-  one command.
+* **Bootstrap sequencing for `setup`**: the user has already run `git init` in
+  source's directory — gitprism itself never creates a git repository, matching
+  `git`'s own convention of erroring rather than silently initializing one outside a
+  repo — and writes `.gitprism.toml` locally, uncommitted, since there's no committed
+  history yet to have put it in. `gitprism setup --config <path>` reads it straight
+  off disk, fetches dest, and creates source's first commit with dest's tree plus
+  `.gitprism.toml` and `.gitprismignore`, parented on dest's tip. Every subsequent
+  command reads the config from source's committed tree like any other versioned
+  file — no separate "first run" config path to maintain past that one command.
+  Like `git` itself, gitprism takes no separate source-location config or flag:
+  `setup` discovers source's repo by walking upward from the current directory,
+  exactly as `git` would, and a relative `--config` path resolves against that
+  discovered root, not against whatever subdirectory it was invoked from.
 * **Schema** (fields only; exact TOML shape is an implementation detail, not a
   design fork):
   * committer identity: name, email (decisions/0010)
@@ -89,3 +100,8 @@ config to live in yet at the moment `setup` needs to read it.
   change, not a redeploy of something external.
 * `.gitprism.toml` never needs listing inside `.gitprismignore` itself, same
   guarantee `.gitprismignore` already gives itself.
+* `gitprism setup` requires an existing, completely empty repository (no commits, no
+  branches) at or above where it's invoked — it errors loudly like any other git
+  command run outside a repository, rather than auto-`init`-ing one, and it refuses to
+  run against a repo that already has history rather than grafting on top of or
+  checking out over whatever's already there.

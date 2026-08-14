@@ -44,6 +44,15 @@ pub struct BranchPair {
 }
 
 impl Config {
+    /// Parse already-read config contents.
+    ///
+    /// Split out from [`Config::load`] so `setup` can reuse the exact raw
+    /// bytes it read off disk for the graft commit's blob (decisions/0012),
+    /// without reading the file a second time.
+    pub fn parse(raw: &str, path: &Path) -> Result<Config> {
+        toml::from_str(raw).with_context(|| format!("parsing config at {}", path.display()))
+    }
+
     /// Load from an arbitrary filesystem path.
     ///
     /// `setup` reads this off disk before source has a first commit to
@@ -54,7 +63,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("reading config at {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))
+        Self::parse(&raw, path)
     }
 }
 

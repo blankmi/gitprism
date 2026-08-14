@@ -41,3 +41,14 @@ user already adds themselves), self-excluding like `.gitprismignore`
 ([decisions/0011](decisions/0011-exclude-list-is-gitignore-syntax.md)). `setup`
 reads it from disk before source's first commit exists, since source has no history
 yet at that point; every later command reads it from the committed tree.
+
+**Update**: First `setup` implementation lands, plus a clarification to
+[decisions/0012](decisions/0012-config-versioned-in-source.md): "no repo yet" at
+`setup` time means no *commit history* yet, not no git repository — `setup` requires
+an already-`git init`'d, completely empty repo (discovered by walking upward from cwd,
+same as `git` itself), erroring like any other git command outside a repo rather than
+auto-`init`-ing one. Also settled through code review: `setup` grafts every configured
+pair (not just one primary branch), rolls back this run's branches if a later pair
+fails partway through (including a checkout conflict), and checks out the first
+pair's branch with a safe (non-forced) checkout so a stray local file that collides
+with dest's content is reported as a conflict rather than silently overwritten.
