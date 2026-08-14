@@ -41,12 +41,19 @@ pub enum Commands {
     Sync,
 
     /// Reproduce a dest<->source conflict and hand off to normal git
-    /// conflict-resolution UX (decisions/0007, decisions/0008).
+    /// conflict-resolution UX (decisions/0007, decisions/0008, decisions/0015).
     Resolve {
-        /// Which branch pair the conflict is on.
-        ///
-        /// Exact identifier shape (config key vs. raw branch names) is
-        /// deferred — see decisions/0008's "Consequences".
+        /// Which branch pair the conflict is on, identified by its
+        /// configured `source_branch` — the same identifier `sync`'s own
+        /// conflict error prints (decisions/0015).
         pair: String,
+
+        /// Finish a cherry-pick already started by a prior `gitprism resolve
+        /// <pair>` run, once the human has resolved its conflicts and `git
+        /// add`ed them. Explicit, matching git's own `rebase`/`cherry-pick`/
+        /// `merge --continue` convention rather than having the bare command
+        /// guess start-vs-resume from repo state (decisions/0015).
+        #[arg(long)]
+        r#continue: bool,
     },
 }

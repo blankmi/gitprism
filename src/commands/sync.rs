@@ -604,33 +604,13 @@ fn sync_pair_from_dest(
                 .id()
         };
 
-        // The resume boundary lives in *source's* history, not dest's — every
-        // commit gitprism creates on source carries `Gitprism-Dest-Commit`
-        // (decisions/0003), including setup's own graft (decisions/0006), so
-        // there's always at least one to find. `boundary` names a dest-space
-        // commit; verify it's actually an ancestor of (or equal to) the dest
-        // tip just fetched before trusting it to scope the pending-commit
-        // walk — dest is fast-forward-only in normal operation
-        // (requirements/0001), so this should always hold, but a missing
-        // object or a genuine non-ancestor both mean something is wrong
-        // enough to fail loudly rather than silently mis-walk.
-        let (_, boundary) = newest_dest_marker(repo, source_tip)?;
-        if boundary != dest_tip {
-            let is_ancestor = repo.find_commit(boundary).is_ok()
-                && repo
-                    .graph_descendant_of(dest_tip, boundary)
-                    .with_context(|| {
-                        format!("checking whether {dest_tip} descends from {boundary}")
-                    })?;
-            if !is_ancestor {
-                anyhow::bail!(
-                    "gitprism sync: source's last-synced dest commit ({boundary}) isn't an ancestor of dest branch {:?}'s current tip ({dest_tip}) — has dest's history been rewritten outside gitprism?",
-                    pair.dest_branch
-                );
-            }
-        }
-
-        let build = build_pending_source_tip(repo, config, boundary, dest_tip, source_tip)?;
+        let pending = pending_dest_commits(repo, source_tip, dest_tip).with_context(|| {
+            format!(
+                "has dest branch {:?}'s history been rewritten outside gitprism?",
+                pair.dest_branch
+            )
+        })?;
+        let build = build_pending_source_tip(repo, config, pending, source_tip)?;
 
         if let Some(new_source_tip) = build.new_tip {
             let source_url = config.source_url()?;
@@ -786,6 +766,53 @@ fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> 
     )
 }
 
+/// Every dest commit still pending reconciliation onto source, oldest first,
+/// with loop-prevention already applied (decisions/0003) — exactly what
+/// [`sync_pair_from_dest`] would attempt to build next. Pulled out as its own
+/// function so `gitprism resolve` (decisions/0008, 0015) can compute the
+/// identical list — resolve and sync must never disagree about which dest
+/// commit is next.
+///
+/// `boundary` names a dest-space commit (via [`newest_dest_marker`]); it's
+/// verified to actually be an ancestor of (or equal to) `dest_tip` before
+/// trusting it to scope the walk — dest is fast-forward-only in normal
+/// operation (requirements/0001), so this should always hold, but a missing
+/// object or a genuine non-ancestor both mean something is wrong enough to
+/// fail loudly rather than silently mis-walk.
+pub(crate) fn pending_dest_commits(
+    repo: &Repository,
+    source_tip: Oid,
+    dest_tip: Oid,
+) -> Result<Vec<Oid>> {
+    let (_, boundary) = newest_dest_marker(repo, source_tip)?;
+    if boundary != dest_tip {
+        let is_ancestor = repo.find_commit(boundary).is_ok()
+            && repo
+                .graph_descendant_of(dest_tip, boundary)
+                .with_context(|| format!("checking whether {dest_tip} descends from {boundary}"))?;
+        if !is_ancestor {
+            anyhow::bail!(
+                "gitprism sync: source's last-synced dest commit ({boundary}) isn't an ancestor of dest's current tip ({dest_tip})"
+            );
+        }
+    }
+
+    let pending = pending_commits(repo, boundary, dest_tip)?;
+    let mut result = Vec::with_capacity(pending.len());
+    for oid in pending {
+        let commit = repo
+            .find_commit(oid)
+            .context("resolving a pending dest commit")?;
+        // Loop prevention (decisions/0003): a dest commit that itself came
+        // from source (source→dest sync) already exists on source — cherry-
+        // picking it back would loop.
+        if trailer_value(commit.message().unwrap_or(""), "Gitprism-Source-Commit").is_none() {
+            result.push(oid);
+        }
+    }
+    Ok(result)
+}
+
 /// The result of [`build_pending_source_tip`]: `new_tip` is the chain's tip
 /// if anything was built (`None` only if every pending commit was loop-
 /// prevented, or nothing was pending at all — a clean cherry-pick always
@@ -800,36 +827,22 @@ struct PendingSourceBuild {
 }
 
 /// Builds, in `repo`'s object database, a chain of new commits reflecting
-/// every dest commit between `boundary` and `dest_tip` that cherry-picks
-/// cleanly onto source — stopping at the first one that doesn't
-/// (decisions/0007). `source_tip` seeds the chain's first parent.
+/// every commit in `pending` (already loop-prevention-filtered, see
+/// [`pending_dest_commits`]) that cherry-picks cleanly onto source —
+/// stopping at the first one that doesn't (decisions/0007). `source_tip`
+/// seeds the chain's first parent.
 fn build_pending_source_tip(
     repo: &Repository,
     config: &Config,
-    boundary: Oid,
-    dest_tip: Oid,
+    pending: Vec<Oid>,
     source_tip: Oid,
 ) -> Result<PendingSourceBuild> {
-    let pending = pending_commits(repo, boundary, dest_tip)?;
-
     let mut parent = source_tip;
     let mut built_any = false;
     for dest_oid in pending {
         let dest_commit = repo
             .find_commit(dest_oid)
             .context("resolving a pending dest commit")?;
-
-        // Loop prevention (decisions/0003): a dest commit that itself came
-        // from source (source→dest sync) already exists on source — cherry-
-        // picking it back would loop.
-        if trailer_value(
-            dest_commit.message().unwrap_or(""),
-            "Gitprism-Source-Commit",
-        )
-        .is_some()
-        {
-            continue;
-        }
 
         let parent_commit = repo
             .find_commit(parent)
@@ -877,8 +890,10 @@ fn build_pending_source_tip(
 /// only, no ref update, since the chain is pushed by oid once it's complete.
 /// Preserves the original author, stamps gitprism's own committer identity
 /// (decisions/0010), and carries the `Gitprism-Dest-Commit` trailer
-/// (decisions/0003) that lets a future sync resume from here.
-fn build_source_commit(
+/// (decisions/0003) that lets a future sync resume from here. `pub(crate)`
+/// so `gitprism resolve` (decisions/0015) builds its own commit in exactly
+/// the same shape once a human finishes resolving a conflict by hand.
+pub(crate) fn build_source_commit(
     repo: &Repository,
     config: &Config,
     parent: Oid,

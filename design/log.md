@@ -169,3 +169,45 @@ at the top of `sync_pair_from_dest`, so a config that legitimately omits it (per
 decisions/0013, valid whenever a pair never needs to push anything to source) still
 failed the whole run even when nothing was pending. Fixed by resolving it lazily, only
 at the point a push (or a retry's refetch) actually needs it.
+
+**Implemented `gitprism resolve`** (decisions/0007, 0008), filling the gap those two
+decisions left open. Settled first, in conversation: how the human tells gitprism a
+resolution is done. Decided an explicit `--continue` flag
+([decisions/0015](decisions/0015-resolve-real-git-cherry-pick-explicit-continue.md)),
+matching git's own `rebase`/`cherry-pick`/`merge --continue` convention rather than
+having the bare command guess start-vs-resume from `.git/CHERRY_PICK_HEAD` on its own.
+
+`gitprism resolve <pair>` recomputes the exact same pending-dest-commit list `sync`
+would build next (a new shared `pending_dest_commits` helper, factored out of
+`sync_pair_from_dest`'s inline boundary/ancestor-check so the two can never disagree),
+takes the oldest one, and drives a **real** `git cherry-pick` subprocess against it —
+deliberately not `git2`, unlike every cherry-pick `sync` itself does (which stays
+entirely in the object database and never touches the working tree). Decisions/0008
+promises the human "100% standard git" conflict-resolution — real files, real
+markers, `git add` — which only exists if the conflict is reproduced against the
+actual working tree. A clean apply is finished immediately, no human needed; a real
+conflict leaves ordinary conflict markers and stops (told apart from any other
+subprocess failure by git's own exit-code convention: `1` conflict, everything else a
+plain error).
+
+Whichever way it applied, gitprism never trusts git's own auto-committed result — it
+would carry whatever `user.name`/`user.email` this checkout's local git config has,
+not gitprism's configured committer, and no `Gitprism-Dest-Commit` trailer. Finishing
+means rebuilding the commit via `build_source_commit`, made `pub(crate)` so `resolve`
+reuses the exact function `sync` itself calls: original author preserved, gitprism's
+committer stamped, trailer appended (decisions/0003, 0010) — then pushed to source,
+ff-only (decisions/0009), a single attempt rather than `sync`'s refetch-and-recompute
+retry loop, since `resolve` is a rare, human-supervised path.
+
+Scoped to dest→source's cherry-pick conflict shape only for now — source→dest's own
+conflict (decisions/0014, a failed diff-apply rather than a cherry-pick) isn't wired
+into `resolve` yet, tracked as a follow-up in decisions/0015's "Consequences".
+
+A real subprocess conflict turned up a fixture-only gotcha worth remembering: building
+a commit via `git2`'s `repo.commit()` moves the branch ref but does *not* by itself
+keep the working tree/index in step with it — `sync`'s own test fixtures never needed
+to care (its cherry-pick/diff-apply logic never touches the checkout), but `resolve`'s
+real `git cherry-pick` subprocess refuses to run at all against a stale index
+("your local changes would be overwritten"). Fixed in the test fixtures with a forced
+`checkout_head` after each fixture commit; not a product bug, since real checkouts
+built by actual `git` commands never have this problem.
