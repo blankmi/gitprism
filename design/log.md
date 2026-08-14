@@ -52,3 +52,56 @@ pair (not just one primary branch), rolls back this run's branches if a later pa
 fails partway through (including a checkout conflict), and checks out the first
 pair's branch with a safe (non-forced) checkout so a stray local file that collides
 with dest's content is reported as a conflict rather than silently overwritten.
+
+**Update**: `sync`'s source→dest direction lands (dest→source, which can hit
+[decisions/0007](decisions/0007-conflict-policy-hard-stop.md)'s conflict hard-stop, is
+still unimplemented). Same discovery convention as `setup`
+([decisions/0012](decisions/0012-config-versioned-in-source.md)): no source-location
+config, cwd is a git-style discovery start point. Per configured pair: fetch dest's
+tip, find the resume point by scanning dest's history for the most recent
+`Gitprism-Source-Commit` trailer ([decisions/0003](decisions/0003-mapping-state-in-commit-trailers.md)),
+falling back to `merge_base(source, dest)` — always `setup`'s original graft
+parent — the first time a pair is ever synced. Every pending source commit is
+filtered using *that commit's own* `.gitprismignore`, not the current tip's, so a
+change to the exclude-list takes effect from the commit that made it, not
+retroactively ([decisions/0004](decisions/0004-exclude-list-versioned-in-source.md),
+[decisions/0011](decisions/0011-exclude-list-is-gitignore-syntax.md)); a commit that
+filters to no change from its parent is skipped entirely rather than pushed empty
+(requirements/0001); a commit already carrying `Gitprism-Dest-Commit` (dest→source's
+own prior output) is skipped as loop prevention. The whole pending chain is built as
+loose commit objects and pushed by raw oid in one `git push <oid>:<dest_branch>` —
+real `git`'s own non-force default is what actually enforces fast-forward-only here,
+not custom logic. A rejected (non-fast-forward) push is handled by refetching dest and
+recomputing the chain from scratch against its new tip, bounded to 3 retries
+([decisions/0009](decisions/0009-push-race-refetch-and-recompute.md)) — no new
+decision needed for any of this, it's what 0003/0004/0009/0011 already specify.
+
+**Update**: Code review caught three real bugs in that first `sync` pass, all fixed:
+(1) the exclude-list was read per-*commit* from that commit's own historical tree,
+contradicting [decisions/0004](decisions/0004-exclude-list-versioned-in-source.md)'s
+explicit "apply the current list at processing time, not a historical
+reconstruction" — fixed by loading it once per pair, from source's current tip, before
+filtering anything. (2) source→dest was replacing dest's entire tree with source's
+filtered snapshot on every push; since dest→source isn't implemented yet, dest can
+carry independent content (e.g. a PR merged straight to dest) that snapshot silently
+drops even though the ref update is a legitimate fast-forward — fixed by refusing to
+sync a pair at all unless dest's tip is a point gitprism itself already accounts for
+(its own last push, or unmoved since `setup`'s graft), rather than picking a
+merge/patch policy that's properly dest→source's job. (3) every push failure was
+retried as if it were the fast-forward race
+[decisions/0009](decisions/0009-push-race-refetch-and-recompute.md) describes,
+including auth/hook/network failures that must fail immediately — fixed by
+classifying `git push`'s own rejection wording and only retrying a genuine
+non-fast-forward rejection.
+
+**Update**: A fourth review round caught a real gap in fix (2) above: the
+`Gitprism-Source-Commit` trailer on dest's tip is trusted as the resume boundary
+without checking that *this* clone's own source branch actually descends from it. A
+second, divergent clone of source (e.g. one that hasn't fetched a commit another
+clone already synced) would otherwise rebuild its own full snapshot on dest and
+silently drop that already-synced content — a fast-forward ref update that's still a
+real data loss. Fixed by requiring `source_tip` to be a descendant of the trailer's
+commit (`Repository::graph_descendant_of`) before accepting it, treating "this clone
+doesn't even have that object" (which a sibling clone's un-pushed source commit never
+would be) the same as a confirmed non-ancestor — both refuse the sync with the same
+message pointing at fetching the latest source history.
