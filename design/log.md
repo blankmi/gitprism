@@ -105,3 +105,67 @@ commit (`Repository::graph_descendant_of`) before accepting it, treating "this c
 doesn't even have that object" (which a sibling clone's un-pushed source commit never
 would be) the same as a confirmed non-ancestor — both refuse the sync with the same
 message pointing at fetching the latest source history.
+
+**Update**: Decided [decisions/0013](decisions/0013-repo-urls-optional-fall-back-to-env-vars.md)
+— `[source].url`/`[dest].url` become optional in `.gitprism.toml`, falling back to
+`GITPRISM_SOURCE_URL`/`GITPRISM_DEST_URL` when omitted, so a credential-bearing or
+per-environment remote URL never has to be committed into source's own history. This
+surfaced while starting dest→source: that direction needs somewhere to push its
+result (source's own remote), which the config schema had never named.
+
+**Update**: `sync`'s dest→source direction lands (decisions/0003, 0006, 0007, 0008,
+0013). Per configured pair, after source→dest: fetch dest's tip, find the resume
+boundary by scanning *source's own* history for the most recent
+`Gitprism-Dest-Commit` trailer (a real scan, unlike source→dest's tip-only check —
+source's tip moves for reasons that have nothing to do with dest→source), cherry-pick
+every pending dest commit not already loop-prevented (`Gitprism-Source-Commit`
+present) onto source's tip via `git2`'s `cherrypick_commit`, and push the result to
+source's own remote — ff-only, same push/race-retry mechanics as source→dest. A real
+conflict hard-stops the pair (decisions/0007): whatever cherry-picked cleanly is
+still pushed, the conflict is reported with the exact commit/branch for
+`gitprism resolve` (decisions/0008, still a stub) to act on later. `run` now runs
+dest→source *before* source→dest per pair — source→dest's own refusal check
+(`dest_resume_point`) needed a third recognition case (source's history already
+carries a marker naming dest's tip exactly) so it stops treating dest's independent
+content as unrecognized once dest→source has already reflected it in, which only
+works if dest→source has already had its turn this run.
+
+**Update**: Implementing that ordering surfaced a real, pre-existing bug: source→dest
+built every pushed commit as a *full filtered snapshot* of that source commit's
+entire tree, safe only because source was previously guaranteed a strict superset of
+dest. Once dest→source can land content on source's tip ahead of an older,
+not-yet-pushed source commit, that older commit's full-snapshot would silently
+*regress* dest's independent content back out — and this isn't rare, it's the normal
+case once both directions run against actively-developed repos. Decided
+[decisions/0014](decisions/0014-source-to-dest-becomes-diff-based-and-can-conflict.md):
+source→dest now applies each pending commit as its own filtered diff (via `git2`
+diff + `apply_to_tree`, filtering excluded-path deltas *before* application, not
+after) onto dest's growing chain tip, instead of a snapshot replace — behavior-
+identical to the old approach for any linear history (every pre-existing test), but
+correct once dest→source is in the mix. This supersedes
+[decisions/0009](decisions/0009-push-race-refetch-and-recompute.md)'s claim that
+source→dest has "no merge semantics at all": it can now genuinely conflict too, the
+same real dest↔source content-divergence shape decisions/0007 already describes for
+dest→source, and gets the identical hard-stop treatment.
+
+**Update**: Code review caught three real bugs in the dest→source landing above, all
+fixed, no new decisions needed: (1) a cherry-picked dest commit that merges to a true
+no-op (its content already matched source) was skipped entirely without a marker
+commit — since the resume boundary *is* the newest `Gitprism-Dest-Commit` trailer on
+source's history (decisions/0003), this left that trailer stuck on an older dest oid
+forever, permanently blocking source→dest from ever recognizing the real dest tip as
+accounted for. Fixed by always building a marker commit, even a content-empty one —
+unlike source→dest's own empty-commit rule (requirements/0001), that rule was never
+meant to apply to this direction. (2) after a successful dest→source push, the local
+checkout's own branch ref was force-moved directly, without touching the working
+tree/index — left the checkout looking dirty relative to its own HEAD, and could
+silently discard a locally-diverged commit on a retry (which rebuilds against a
+freshly-*fetched* remote tip, not necessarily this checkout's local view). Fixed with
+a dedicated `advance_local_source_branch`: verifies the move is a real fast-forward of
+the branch's current local value first, and if that branch is the one actually
+checked out, updates the working tree via a safe (non-forced) checkout instead of a
+bare ref write. (3) `GITPRISM_SOURCE_URL`/`[source].url` was resolved unconditionally
+at the top of `sync_pair_from_dest`, so a config that legitimately omits it (per
+decisions/0013, valid whenever a pair never needs to push anything to source) still
+failed the whole run even when nothing was pending. Fixed by resolving it lazily, only
+at the point a push (or a retry's refetch) actually needs it.

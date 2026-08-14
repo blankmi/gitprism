@@ -109,12 +109,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // Fetch every pair's dest tip before writing anything, so a fetch
     // failure partway through never leaves some branches grafted and
     // others not.
+    let dest_url = config.dest_url()?;
     let mut dest_tips = Vec::with_capacity(config.pairs.len());
     for pair in &config.pairs {
-        git::fetch(&source_root, &config.dest.url, &pair.dest_branch).with_context(|| {
+        git::fetch(&source_root, &dest_url, &pair.dest_branch).with_context(|| {
             format!(
-                "fetching dest branch {:?} from {:?}",
-                pair.dest_branch, config.dest.url
+                "fetching dest branch {:?} from {dest_url:?}",
+                pair.dest_branch
             )
         })?;
         // FETCH_HEAD gets overwritten by the next fetch, so resolve it to a
