@@ -15,11 +15,13 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "gitprism", version, about, long_about = None)]
 pub struct Cli {
-    /// Path to the gitprism config file.
+    /// Path to the gitprism config file (decisions/0012).
     ///
-    /// Config format (repo locations, branch-pair list, committer identity)
-    /// is not yet decided — see design/decisions/ for what *is* settled.
-    #[arg(short, long, global = true, default_value = "gitprism.toml")]
+    /// For every command except `setup`, this resolves against source's
+    /// checked-out tree, since the config is versioned there. `setup` is the
+    /// exception: it reads this same path off disk *before* source has a
+    /// first commit to version it in — see decisions/0012's bootstrap note.
+    #[arg(short, long, global = true, default_value = crate::config::FILENAME)]
     pub config: PathBuf,
 
     #[command(subcommand)]

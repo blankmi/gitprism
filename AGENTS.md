@@ -42,3 +42,7 @@ recording the chronological history of what was added/decided and when.
   works.
 * The project owner wants to understand the design, not receive code without having
   walked through the reasoning first.
+* Test-driven: write a failing test for the behavior first, then the implementation
+  that makes it pass. Rust's built-in `#[test]` + `cargo test` is the framework;
+  reach for an added dev-dependency (e.g. `tempfile`) only when the built-in tools
+  can't express the test cleanly.

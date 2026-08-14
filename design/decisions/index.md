@@ -11,4 +11,5 @@
 * [0009-push-race-refetch-and-recompute](0009-push-race-refetch-and-recompute.md) - A lost ff-only push race is handled by refetching dest and recomputing, not rebasing.
 * [0010-preserve-author-stamp-committer](0010-preserve-author-stamp-committer.md) - Original author is preserved; gitprism stamps itself as committer, matching git's own rewrite conventions.
 * [0011-exclude-list-is-gitignore-syntax](0011-exclude-list-is-gitignore-syntax.md) - Exclude-list is `.gitprismignore` using exact `.gitignore` syntax, self-excluding by default.
+* [0012-config-versioned-in-source](0012-config-versioned-in-source.md) - Config (repo locations, branch pairs, committer identity) is `.gitprism.toml`, versioned in source, self-excluding like `.gitprismignore`; `setup` bootstraps it from disk before source's first commit exists.
 

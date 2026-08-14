@@ -34,3 +34,10 @@ subcommands stubbed out matching the design directly — `setup` (decisions/0006
 `resolve <pair>` (decisions/0008) — each currently just fails loudly with "not yet
 implemented" rather than pretending to work. No git logic yet; no config format
 decided yet (`--config` flag exists but nothing parses it).
+
+**Update**: Decided [decisions/0012](decisions/0012-config-versioned-in-source.md) —
+config is `.gitprism.toml`, versioned in source (same as the CI pipeline file the
+user already adds themselves), self-excluding like `.gitprismignore`
+([decisions/0011](decisions/0011-exclude-list-is-gitignore-syntax.md)). `setup`
+reads it from disk before source's first commit exists, since source has no history
+yet at that point; every later command reads it from the committed tree.
