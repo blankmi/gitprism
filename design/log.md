@@ -211,3 +211,33 @@ real `git cherry-pick` subprocess refuses to run at all against a stale index
 ("your local changes would be overwritten"). Fixed in the test fixtures with a forced
 `checkout_head` after each fixture commit; not a product bug, since real checkouts
 built by actual `git` commands never have this problem.
+
+**Update**: Code review caught three real bugs in `resolve`, all fixed, no new
+decisions needed. (1) `resolve --continue` read `CHERRY_PICK_HEAD` and stamped/pushed
+whatever commit it named without ever checking that commit was actually the pair's own
+expected next pending dest commit — a cherry-pick a human started by hand (unrelated
+to gitprism, or the wrong pair entirely) would get labeled with a `Gitprism-Dest-Commit`
+trailer as if it were, silently corrupting resume/loop-prevention (decisions/0003) for
+both directions from then on. Fixed by recomputing `pending_dest_commits` at the top of
+`resolve --continue` too (using the current HEAD as source_tip — a conflicted or
+not-yet-committed cherry-pick never advances HEAD, only `CHERRY_PICK_HEAD` records
+which commit is being picked) and refusing to continue unless `CHERRY_PICK_HEAD`'s oid
+matches `pending.first()` exactly. (2) A human resolving a real conflict by keeping
+source's existing content outright (a legitimate resolution, discarding dest's incoming
+change entirely) produces an empty merge result — git's own `cherry-pick --continue`
+refuses to finish that without being told `--allow-empty`, which this code
+misinterpreted as an unresolved conflict, reporting no conflicted paths and never
+building the marker commit sync's own resume-trailer invariant requires even for a
+no-op dest pick (decisions/0003, mirroring `sync`'s own no-op-cherry-pick rule). Fixed
+two ways: the initial `cherry_pick` now always passes `--empty=keep` (git's flag for
+exactly this, not accepted by `--continue`), and `cherry_pick_continue` tells a real
+remaining conflict apart from an empty-but-resolved one by checking for unmerged paths,
+finishing the latter by hand with `git commit --allow-empty` (which clears the
+sequencer state exactly like a normal `--continue` would). (3) The local branch-ref
+update in `finish` was documented as "a plain, non-forced local update" but actually
+passed `force: true` with no check at all — a concurrent local ref move in that window
+would have been silently overwritten, contrary to the stated safety guarantee. Fixed
+by switching to `git2`'s `reference_matching` (an atomic compare-and-swap): the update
+now only succeeds if the branch still names the exact commit gitprism's own cherry-pick
+just produced, and fails loudly (`GIT_EMODIFIED`) otherwise instead of clobbering
+whatever moved it.

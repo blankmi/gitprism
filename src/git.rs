@@ -112,6 +112,15 @@ pub enum CherryPickOutcome {
 /// Told apart from a genuine, unrelated failure (bad sha, dirty working
 /// tree, ...) by git's own exit-code convention: `0` clean, `1` a real
 /// conflict needing resolution, anything else a plain `Err`.
+///
+/// `--empty=keep` is always passed: a pending dest commit that cherry-picks
+/// to no actual change (e.g. source already has the same content) must still
+/// produce its own marker commit, the same rule `sync`'s own no-op cherry-
+/// picks already follow (decisions/0007's resume-trailer requirement) —
+/// without it, git stops and asks a human to choose `--allow-empty` vs
+/// `--skip` even though there was never a real conflict to resolve, and this
+/// function would have no way to tell that apart from an actual conflict
+/// from the exit code alone.
 pub fn cherry_pick(
     repo_dir: &Path,
     commit: git2::Oid,
@@ -122,6 +131,7 @@ pub fn cherry_pick(
     if let Some(mainline) = mainline {
         cmd.arg("-m").arg(mainline.to_string());
     }
+    cmd.arg("--empty=keep");
     cmd.arg(commit.to_string());
     cmd.env("GIT_EDITOR", "true");
 
@@ -133,8 +143,17 @@ pub fn cherry_pick(
 
 /// Finishes a cherry-pick already in progress in `repo_dir` (started by
 /// [`cherry_pick`]) after the human has resolved its conflicts and `git
-/// add`ed them — the real `git cherry-pick --continue`, so it shares its
-/// exit-code convention and `GIT_EDITOR` handling with [`cherry_pick`].
+/// add`ed them — the real `git cherry-pick --continue`.
+///
+/// `--continue` doesn't accept `--empty=keep` itself (git rejects the
+/// combination outright), so a conflict a human resolves by keeping source's
+/// existing content exactly (a legitimate resolution, not a mistake) still
+/// makes `--continue` stop at exit `1` with *no* conflicted paths left in the
+/// index — git's own "the previous cherry-pick is now empty" prompt, asking
+/// whether to `git commit --allow-empty` or `--skip`. That's told apart from
+/// a genuine still-unresolved conflict by whether any unmerged paths remain:
+/// none left means finish it by hand with `git commit --allow-empty`, which
+/// clears the sequencer state exactly like a normal `--continue` would.
 pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
     let output = Command::new("git")
         .arg("-C")
@@ -144,7 +163,69 @@ pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
         .env("GIT_EDITOR", "true")
         .output()
         .context("running git cherry-pick --continue")?;
-    cherry_pick_outcome(output, || "git cherry-pick --continue".to_string())
+
+    match output.status.code() {
+        Some(0) => Ok(CherryPickOutcome::Clean),
+        Some(1) if !has_unmerged_paths(repo_dir)? => {
+            finish_empty_continue(repo_dir)?;
+            Ok(CherryPickOutcome::Clean)
+        }
+        Some(1) => Ok(CherryPickOutcome::Conflict),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "git cherry-pick --continue failed ({}): {stderr}",
+                output.status
+            )
+        }
+    }
+}
+
+/// Whether the index still has any unmerged (conflicted) path — used only to
+/// tell `cherry_pick_continue`'s two exit-`1` cases apart (a real remaining
+/// conflict vs. a fully-resolved-but-empty result).
+fn has_unmerged_paths(repo_dir: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("ls-files")
+        .arg("--unmerged")
+        .output()
+        .context("checking for unmerged paths")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git ls-files --unmerged failed ({}): {stderr}",
+            output.status
+        );
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+/// Finishes a cherry-pick resolution that turned out empty (see
+/// [`cherry_pick_continue`]) the way git itself suggests when it refuses to:
+/// a real, empty commit, which finishes the sequence (clears
+/// `CHERRY_PICK_HEAD`) exactly like a normal `--continue` would have.
+/// `gitprism resolve` immediately replaces whatever commit this produces
+/// with its own properly-stamped one, so this commit's own message/identity
+/// are never user-visible.
+fn finish_empty_continue(repo_dir: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("commit")
+        .arg("--allow-empty")
+        .arg("--no-edit")
+        .output()
+        .context("running git commit --allow-empty to finish an empty cherry-pick resolution")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git commit --allow-empty failed ({}): {stderr}",
+            output.status
+        );
+    }
+    Ok(())
 }
 
 fn cherry_pick_outcome(
@@ -523,6 +604,93 @@ mod tests {
         );
         let contents = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
         assert_eq!(contents, "resolved");
+    }
+
+    #[test]
+    fn cherry_pick_reports_clean_when_the_pick_nets_to_no_change() {
+        let dir = tempdir().unwrap();
+        let base = checkout_with_a_commit_on(dir.path(), "main", &[("f.txt", "1")]);
+        let repo = Repository::open(dir.path()).unwrap();
+        let to_pick = commit_on_branch(&repo, "topic", base, &[("f.txt", "2")]);
+        // main independently already has the exact content `to_pick` would
+        // introduce — a clean but *empty* merge result, which without
+        // `--empty=keep` git refuses to finish on its own (the "previous
+        // cherry-pick is now empty" prompt), even though there was never a
+        // conflict at all.
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let mut index = repo.index().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "2").unwrap();
+        index.add_path(Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.find_commit(base).unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "already matches",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        let outcome = cherry_pick(dir.path(), to_pick, None)
+            .expect("an empty-result pick must still succeed thanks to --empty=keep");
+        assert_eq!(outcome, CherryPickOutcome::Clean);
+        assert!(!dir.path().join(".git/CHERRY_PICK_HEAD").exists());
+    }
+
+    #[test]
+    fn cherry_pick_continue_finishes_an_empty_resolution_by_committing_it_directly() {
+        let dir = tempdir().unwrap();
+        let base = checkout_with_a_commit_on(dir.path(), "main", &[("f.txt", "1")]);
+        let repo = Repository::open(dir.path()).unwrap();
+        let to_pick = commit_on_branch(&repo, "topic", base, &[("f.txt", "from topic")]);
+        std::fs::write(dir.path().join("f.txt"), "from main").unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("f.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.find_commit(base).unwrap();
+            repo.commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "diverging change",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        }
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        assert_eq!(
+            cherry_pick(dir.path(), to_pick, None).unwrap(),
+            CherryPickOutcome::Conflict
+        );
+
+        // The human resolves the conflict by keeping main's own content
+        // exactly — `--continue` can't finish this on its own (`--empty=keep`
+        // isn't accepted alongside `--continue`), and must not be
+        // misreported as still-conflicted.
+        std::fs::write(dir.path().join("f.txt"), "from main").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+
+        let outcome = cherry_pick_continue(dir.path())
+            .expect("an empty-result resolution must still finish, not be reported as a conflict");
+        assert_eq!(outcome, CherryPickOutcome::Clean);
+        assert!(
+            !dir.path().join(".git/CHERRY_PICK_HEAD").exists(),
+            "finishing an empty resolution must clear CHERRY_PICK_HEAD just like a normal continue"
+        );
+        let contents = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+        assert_eq!(contents, "from main");
     }
 
     #[test]
