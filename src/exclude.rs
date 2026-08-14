@@ -117,5 +117,4 @@ mod tests {
 
         assert!(list.is_excluded(Path::new(crate::config::FILENAME), false));
     }
-
 }

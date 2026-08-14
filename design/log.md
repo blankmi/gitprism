@@ -241,3 +241,89 @@ by switching to `git2`'s `reference_matching` (an atomic compare-and-swap): the 
 now only succeeds if the branch still names the exact commit gitprism's own cherry-pick
 just produced, and fails loudly (`GIT_EMODIFIED`) otherwise instead of clobbering
 whatever moved it.
+
+**Update**: An end-to-end review — driving the built binary against real two-repo
+fixtures rather than only the unit suite — found three real bugs in source→dest, all
+fixed, no new decisions taken. Every one of them sits in the space
+[decisions/0014](decisions/0014-source-to-dest-becomes-diff-based-and-can-conflict.md)'s
+equivalence argument explicitly excluded ("any purely linear history — every existing
+source→dest test"), which is also exactly what the test suite covered.
+
+(1) **Binary files could never reach dest.** `apply_filtered_diff` built its diff with
+default `DiffOptions`, so libgit2 emitted binary deltas with no payload and
+`apply_to_tree` failed with `ApplyFail` — the same error code a genuine text conflict
+produces, so a binary file was reported as a decisions/0007 conflict and the pair
+hard-stopped, with no recovery path (`gitprism resolve` is dest→source only,
+decisions/0015). Fixed with `show_binary(true)`.
+
+(2) **Already-synced source commits were re-applied whenever dest's tip was an
+independent dest commit** (a merged PR — the normal operating case of
+[playbooks/0001](playbooks/0001-gitlab-pipeline-triggers.md)). `dest_resume_point`
+answered two different questions with one value: "is dest's tip safe to build on?" and
+"which source commits does dest already have?". Its independent-dest-commit case
+returned the *graft point* as the revwalk boundary, so `pending_commits` re-yielded
+every commit gitprism had already pushed. Where the patch re-applied cleanly this
+silently duplicated content on dest (an already-synced `line1` became `line1\nline1`);
+where it didn't, it was misreported as a conflict and the pair was bricked — every
+later run failed identically, and `resolve` answered "nothing pending from dest".
+Fixed by splitting the two questions: `dest_tip_is_accounted_for` keeps the tip-only
+safety recognition unchanged, while the boundary now comes from `newest_source_marker`,
+a real scan of dest's own history for the newest `Gitprism-Source-Commit` trailer
+(decisions/0003), falling back to the graft only when dest carries no gitprism-written
+commit at all. An unusable newest marker (absent from this clone's odb, or not an
+ancestor of `source_tip`) refuses rather than falling back to an older one, which would
+be the same bug with a wider blast radius. This also strengthens the divergent-clone
+guarantee: a clone that never fetched the source commit dest was last synced from is
+now refused even when dest's tip is an independent commit, where it previously pushed
+its own divergent history onto dest.
+
+(3) **A merge commit in source duplicated the merged content on dest.**
+decisions/0014 specifies each pending commit is applied as its diff "against its
+immediate parent, mainline for merge commits", but the revwalk has already applied the
+side-branch commits individually by then, and `apply_to_tree` is patch application, not
+a three-way merge, so a repeated add appends instead of no-op'ing: an ordinary
+`git merge --no-ff` put `line1\nline1` on dest and reported success. Fixed with a
+source-space cursor — each pending commit is diffed from the *previously examined*
+pending commit, so the deltas telescope from the boundary with nothing repeated and
+nothing skipped. Identical to `parent(0)` for linear history (so 0014's equivalence
+argument still holds there), it preserves a hand-resolved "evil" merge's own content
+(unlike skipping merge commits), and it needs no `parent_count` special-casing, so root
+commits and octopus merges fall out for free. The cursor must advance across *skipped*
+commits too — a loop-prevented commit's content came from dest and is already there, so
+leaving the cursor behind would push dest's own content back at dest.
+
+This is also why the same bug never existed on dest→source: `cherrypick_commit` is a
+three-way merge, and three-way merging an identical change is idempotent.
+
+**Open, not yet decided** (these need a conversation, not a patch):
+
+* decisions/0014's stated mechanism ("against its immediate parent, mainline for merge
+  commits") no longer describes the implementation, and its equivalence argument should
+  be restated as "identical for linear history, telescoping in general". Needs an
+  amendment or a superseding decision.
+* Should source→dest move from patch application to a real three-way merge over
+  pre-filtered trees, matching dest→source's cherry-pick? Fix (3) leaves a known wart
+  the cursor cannot avoid: when source's history interleaves two branches, the
+  intermediate dest commit for whichever branch the walk emits second is a state that
+  never existed on source (it temporarily removes the other branch's files, restored by
+  the merge's own commit). The tip is always correct, but a conflict hard-stopping
+  mid-chain can leave dest fast-forwarded *to* such a commit — verified: dest's tip
+  ended up missing a file source had pushed one commit earlier. Three-way merge fixes
+  both the duplication and the churn at the root; it also changes conflict detection
+  from `ApplyFail` to `index.has_conflicts()`, and 0014's reason for filtering before
+  applying is satisfiable by pre-filtering the trees instead.
+* Trailers are not pair-qualified: both marker scans accept any `Gitprism-*-Commit`
+  trailer regardless of which branch pair wrote it, so dest branches merged into one
+  another can hand a pair the other pair's marker.
+* `trailer_value` matches `Key: value` anywhere in a message rather than only in the
+  final trailer block, so a commit message that merely *quotes* a trailer (a squash
+  merge concatenating bodies, say) can poison the resume scan — verified: it stops the
+  pair with "isn't an ancestor of dest's current tip", and that commit's content never
+  reaches dest.
+* A file that already reached dest and is *later* added to `.gitprismignore` stays on
+  dest forever; the diff model has no delta to filter. decisions/0004's "apply the
+  current list at processing time" reads as though it should be scrubbed, which would
+  need an explicit deletion commit since dest is fast-forward-only.
+* `gitprism resolve` still doesn't cover source→dest's conflict shape
+  (decisions/0015's tracked follow-up), yet `sync`'s own source→dest conflict message
+  tells the operator to run it — and it answers "nothing pending from dest".
