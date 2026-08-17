@@ -177,9 +177,32 @@ fn sync_pair_to_dest(
         // and treating "no such ref" as the same failure it would be for a
         // branch that's supposed to already exist.
         let dest_ref_exists = git::remote_ref_exists(source_root, &dest_url, branch)?;
+
+        // decisions/0018, Case 2: a mirror-only branch with no dest ref may
+        // never have been synced yet, or it may have been synced, merged into
+        // a round-tripped branch via an ordinary PR, and had its now-merged
+        // mirror deleted on dest as routine cleanup — indistinguishable from
+        // "never synced" by ref/ancestry alone. Checked content-first, with no
+        // persisted state, before ever rebuilding anything: if `branch`'s
+        // content is already fully present in one of `config.branches`'s
+        // current tips, its absence on dest is expected, not something to
+        // resurrect (GitLab's own push-mirror does the same for its mirrors).
+        if !dest_ref_exists
+            && !config.branches.iter().any(|b| b == branch)
+            && let Some(landing) =
+                already_merged_into_a_landing_branch(repo, config, source_tip, source_root)?
+        {
+            eprintln!(
+                "{branch}: not recreating on dest — already merged into {landing:?} and cleaned up there (expected for a mirror-only branch)"
+            );
+            return Ok(());
+        }
+
         let (dest_tip, boundary) = if dest_ref_exists {
             if config.branches.iter().any(|b| b == branch) {
-                eprintln!("{branch}: fetching dest (finding resume point before merging from source)");
+                eprintln!(
+                    "{branch}: fetching dest (finding resume point before merging from source)"
+                );
             } else {
                 eprintln!("{branch}: fetching dest (mirror-only branch, not round-tripped)");
             }
@@ -241,9 +264,7 @@ fn sync_pair_to_dest(
         // graft/marker point it shares with dest (decisions/0017: still has
         // to be created on dest). Only the latter needs `dest_tip` itself
         // pushed — it's already the right content, just missing a ref name.
-        let new_dest_tip = build
-            .new_tip
-            .or((!dest_ref_exists).then_some(dest_tip));
+        let new_dest_tip = build.new_tip.or((!dest_ref_exists).then_some(dest_tip));
 
         if let Some(new_dest_tip) = new_dest_tip {
             match git::push(source_root, &dest_url, new_dest_tip, branch)? {
@@ -393,6 +414,86 @@ fn build_pending_dest_tip(
         new_tip: built_any.then_some(parent),
         conflict: None,
     })
+}
+
+/// Whether `branch_tip`'s content is already fully merged into any of
+/// `config.branches`'s current local source-side tips (decisions/0018, Case
+/// 2) — content-based, via the same `git merge-tree` primitive decisions/0016
+/// already uses, not oid ancestry, so a squash merge is recognized just as
+/// well as a real merge or a rebase/fast-forward (a squash merge's result has
+/// no ordinary ancestor relationship to the branch it came from at all).
+///
+/// Safe to read each landing branch's *current* tip here because `run`
+/// finishes dest→source for every `config.branches` entry before source→dest
+/// ever discovers a branch (decisions/0017's phase ordering) — those tips are
+/// as fresh as this run makes them, not stale from before this run started.
+///
+/// Returns the name of the first landing branch `branch_tip` is already fully
+/// merged into, if any. No state is written or read anywhere for this — every
+/// answer comes from the current object graph, recomputed from scratch each
+/// call, the same shape git-trim's own "merged vs. stray" classification
+/// uses.
+fn already_merged_into_a_landing_branch(
+    repo: &Repository,
+    config: &Config,
+    branch_tip: Oid,
+    source_root: &Path,
+) -> Result<Option<String>> {
+    for landing in &config.branches {
+        // A landing branch named in config that doesn't (yet) exist on source
+        // isn't something to compare against — nothing for `branch_tip` to
+        // have been merged into.
+        let Ok(landing_ref) = repo.find_branch(landing, git2::BranchType::Local) else {
+            continue;
+        };
+        let landing_tip = landing_ref
+            .get()
+            .peel_to_commit()
+            .with_context(|| format!("resolving landing branch {landing:?} to a commit"))?
+            .id();
+
+        // No shared history at all between this branch and the landing
+        // branch — nothing a 3-way merge can evaluate, so this landing branch
+        // has nothing to say about whether `branch_tip` is merged.
+        let Ok(merge_base) = repo.merge_base(branch_tip, landing_tip) else {
+            continue;
+        };
+
+        // `branch_tip` has no commits of its own beyond where it diverged
+        // from `landing` at all (e.g. a branch just created off it, decisions
+        // /0017's "no commits of its own yet" case) — trivially identical in
+        // content to `landing`, but that's "hasn't diverged yet," not
+        // "already merged and cleaned up." Without this guard a brand-new,
+        // never-synced branch would be wrongly treated as already merged
+        // (caught by the existing
+        // `run_mirrors_an_ad_hoc_branch_with_no_commits_of_its_own`
+        // regression test).
+        if branch_tip == merge_base {
+            continue;
+        }
+
+        let base_tree = repo
+            .find_commit(merge_base)
+            .context("resolving a landing branch's merge-base commit")?
+            .tree_id();
+        let landing_tree = repo
+            .find_commit(landing_tip)
+            .context("resolving a landing branch's tip commit")?
+            .tree_id();
+        let branch_tree = repo
+            .find_commit(branch_tip)
+            .context("resolving a mirror-only branch's tip commit")?
+            .tree_id();
+
+        if let git::MergeTreeOutcome::Clean(merged) =
+            git::merge_tree(source_root, base_tree, landing_tree, branch_tree)?
+            && merged == landing_tree
+        {
+            return Ok(Some(landing.clone()));
+        }
+    }
+
+    Ok(None)
 }
 
 /// `setup`'s own real graft between source and dest (decisions/0006) — the
@@ -716,7 +817,23 @@ fn sync_pair_from_dest(
 
     let mut attempt = 0;
     loop {
-        eprintln!("{branch}: fetching dest (checking for independent content to reflect into source)");
+        // `branch` is always named in `config.branches`, so unlike a
+        // discovered mirror-only branch's first sync (decisions/0017,
+        // `sync_pair_to_dest`'s own `remote_ref_exists` check), there is no
+        // legitimate reason for it to have no ref on dest at all — `gitprism
+        // setup` (decisions/0006) always grafts every round-tripped branch.
+        // Checked before fetching so a deleted dest ref fails with a clear,
+        // gitprism-authored message (decisions/0018) instead of git's own raw
+        // "couldn't find remote ref" subprocess error aborting the run.
+        if !git::remote_ref_exists(source_root, &dest_url, branch)? {
+            anyhow::bail!(
+                "gitprism sync: round-tripped branch {branch:?} has no ref on dest anymore — source and dest are out of sync (a round-tripped branch's dest ref should never be deleted); investigate before syncing again"
+            );
+        }
+
+        eprintln!(
+            "{branch}: fetching dest (checking for independent content to reflect into source)"
+        );
         git::fetch(source_root, &dest_url, branch)
             .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
         let dest_tip = repo
@@ -3607,7 +3724,11 @@ mod tests {
             .id();
 
         source_repo
-            .branch("feature-empty", &source_repo.find_commit(graft).unwrap(), false)
+            .branch(
+                "feature-empty",
+                &source_repo.find_commit(graft).unwrap(),
+                false,
+            )
             .unwrap();
 
         // "feature-empty" appears nowhere in config, and carries no commits
@@ -3695,6 +3816,273 @@ mod tests {
             source_feature_tip_after, source_feature_tip,
             "feature-x's independent dest content must never be pulled back into source — \
              dest→source is scoped to config.branches only"
+        );
+    }
+
+    #[test]
+    fn run_fails_clearly_when_a_round_tripped_branchs_dest_ref_is_deleted() {
+        // decisions/0018, Case 1: a round-tripped branch (config.branches) always
+        // has a dest ref — gitprism's own `setup` grafted it — so it going missing
+        // is a real error, not a routine "first sync" case. Before the fix,
+        // `sync_pair_from_dest` fetched unconditionally and let git's own raw
+        // "couldn't find remote ref" error leak through.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("shared.txt", "v2")]);
+
+        // git2 refuses to delete a bare repo's own current HEAD branch via the
+        // branch API, so move HEAD off "main" first, then delete the ref
+        // directly — simulating an operator (or some other process) deleting
+        // main on dest.
+        dest_repo.set_head("refs/heads/unrelated-head").unwrap();
+        dest_repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let err = run(source_dir.path(), config.path()).expect_err(
+            "a round-tripped branch whose dest ref has vanished must fail clearly, not panic through on git's own raw fetch error",
+        );
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("main") && message.contains("out of sync"),
+            "the error should be gitprism's own clear, actionable message naming the \
+             affected branch and explaining that source/dest are out of sync: {message}"
+        );
+        assert!(
+            !message.contains("git fetch"),
+            "the fix must check existence *before* ever attempting the fetch, so the \
+             raw git-fetch failure text must never appear: {message}"
+        );
+    }
+
+    #[test]
+    fn run_does_not_resurrect_a_mirror_only_branch_already_merged_and_deleted_on_dest() {
+        // decisions/0018, Case 2: a mirror-only branch (not in config.branches)
+        // that was mirrored to dest, then merged into a round-tripped branch via
+        // an ordinary PR and cleaned up there, must not be blindly recreated —
+        // that would undo the cleanup every single run.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "line1\n")]);
+
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+
+        // First sync: feature-x is mirrored to dest with no config entry.
+        run(source_dir.path(), config.path()).expect("first sync should mirror feature-x to dest");
+        let dest_feature_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        // Simulate a real PR: feature-x is merged into dest's main via a genuine
+        // new commit made directly on dest (not gitprism's own mirrored commit,
+        // which would carry a Gitprism-Source-Commit trailer and get
+        // loop-prevented) — single-parent, the same shape a squash-merge
+        // produces, and deliberately *not* a real two-parent git merge: making
+        // gitprism's own `dest_feature_tip` (which itself carries a
+        // Gitprism-Source-Commit trailer for feature-x) a second parent would
+        // fold that trailer into main's own ancestry and confuse
+        // `newest_source_marker`'s unrelated, pre-existing "trailers aren't
+        // pair-qualified" gap (design/log.md) — not what this test means to
+        // exercise.
+        let dest_main_tip_before = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let merge_signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        dest_repo
+            .commit(
+                Some("refs/heads/main"),
+                &merge_signature,
+                &merge_signature,
+                "Merge branch 'feature-x' into 'main'",
+                &dest_feature_tip.tree().unwrap(),
+                &[&dest_main_tip_before],
+            )
+            .unwrap();
+
+        // Second sync: dest→source reflects that merge back into source's main.
+        run(source_dir.path(), config.path())
+            .expect("second sync should bring the PR merge back into source's main");
+        let source_main_tip_after = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            source_main_tip_after
+                .tree()
+                .unwrap()
+                .get_name("feature.txt")
+                .is_some(),
+            "source's main must now carry feature-x's content via dest→source"
+        );
+
+        // dest deletes feature-x as routine post-merge cleanup.
+        dest_repo
+            .find_reference("refs/heads/feature-x")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        // Third sync must not recreate feature-x on dest.
+        run(source_dir.path(), config.path())
+            .expect("third sync should succeed without recreating feature-x");
+        assert!(
+            dest_repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .is_err(),
+            "a mirror-only branch already merged into a round-tripped branch, then \
+             deleted on dest, must not be resurrected"
+        );
+    }
+
+    #[test]
+    fn run_still_recreates_a_mirror_only_branch_with_genuinely_unmerged_content() {
+        // decisions/0018, Case 2's fall-through: a mirror-only branch whose dest
+        // ref is missing but whose content is only *partially* present in a
+        // landing branch (e.g. resumed work after a squash merge that only
+        // captured part of it) must still be rebuilt and pushed normally, not
+        // mistaken for "already merged and cleaned up."
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "line1\n")]);
+        add_commit(&source_repo, "feature-x", &[("extra.txt", "line2\n")]);
+        let feature_tip = source_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+
+        // First sync: feature-x (both commits) is mirrored to dest.
+        run(source_dir.path(), config.path()).expect("first sync should mirror feature-x to dest");
+        dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync");
+
+        // A squash merge onto dest's main that only captures feature.txt, not
+        // extra.txt — e.g. the PR was merged before the branch's second commit
+        // was pushed.
+        let dest_main_tip_before = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut builder = dest_repo
+            .treebuilder(Some(&dest_main_tip_before.tree().unwrap()))
+            .unwrap();
+        let blob = dest_repo.blob(b"line1\n").unwrap();
+        builder
+            .insert("feature.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let squash_tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+        let merge_signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        // Single-parent, same reasoning as the sibling test above: a real
+        // second parent naming gitprism's own mirrored `dest_feature_tip`
+        // would fold its Gitprism-Source-Commit trailer into main's ancestry
+        // and trip the unrelated, pre-existing "trailers aren't
+        // pair-qualified" gap (design/log.md), not what this test exercises.
+        dest_repo
+            .commit(
+                Some("refs/heads/main"),
+                &merge_signature,
+                &merge_signature,
+                "Merge branch 'feature-x' into 'main' (squash)",
+                &squash_tree,
+                &[&dest_main_tip_before],
+            )
+            .unwrap();
+
+        run(source_dir.path(), config.path())
+            .expect("second sync should bring the squash merge back into source's main");
+
+        // dest deletes feature-x, believing it fully merged (only part of it
+        // actually was).
+        dest_repo
+            .find_reference("refs/heads/feature-x")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        // Third sync: feature-x's tip still carries extra.txt, which main does
+        // not have — not a no-op merge, so feature-x must be recreated on dest.
+        run(source_dir.path(), config.path())
+            .expect("third sync should succeed and recreate feature-x");
+        let recreated = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect(
+                "feature-x must be recreated on dest: its content isn't fully merged into main yet",
+            )
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = recreated.tree().unwrap();
+        assert!(tree.get_name("feature.txt").is_some());
+        assert!(
+            tree.get_name("extra.txt").is_some(),
+            "the genuinely unmerged remainder must reach dest"
+        );
+        assert_eq!(
+            recreated.tree().unwrap().id(),
+            feature_tip.tree().unwrap().id(),
+            "the recreated mirror must match feature-x's own current content"
         );
     }
 }

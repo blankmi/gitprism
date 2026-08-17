@@ -484,4 +484,60 @@ fully present there and its missing dest ref is left alone rather than recreated
 
 decisions/0018 is written as `status: draft` with no `verified` stamp — same
 precedent as 0016/0017: the decision is the owner's, the write-up isn't, so it needs
-his review before it counts as settled. Implementation hasn't started yet.
+his review before it counts as settled.
+
+**Implemented decisions/0018.** `sync_pair_from_dest` (`src/commands/sync.rs`) now
+calls `git::remote_ref_exists` before its dest fetch and `anyhow::bail!`s a clear,
+gitprism-authored message naming the branch when it comes back `false`, instead of
+calling `git::fetch` unconditionally and letting git's own raw "couldn't find remote
+ref" subprocess error abort the run. `sync_pair_to_dest`'s `!dest_ref_exists` branch
+now calls a new `already_merged_into_a_landing_branch` helper — for each branch named
+in `config.branches`, compute `merge_base(branch_tip, landing_tip)` in source's own
+history and run the same `git merge-tree` primitive decisions/0016 already uses (base
+= merge-base tree, ours = landing's tree, theirs = branch's tip tree); a clean merge
+whose result equals landing's tree unchanged means the branch's content is already
+fully present there — before falling through to the existing rebuild-and-push
+behavior, and returns early (logging, not erroring) the moment it finds a match.
+
+Writing the test for Case 2 surfaced a real, pre-existing, already-logged gap
+(above, "Trailers are not pair-qualified"): a first draft of the test simulated a PR
+merge as a genuine two-parent git commit naming gitprism's own mirrored commit for
+the feature branch as the second parent — realistic, but it folded that commit's own
+`Gitprism-Source-Commit` trailer into the round-tripped branch's ancestry, which made
+`newest_source_marker`'s unrelated, already-known "accepts any `Gitprism-*-Commit`
+trailer regardless of which branch wrote it" gap misidentify the *feature* branch's
+own commit as the round-tripped branch's resume boundary, wrongly failing the
+round-tripped branch's own sync with "isn't at a point this clone can safely build
+on." Not a decisions/0018 bug — worked around in the test fixture with a
+single-parent commit (the same tree, without the second parent), since a squash-merge
+PR is just as realistic a fixture and doesn't touch the unrelated gap at all.
+
+A second case the decision's first draft didn't anticipate, caught by the
+pre-existing `run_mirrors_an_ad_hoc_branch_with_no_commits_of_its_own` regression
+test still needing to pass: a brand-new branch with zero commits of its own is
+trivially "already merged" into whatever landing branch it was cut from (their trees
+are identical, since nothing has diverged yet from either side) — which would have
+wrongly suppressed decisions/0017's own guarantee that even a zero-commit branch
+still gets its first mirror created. Fixed by skipping a landing branch entirely when
+`branch_tip` equals its own `merge_base` with that landing branch — there's nothing
+to have been merged or cleaned up if the branch never diverged from it in the first
+place; this guard is now written into decisions/0018's own "Consequences" section
+too.
+
+Four new tests in `commands::sync`: one for Case 1 (deleting a round-tripped branch's
+dest ref via `repo.find_reference(...).delete()`, after moving the bare dest repo's
+own `HEAD` elsewhere first since git2 refuses to delete a bare repo's current `HEAD`
+branch, and confirming sync fails with gitprism's own "out of sync" message rather
+than a raw `git fetch` failure); one driving the full three-sync-run sequence Case 2
+describes (mirror a feature branch, merge it into dest's main via a real
+single-parent commit as a squash-merge PR stand-in, let dest→source reflect that
+merge back into source, delete the feature branch's dest ref, then confirm a third
+sync does *not* recreate it); one confirming a genuinely unmerged remainder
+(simulating a squash merge that only captured part of the branch, leaving a second
+file behind) still gets rebuilt and pushed normally — this one already passed before
+any code changed, serving as the regression guard for the fall-through path; and the
+pre-existing zero-commit-branch regression test above, unmodified, now also proving
+the merge-base equality guard.
+
+`cargo test`: 86 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
+--check`: clean.
