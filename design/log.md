@@ -446,3 +446,42 @@ during the actual TDD pass; corrected here without changing the field itself).
 --check`: clean. decisions/0017's own frontmatter is untouched (`status: draft`) —
 same precedent decisions/0016 set: implementing the code doesn't settle the owner's own
 review of the write-up.
+
+## 2026-08-17
+
+**Update**: Manual testing against `sync.rs` surfaced two of decisions/0017's own
+deferred "deletion-adjacent edge cases," with opposite correct answers. Decided
+[decisions/0018](decisions/0018-branch-deletion-failure-modes.md): (1) a
+round-tripped branch (`config.branches`) whose dest ref has been deleted is a genuine
+error — `sync_pair_from_dest` fetched it unconditionally and let git's own raw
+"couldn't find remote ref" text leak through as an unhelpful, run-aborting failure;
+now checked with `git::remote_ref_exists` first (the same idiom `sync_pair_to_dest`
+already uses for a mirror-only branch's first sync) and failed loudly with a clear,
+gitprism-authored message instead. (2) a mirror-only (discovered, unconfigured)
+branch whose dest ref has been deleted *after* being merged into a round-tripped
+branch via an ordinary PR is expected, routine cleanup, not something to resurrect —
+previously indistinguishable from "never synced yet," so `sync_pair_to_dest`
+unconditionally rebuilt and repushed it every run, undoing the cleanup.
+
+Prior art checked before choosing how to tell the two cases apart: GitLab's own
+push-mirror feature documents this exact asymmetry as intentional product behavior
+("When a branch is merged into the default branch and deleted in the source
+project, it is deleted from the remote mirror on the next push. Branches with
+unmerged changes are kept." —
+[GitLab docs](https://docs.gitlab.com/user/project/repository/mirror/push/)); and
+git-trim ([foriequal0/git-trim](https://github.com/foriequal0/git-trim)), a real
+tool built around exactly this "merged vs. stray" classification for local
+branches, does it with no persisted state at all — recomputed from the object graph
+every run — and explicitly content-based rather than oid-ancestry-based, since it
+"can detect common merge styles such as merge with a merge commit, rebase/ff merge
+and squash merge," the last of which leaves no ordinary ancestor relationship to
+check. Case 2's fix reuses exactly that shape: for each landing branch in
+`config.branches`, compute `merge_base(branch_tip, landing_tip)` in source's own
+history and run the same `git merge-tree` primitive decisions/0016 already uses
+(base = merge-base tree, ours = landing's tree, theirs = branch's tip tree); if the
+result is clean and equals landing's tree unchanged, the branch's content is already
+fully present there and its missing dest ref is left alone rather than recreated.
+
+decisions/0018 is written as `status: draft` with no `verified` stamp — same
+precedent as 0016/0017: the decision is the owner's, the write-up isn't, so it needs
+his review before it counts as settled. Implementation hasn't started yet.
