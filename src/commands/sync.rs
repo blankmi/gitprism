@@ -248,7 +248,7 @@ fn sync_pair_to_dest(
 
         if let Some(conflict) = build.conflict {
             anyhow::bail!(
-                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}` (decisions/0007, decisions/0008, decisions/0014); commits before it were still pushed to dest's {branch:?} branch",
+                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to dest's {branch:?} branch",
                 conflict.commit,
                 conflict.paths
             );
@@ -766,7 +766,7 @@ fn sync_pair_from_dest(
 
         if let Some(conflict) = build.conflict {
             anyhow::bail!(
-                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}` (decisions/0007, decisions/0008); commits before it were still pushed to source's {branch:?} branch",
+                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to source's {branch:?} branch",
                 conflict.commit,
                 conflict.paths
             );

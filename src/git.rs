@@ -413,7 +413,7 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
     let (major, minor) = parse_git_version(&raw).with_context(|| {
         format!(
             "could not parse a version out of {raw:?} — needed to confirm git supports \
-             the merge-tree flag set decisions/0016 relies on (--merge-base with raw tree \
+             the merge-tree flag set gitprism relies on (--merge-base with raw tree \
              oids, -z --name-only --no-messages), which requires git >= {}.{}",
             MIN_GIT_VERSION.0, MIN_GIT_VERSION.1
         )
@@ -421,7 +421,7 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
 
     if (major, minor) < MIN_GIT_VERSION {
         anyhow::bail!(
-            "found git {major}.{minor}, but gitprism's merge-tree-based sync (decisions/0016) \
+            "found git {major}.{minor}, but gitprism's merge-tree-based sync \
              needs git >= {}.{} for the --merge-base/-z/--name-only/--no-messages flag set \
              it depends on",
             MIN_GIT_VERSION.0,

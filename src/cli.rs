@@ -16,12 +16,12 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "gitprism", version, about, long_about = None)]
 pub struct Cli {
-    /// Path to the gitprism config file (decisions/0012).
+    /// Path to the gitprism config file.
     ///
     /// For every command except `setup`, this resolves against source's
     /// checked-out tree, since the config is versioned there. `setup` is the
     /// exception: it reads this same path off disk *before* source has a
-    /// first commit to version it in — see decisions/0012's bootstrap note.
+    /// first commit to version it in.
     #[arg(short, long, global = true, default_value = crate::config::FILENAME)]
     pub config: PathBuf,
 
@@ -31,28 +31,28 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Graft source's initial commit onto dest's real tip (decisions/0006).
+    /// Graft source's initial commit onto dest's real tip.
     Setup,
 
-    /// Sync both directions in one run (decisions/0017).
+    /// Sync both directions in one run.
     ///
     /// Safe to invoke redundantly: resume and no-op detection come from the
-    /// trailer-based history scan (decisions/0003), not from anything about
-    /// how this command was triggered (playbooks/0001).
+    /// trailer-based history scan, not from anything about how this command
+    /// was triggered.
     Sync,
 
     /// Reproduce a dest<->source conflict and hand off to normal git
-    /// conflict-resolution UX (decisions/0007, decisions/0008, decisions/0015).
+    /// conflict-resolution UX.
     Resolve {
         /// Which configured branch the conflict is on — the same identifier
-        /// `sync`'s own conflict error prints (decisions/0015).
+        /// `sync`'s own conflict error prints.
         branch: String,
 
         /// Finish a cherry-pick already started by a prior `gitprism resolve
         /// <branch>` run, once the human has resolved its conflicts and `git
         /// add`ed them. Explicit, matching git's own `rebase`/`cherry-pick`/
         /// `merge --continue` convention rather than having the bare command
-        /// guess start-vs-resume from repo state (decisions/0015).
+        /// guess start-vs-resume from repo state.
         #[arg(long)]
         r#continue: bool,
     },
