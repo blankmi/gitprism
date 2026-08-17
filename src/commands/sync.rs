@@ -178,6 +178,11 @@ fn sync_pair_to_dest(
         // branch that's supposed to already exist.
         let dest_ref_exists = git::remote_ref_exists(source_root, &dest_url, branch)?;
         let (dest_tip, boundary) = if dest_ref_exists {
+            if config.branches.iter().any(|b| b == branch) {
+                eprintln!("{branch}: fetching dest (finding resume point before merging from source)");
+            } else {
+                eprintln!("{branch}: fetching dest (mirror-only branch, not round-tripped)");
+            }
             git::fetch(source_root, &dest_url, branch)
                 .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
             let dest_tip = repo
@@ -711,6 +716,7 @@ fn sync_pair_from_dest(
 
     let mut attempt = 0;
     loop {
+        eprintln!("{branch}: fetching dest (checking for independent content to reflect into source)");
         git::fetch(source_root, &dest_url, branch)
             .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
         let dest_tip = repo
@@ -743,6 +749,7 @@ fn sync_pair_from_dest(
             // anything to source, e.g. a branch that never receives
             // independent dest-side commits.
             let source_url = config.source_url()?;
+            eprintln!("{branch}: refetching source (lost a push race, recomputing)");
             git::fetch(source_root, &source_url, branch).with_context(|| {
                 format!("fetching source branch {branch:?} from {source_url:?}")
             })?;

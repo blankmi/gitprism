@@ -11,12 +11,19 @@ use anyhow::{Context, Result};
 
 /// Fetch `refspec` from `url` into `repo_dir`'s local object database,
 /// landing at `FETCH_HEAD` — same as running `git fetch <url> <refspec>` by
-/// hand inside `repo_dir`.
+/// hand inside `repo_dir`. Quiet: git's own "From <url> / * branch ... ->
+/// FETCH_HEAD" summary is raw plumbing output with no framing about which
+/// sync phase or branch it belongs to, and looks identical whether it's
+/// checking a round-tripped branch or a mirror-only one — callers print
+/// their own labeled progress line instead (see `sync.rs`). Real failures
+/// (bad ref, network, auth) still surface: `-q` only silences the progress
+/// summary, not errors.
 pub fn fetch(repo_dir: &Path, url: &str, refspec: &str) -> Result<()> {
     let status = Command::new("git")
         .arg("-C")
         .arg(repo_dir)
         .arg("fetch")
+        .arg("-q")
         .arg(url)
         .arg(refspec)
         .status()
