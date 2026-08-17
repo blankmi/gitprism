@@ -297,12 +297,15 @@ three-way merge, and three-way merging an identical change is idempotent.
 
 **Open, not yet decided** (these need a conversation, not a patch):
 
-* decisions/0014's stated mechanism ("against its immediate parent, mainline for merge
-  commits") no longer describes the implementation, and its equivalence argument should
-  be restated as "identical for linear history, telescoping in general". Needs an
-  amendment or a superseding decision.
-* Should source→dest move from patch application to a real three-way merge over
-  pre-filtered trees, matching dest→source's cherry-pick? Fix (3) leaves a known wart
+* ~~decisions/0014's stated mechanism no longer describes the implementation, and its
+  equivalence argument should be restated.~~ — resolved, superseded by
+  [decisions/0016](decisions/0016-both-directions-merge-via-real-git-merge-tree.md):
+  0014's original "diff against the commit's own parent" is correct as written once the
+  merge is idempotent.
+* ~~Should source→dest move from patch application to a real three-way merge over
+  pre-filtered trees, matching dest→source's cherry-pick?~~ — resolved, see
+  [decisions/0016](decisions/0016-both-directions-merge-via-real-git-merge-tree.md),
+  which moves *both* directions to a real `git merge-tree`. Fix (3) left a known wart
   the cursor cannot avoid: when source's history interleaves two branches, the
   intermediate dest commit for whichever branch the walk emits second is a state that
   never existed on source (it temporarily removes the other branch's files, restored by
@@ -327,3 +330,42 @@ three-way merge, and three-way merging an identical change is idempotent.
 * `gitprism resolve` still doesn't cover source→dest's conflict shape
   (decisions/0015's tracked follow-up), yet `sync`'s own source→dest conflict message
   tells the operator to run it — and it answers "nothing pending from dest".
+
+**Update**: Decided [decisions/0016](decisions/0016-both-directions-merge-via-real-git-merge-tree.md)
+— both directions stop doing their own merge work and delegate to a real
+`git merge-tree --write-tree` subprocess over pre-filtered trees, replacing
+source→dest's non-idempotent patch application *and* dest→source's
+`cherrypick_commit`. This closes two of the open questions above (decisions/0014's
+wording, and the three-way merge question) and, in doing so, removes the cursor that
+had just been introduced: with an idempotent merge, decisions/0014's original "diff
+against the commit's own parent"
+mechanism is correct as written, and the interleaved-branch churn plus the stranding
+exposure both disappear.
+
+The owner's decision rule drove it — "what git already does well should be done by
+git, not reinvented", alongside "don't solve everything automatically, let an operator
+do it". Prior art was checked first (their third rule) and is cited in 0016: josh's own
+reverse-apply turns out to be a real `git2` three-way merge with a hard-error on
+ambiguity, not patch application; jj gets idempotency from merge algebra (`A+(A-B)=A`,
+documented as "what Git and Mercurial do"); Copybara and git-subtree both need a
+working tree and both keep separate trailer bookkeeping; git's own docs treat patch
+application as the fallback rather than the mechanism; and `git merge-tree --write-tree`
+is git's non-experimental, no-working-tree plumbing for precisely this, already used in
+production by GitLab's Gitaly for server-side merges. `git replay` was considered and
+rejected — experimental, and it handles neither merge commits nor root commits.
+
+Also filled a long-standing gap in [references/josh](references/josh.md): the "reverse
+merge mechanics could not be confirmed from the docs" note is now answered from josh's
+actual source, with permalinks, including the four open issue reports that live in that
+same reconciliation path.
+
+Consequence for [decisions/0002](decisions/0002-hybrid-git-backend.md): its "local
+object-graph work — including the dest→source merge — goes through `git2-rs`" clause no
+longer holds for the merge itself. `git2` keeps everything else local (revwalks, trailer
+scans, tree construction and filtering, commit building, ancestry checks); only the
+merge moves to the subprocess side. 0002's reason for choosing git2 over gix — that
+gix's merge support was incomplete and "merge is core, not incidental" — is moot for the
+same reason.
+
+decisions/0016 is written as `status: draft` with no `verified` stamp: the decision is
+the owner's, the write-up isn't, so it needs his review before it counts as settled.

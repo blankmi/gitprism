@@ -245,6 +245,163 @@ fn cherry_pick_outcome(
     }
 }
 
+/// The floor [`merge_tree`]'s exact command line needs, which is higher than
+/// any single one of its flags would suggest. Three separate additions stack:
+/// `--write-tree` itself landed in git 2.38, `--merge-base=<tree-ish>` in
+/// 2.40, but passing **raw tree oids** as the two positional arguments — what
+/// `merge_tree` does, since a filtered tree has no commit to name it — only
+/// became supported and documented in **2.45** (git commit `5f43cf5b2e`,
+/// "merge-tree: accept 3 trees as arguments"; the man page's `--merge-base`
+/// entry now reads "trees are enough"). On 2.40–2.44 those positions still
+/// require commit-ish and this would fail, so 2.45 is the real floor rather
+/// than the union of the older two.
+///
+/// If gitprism ever needs to run against 2.40–2.44, the fix is to wrap each
+/// filtered tree in a throwaway commit object rather than to lower this
+/// number.
+pub const MIN_GIT_VERSION: (u32, u32) = (2, 45);
+
+/// What a real `git merge-tree --write-tree` subprocess (decisions/0016)
+/// came back with for one pending commit's 3-way merge. `merge-tree` touches
+/// neither the index nor the working tree, which is what lets `sync` build
+/// commits straight into the object database without a checkout — the same
+/// property decisions/0015 relies on to justify `resolve` being the one
+/// place that *does* use a working tree.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeTreeOutcome {
+    Clean(git2::Oid),
+    Conflict { paths: Vec<String> },
+}
+
+/// Computes the 3-way merge of `ours` and `theirs` against `base` — all raw
+/// tree oids, no commits needed — via a real `git merge-tree --write-tree`
+/// subprocess (decisions/0016). This is the one merge primitive both sync
+/// directions now share; filtering (excluded paths) is gitprism's own job,
+/// done by building the filtered trees passed in here, not by this function.
+///
+/// `--no-messages` is load-bearing for the parse below, not cosmetic: with
+/// informational messages enabled, `-z` appends a further NUL-terminated
+/// section (an "Auto-merging"/"CONFLICT" narration) after the path list that
+/// would otherwise be indistinguishable from more conflicted paths.
+pub fn merge_tree(
+    repo_dir: &Path,
+    base: git2::Oid,
+    ours: git2::Oid,
+    theirs: git2::Oid,
+) -> Result<MergeTreeOutcome> {
+    let merge_base_arg = format!("--merge-base={base}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("merge-tree")
+        .arg("--write-tree")
+        .arg("-z")
+        .arg("--name-only")
+        .arg("--no-messages")
+        .arg(&merge_base_arg)
+        .arg(ours.to_string())
+        .arg(theirs.to_string())
+        .output()
+        .with_context(|| {
+            format!("running git merge-tree --write-tree --merge-base={base} {ours} {theirs}")
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut records = stdout.split('\0').filter(|record| !record.is_empty());
+
+    match output.status.code() {
+        Some(0) => {
+            let tree_record = records.next().unwrap_or_default();
+            let oid = git2::Oid::from_str(tree_record.trim()).with_context(|| {
+                format!(
+                    "parsing merge-tree's reported tree oid {tree_record:?} for \
+                     --merge-base={base} {ours} {theirs}"
+                )
+            })?;
+            Ok(MergeTreeOutcome::Clean(oid))
+        }
+        // git's own convention: 1 is a real conflict needing resolution.
+        // The first record here is the tree oid git wrote alongside the
+        // conflict — deliberately discarded, not merely unused: that tree
+        // contains conflict markers and must never be committed anywhere.
+        // Only the exit code decides Clean vs Conflict (decisions/0007:
+        // hard-stop, never auto-resolve) — `paths` below exists purely to
+        // make that hard-stop message actionable, never as a control-flow
+        // input, which is also why a lossy UTF-8 conversion is fine here
+        // rather than a bail on invalid bytes.
+        //
+        // Leaving that discarded tree (and its blobs) as unreferenced loose
+        // objects is accepted, not overlooked: ordinary git garbage on an
+        // error path, in a CI checkout, reclaimed by `git gc` — the same
+        // residue an aborted `git merge` leaves behind.
+        Some(1) => {
+            let mut paths: Vec<String> = records.skip(1).map(str::to_string).collect();
+            // The same normalisation resolve::conflicted_paths already
+            // does — don't assume git deduplicates stages for us.
+            paths.sort();
+            paths.dedup();
+            Ok(MergeTreeOutcome::Conflict { paths })
+        }
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "git merge-tree --write-tree --merge-base={base} {ours} {theirs} failed ({}): {stderr}",
+                output.status
+            )
+        }
+    }
+}
+
+/// Parses the two leading version components out of `git --version`'s own
+/// output, e.g. `"git version 2.50.1 (Apple Git-155)"` -> `Some((2, 50))`.
+/// Must also tolerate distro/platform suffixes tacked onto the patch
+/// component, e.g. `"2.45.1.windows.1"`.
+fn parse_git_version(raw: &str) -> Option<(u32, u32)> {
+    let version = raw.split_whitespace().nth(2)?;
+    let mut components = version.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Confirms the `git` on `PATH` is new enough for [`merge_tree`]'s flag set
+/// (decisions/0016) — checked once, up front, so an operator sees a clear
+/// version/reason message instead of a confusing parse failure the first
+/// time `merge_tree` itself runs. Deliberately no `-C repo_dir`: this is a
+/// property of the `git` binary, not of any particular repository.
+pub fn ensure_merge_tree_supported() -> Result<()> {
+    let output = Command::new("git")
+        .arg("--version")
+        .output()
+        .context("running git --version")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git --version failed ({}): {stderr}", output.status);
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let (major, minor) = parse_git_version(&raw).with_context(|| {
+        format!(
+            "could not parse a version out of {raw:?} — needed to confirm git supports \
+             the merge-tree flag set decisions/0016 relies on (--merge-base with raw tree \
+             oids, -z --name-only --no-messages), which requires git >= {}.{}",
+            MIN_GIT_VERSION.0, MIN_GIT_VERSION.1
+        )
+    })?;
+
+    if (major, minor) < MIN_GIT_VERSION {
+        anyhow::bail!(
+            "found git {major}.{minor}, but gitprism's merge-tree-based sync (decisions/0016) \
+             needs git >= {}.{} for the --merge-base/-z/--name-only/--no-messages flag set \
+             it depends on",
+            MIN_GIT_VERSION.0,
+            MIN_GIT_VERSION.1
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use git2::Repository;
@@ -702,5 +859,111 @@ mod tests {
             .expect_err("continuing with no cherry-pick in progress must not silently succeed");
 
         assert!(err.to_string().contains("cherry-pick --continue"));
+    }
+
+    /// A tree built directly via `repo.treebuilder`, no commit needed — the
+    /// point of testing `merge_tree` against raw tree oids (decisions/0016).
+    fn tree_with(repo: &Repository, files: &[(&str, &str)]) -> git2::Oid {
+        let mut builder = repo.treebuilder(None).unwrap();
+        for (name, contents) in files {
+            let blob = repo.blob(contents.as_bytes()).unwrap();
+            builder
+                .insert(*name, blob, git2::FileMode::Blob.into())
+                .unwrap();
+        }
+        builder.write().unwrap()
+    }
+
+    #[test]
+    fn merge_tree_reports_the_merged_tree_when_the_two_sides_touch_different_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let base = tree_with(&repo, &[("a.txt", "1")]);
+        let ours = tree_with(&repo, &[("a.txt", "1"), ("b.txt", "ours")]);
+        let theirs = tree_with(&repo, &[("a.txt", "1"), ("c.txt", "theirs")]);
+
+        let outcome = merge_tree(dir.path(), base, ours, theirs)
+            .expect("merging changes to different files must not conflict");
+        let oid = match outcome {
+            MergeTreeOutcome::Clean(oid) => oid,
+            other => panic!("expected a clean merge, got {other:?}"),
+        };
+
+        let merged = repo
+            .find_tree(oid)
+            .expect("the written tree must be readable back through git2");
+        assert!(merged.get_name("a.txt").is_some());
+        assert!(merged.get_name("b.txt").is_some());
+        assert!(merged.get_name("c.txt").is_some());
+    }
+
+    #[test]
+    fn merge_tree_reports_the_merged_tree_when_both_sides_made_the_same_change() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let base = tree_with(&repo, &[("a.txt", "1")]);
+        let ours = tree_with(&repo, &[("a.txt", "2")]);
+        let theirs = tree_with(&repo, &[("a.txt", "2")]);
+
+        let outcome = merge_tree(dir.path(), base, ours, theirs)
+            .expect("both sides making the identical change must not conflict");
+
+        // Pins the idempotency property decisions/0016 rests on: the same
+        // change on both sides merges to exactly ours' tree, not a new one.
+        assert_eq!(outcome, MergeTreeOutcome::Clean(ours));
+    }
+
+    #[test]
+    fn merge_tree_reports_the_conflicted_path_when_both_sides_changed_the_same_line() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let base = tree_with(&repo, &[("a.txt", "1\n")]);
+        let ours = tree_with(&repo, &[("a.txt", "ours\n")]);
+        let theirs = tree_with(&repo, &[("a.txt", "theirs\n")]);
+
+        let outcome = merge_tree(dir.path(), base, ours, theirs)
+            .expect("a real conflict is a reported outcome, not an error");
+
+        assert_eq!(
+            outcome,
+            MergeTreeOutcome::Conflict {
+                paths: vec!["a.txt".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn merge_tree_fails_loudly_on_an_oid_that_isnt_in_the_repository() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let base = tree_with(&repo, &[("a.txt", "1")]);
+        let ours = tree_with(&repo, &[("a.txt", "1")]);
+        // Syntactically valid but absent from this repository's object
+        // database.
+        let theirs = git2::Oid::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+
+        let err = merge_tree(dir.path(), base, ours, theirs)
+            .expect_err("an absent tree oid must not silently succeed");
+
+        assert!(err.to_string().contains("merge-tree"));
+    }
+
+    #[test]
+    fn parse_git_version_reads_majors_and_minors_it_will_see_in_the_wild() {
+        assert_eq!(
+            parse_git_version("git version 2.50.1 (Apple Git-155)"),
+            Some((2, 50))
+        );
+        assert_eq!(
+            parse_git_version("git version 2.45.1.windows.1"),
+            Some((2, 45))
+        );
+        assert_eq!(parse_git_version("git version 2.40.0"), Some((2, 40)));
+        assert_eq!(parse_git_version("not a version"), None);
+    }
+
+    #[test]
+    fn ensure_merge_tree_supported_accepts_the_git_on_this_machine() {
+        ensure_merge_tree_supported().expect("the git on this dev/CI machine must be new enough");
     }
 }

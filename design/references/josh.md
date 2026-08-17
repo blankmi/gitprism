@@ -48,15 +48,44 @@ found that is bidirectional by design rather than as an afterthought.
   "virtual" filtered repo as if it were real. `josh` / `josh-filter` are CLIs for
   local, one-shot filtering without running the proxy.[^readme]
 
-# What could not be confirmed from the docs
+# The reverse merge, confirmed from source
 
-The exact mechanics of the **reverse merge** — when a change lands in the filtered
-(source-like) repo and gets pushed back, how josh reconstructs the corresponding
-monorepo (dest-like) commit if the monorepo side has moved on independently in the
-meantime — were not spelled out in the fetched docs beyond "filters are reversible."
-This is the specific mechanic our own dest→source direction needs, so it's worth
-reading the josh source (`josh-core`) directly rather than trusting docs summaries if
-we end up depending on it.
+This was previously an open question here — the docs said only "filters are
+reversible." Read directly from josh's source when
+[decisions/0016](../decisions/0016-both-directions-merge-via-real-git-merge-tree.md)
+came to depend on it:
+
+* [`unapply_filter` in `josh-core/src/history.rs`](https://github.com/josh-project/josh/blob/2ac70eab2710ef9302fe999e92b6b7cf961f4e2e/josh-core/src/history.rs#L378-L655)
+  is the reverse-apply. It is **not** patch application. Where it can't pick a single
+  parent tree it performs two `git2::Repository::merge_commits` calls — one with
+  `FileFavor::Ours`, one with `FileFavor::Theirs` — and proceeds only if both
+  resulting trees agree, on the source's own stated reasoning that conflicts should
+  only occur in paths present in the filtered commit.
+* When that agreement check fails, josh **hard-errors** rather than guessing:
+  `return Err(anyhow!("rejecting merge with {} parents..."))`, with a maintainer
+  comment about considering "a manual override as last resort." Same operator-first
+  policy as [decisions/0007](../decisions/0007-conflict-policy-hard-stop.md).
+* Idempotency does not come from the merge alone: `josh-core/src/trailers.rs` extracts
+  a stable `change-id` (native commit header, falling back to `Change:`/`Change-Id:`
+  trailers) which, with the `sled`-backed mapping cache, is what stops an
+  already-mapped commit being reprocessed — the same division of labour as
+  [decisions/0003](../decisions/0003-mapping-state-in-commit-trailers.md).
+* The merge path needs no working tree: `git2`'s `merge_commits`/`merge_trees` produce
+  an in-memory index, and checkout is optional. This is structurally forced for josh,
+  since `josh-proxy` is a headless async server speaking the git protocol against bare
+  mirrors.
+* Known failure reports in exactly this reconciliation path, worth designing around:
+  [#998 "rejecting merge with 2 parents..."](https://github.com/josh-project/josh/issues/998)
+  (hit by the rustc↔miri subtree sync; whether it was ever resolved could not be
+  confirmed), [#1325 "Pushing to josh produces non-roundtrip commit"](https://github.com/josh-project/josh/issues/1325)
+  (same tree, different history — the reporter stopped syncing rather than risk
+  duplicating history), [#1583](https://github.com/josh-project/josh/issues/1583) and
+  [#952 "Josh generates lots of redundant merge commits"](https://github.com/josh-project/josh/issues/952).
+
+Still unconfirmed: a repo-wide search for `git` subprocess use in josh was not
+possible (GitHub code search requires login), so "libgit2 only, never shells out"
+remains inferred from the dependency set and from every merge call found going through
+`git2`, rather than proven.
 
 # Relevant difference from our problem
 

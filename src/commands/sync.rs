@@ -2,32 +2,43 @@
 //! design/decisions/0003-mapping-state-in-commit-trailers.md,
 //! design/decisions/0006-setup-uses-real-shared-history.md,
 //! design/decisions/0007-conflict-policy-hard-stop.md,
-//! design/decisions/0009-push-race-refetch-and-recompute.md, and
-//! design/decisions/0013-repo-urls-optional-fall-back-to-env-vars.md.
+//! design/decisions/0009-push-race-refetch-and-recompute.md,
+//! design/decisions/0013-repo-urls-optional-fall-back-to-env-vars.md, and
+//! design/decisions/0016-both-directions-merge-via-real-git-merge-tree.md.
 //!
 //! Both directions, per configured branch pair (decisions/0005), run one
-//! after the other:
+//! after the other. Neither does its own merge or patch work any more: each
+//! builds a `(base, ours, theirs)` tree triple for a pending commit and hands
+//! it to one real `git merge-tree --write-tree` subprocess (decisions/0016),
+//! which computes the resulting tree exactly the way a human running `git
+//! cherry-pick`/`git merge` would see it — idempotent, rename-aware, and
+//! unable to disagree between directions about what counts as a conflict.
 //!
 //! **source→dest**: fetch dest's current tip, find every source commit not
-//! yet reflected there, filter each one against the *current* exclude-list
-//! (decisions/0004, 0011 — not a historical reconstruction of what it looked
-//! like at that commit) and re-parent it onto dest's tip, then push the
-//! result — fast-forward only, never forced (requirements/0001). Refuses to
-//! sync a pair at all if dest's tip carries any commit gitprism didn't put
-//! there since its own last push, rather than fast-forwarding a snapshot
-//! that would silently drop dest's independent content — that content is
-//! exactly what the next step brings back.
+//! yet reflected there, and for each one merge dest's current chain-tip tree
+//! (`ours`) against the source commit's own tree (`theirs`), both filtered
+//! against the *current* exclude-list (decisions/0004, 0011 — not a
+//! historical reconstruction of what it looked like at that commit) before
+//! the merge ever sees them — an excluded path never reaching the merge is
+//! what stops its own history looking like a modify/delete conflict on every
+//! sync. The merge base is the source commit's first-parent tree, filtered
+//! the same way. Pushes the result — fast-forward only, never forced
+//! (requirements/0001). Refuses to sync a pair at all if dest's tip carries
+//! any commit gitprism didn't put there since its own last push, rather than
+//! fast-forwarding a snapshot that would silently drop dest's independent
+//! content — that content is exactly what the next step brings back.
 //!
 //! **dest→source**: find every dest commit not yet reflected into source by
 //! scanning *source's* history for the most recent `Gitprism-Dest-Commit`
 //! trailer (decisions/0003) — setup's own graft commit (decisions/0006)
 //! always carries one, so this never needs a special-cased first run — then
-//! cherry-pick each pending dest commit onto source's tip and push the
-//! result to source's own remote. A real content conflict hard-stops that
-//! pair (decisions/0007): whatever cherry-picked cleanly before the conflict
-//! is still pushed, and the conflicting commit is left for a human to
-//! resolve (decisions/0008), retried automatically on the next run once it
-//! is.
+//! for each pending dest commit merge source's current chain-tip tree
+//! (`ours`) against the dest commit's own tree (`theirs`), unfiltered (dest
+//! never holds source-only content), and push the result to source's own
+//! remote. A real content conflict hard-stops that pair (decisions/0007):
+//! whatever merged cleanly before the conflict is still pushed, and the
+//! conflicting commit is left for a human to resolve (decisions/0008),
+//! retried automatically on the next run once it is.
 //!
 //! Same discovery convention as `setup` (decisions/0012): `cwd` is a
 //! starting point for git-style upward discovery, and a relative `--config`
@@ -68,6 +79,12 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         source_root.join(config_path)
     };
     let config = Config::load(&config_path)?;
+
+    // Checked once per run, not once per merge (decisions/0016) — an
+    // operator on a too-old git gets one clear version message up front
+    // instead of a confusing failure the first time some pending commit
+    // needs merging.
+    git::ensure_merge_tree_supported()?;
 
     for pair in &config.pairs {
         // dest→source first: any content dest carries that gitprism didn't
@@ -151,8 +168,15 @@ fn sync_pair_to_dest(
             )
         })?;
 
-        let build =
-            build_pending_dest_tip(repo, config, &exclude_list, boundary, dest_tip, source_tip)?;
+        let build = build_pending_dest_tip(
+            repo,
+            config,
+            &exclude_list,
+            boundary,
+            dest_tip,
+            source_tip,
+            source_root,
+        )?;
 
         if let Some(new_dest_tip) = build.new_tip {
             match git::push(source_root, &dest_url, new_dest_tip, &pair.dest_branch)? {
@@ -172,11 +196,13 @@ fn sync_pair_to_dest(
             }
         }
 
-        if let Some(conflict_oid) = build.conflict {
+        if let Some(conflict) = build.conflict {
             anyhow::bail!(
-                "gitprism sync: {:?} <- {:?} hit a real conflict at source commit {conflict_oid} — resolve it with `gitprism resolve {:?}` (decisions/0007, decisions/0008, decisions/0014); commits before it were still pushed to dest's {:?} branch",
+                "gitprism sync: {:?} <- {:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {:?}` (decisions/0007, decisions/0008, decisions/0014); commits before it were still pushed to dest's {:?} branch",
                 pair.dest_branch,
                 pair.source_branch,
+                conflict.commit,
+                conflict.paths,
                 pair.source_branch,
                 pair.dest_branch
             );
@@ -186,41 +212,45 @@ fn sync_pair_to_dest(
     }
 }
 
+/// The first commit in a direction's pending list that couldn't be merged
+/// cleanly, plus the paths git reported as conflicted — one shape for both
+/// directions, since both now go through the same `git merge-tree` primitive
+/// and therefore cannot disagree about what a conflict is (decisions/0007,
+/// decisions/0016).
+struct Conflict {
+    commit: Oid,
+    paths: Vec<String>,
+}
+
 /// The result of [`build_pending_dest_tip`]: `new_tip` is the chain's tip if
 /// anything applied cleanly (`None` if nothing was pending, or every pending
-/// commit was either loop-prevented or filtered to a no-op), and `conflict`
-/// names the first source commit that couldn't be applied cleanly onto dest,
-/// if any (decisions/0007, decisions/0014) — processing always stops there
+/// commit was either loop-prevented or merged to a no-op), and `conflict`
+/// names the first source commit that couldn't be merged cleanly onto dest,
+/// if any (decisions/0007, decisions/0016) — processing always stops there
 /// (decisions/0007's "Consequences": later commits may depend on it).
 struct PendingDestBuild {
     new_tip: Option<Oid>,
-    conflict: Option<Oid>,
+    conflict: Option<Conflict>,
 }
 
 /// Builds, in `repo`'s object database, a chain of new commits reflecting
-/// every source commit between `boundary` and `source_tip`, each applied as
-/// the filtered diff *from the previously examined pending source commit* to
-/// itself, onto dest's current chain tip (decisions/0014) — not a full-tree
-/// snapshot replace, which would silently regress any independent dest
-/// content a not-yet-processed dest→source cherry-pick already landed
-/// further up source's history.
+/// every source commit between `boundary` and `source_tip`, each merged onto
+/// dest's current chain tip via a real `git merge-tree` subprocess
+/// (decisions/0016) — not a full-tree snapshot replace, which would silently
+/// regress any independent dest content a not-yet-processed dest→source
+/// cherry-pick already landed further up source's history.
 ///
-/// The diff base is a source-space cursor, not simply `source_commit.parent(0)`
-/// (see the cursor's own seeding/advancing below): for a linear history the
-/// cursor *is* `parent(0)`, so decisions/0014's original equivalence argument
-/// holds unchanged there. It has to differ for a merge commit, though — the
-/// revwalk that produces `pending` (`pending_commits`, topological+reverse)
-/// already visits and applies a merge's side-branch commits individually
-/// before it reaches the merge commit itself, so the merge's own first-parent
-/// diff would repeat exactly what those side-branch commits already
-/// contributed. `apply_to_tree` is patch application, not a three-way merge,
-/// so a repeated add doesn't no-op — it duplicates. Diffing from the cursor
-/// instead means the deltas telescope from `boundary` all the way to the last
-/// examined commit with nothing skipped and nothing repeated, a hand-resolved
-/// ("evil") merge's own content is preserved rather than dropped (unlike
-/// simply skipping merge commits), and it needs no `parent_count`
-/// special-casing at all — root commits and octopus merges fall out of the
-/// same rule for free. Stops at the first commit that doesn't apply cleanly
+/// The merge base is always `source_commit.parent(0)`'s tree — the mainline
+/// parent for a merge commit — filtered the same way `theirs` is, per
+/// decisions/0016's table; no `parent_count` special-casing is needed at all,
+/// so octopus merges fall out of the same rule for free. This replaces
+/// decisions/0014's source-space cursor entirely: that cursor existed only to
+/// work around `apply_to_tree` patch application not being idempotent (a
+/// repeated add duplicated instead of no-op'ing), which is exactly what
+/// solving the problem with a real 3-way merge makes unnecessary — one
+/// mechanism per property, instead of two mechanisms for the same one, is how
+/// the duplication and mid-chain-stranding bugs that motivated decisions/0016
+/// stop being possible. Stops at the first commit that doesn't merge cleanly
 /// (decisions/0007). `dest_tip` seeds the chain's first parent.
 fn build_pending_dest_tip(
     repo: &Repository,
@@ -229,44 +259,21 @@ fn build_pending_dest_tip(
     boundary: Oid,
     dest_tip: Oid,
     source_tip: Oid,
+    source_root: &Path,
 ) -> Result<PendingDestBuild> {
     let pending = pending_commits(repo, boundary, source_tip)?;
 
     let mut parent = dest_tip;
-    // Source-space cursor: the pending commit the *next* diff is taken
-    // against (decisions/0014). Seeded with `boundary`, which is always a
-    // real ancestor of `source_tip` in the same object graph (either
-    // `setup`'s own graft, or a Gitprism-Source-Commit marker target already
-    // verified present in this clone's odb by `dest_resume_point`) — so its
-    // tree is always a well-defined diff base, and the empty-tree fallback
-    // this replaced is unreachable.
-    let mut source_cursor = boundary;
     let mut built_any = false;
     for source_oid in pending {
         let source_commit = repo
             .find_commit(source_oid)
             .context("resolving a pending source commit")?;
 
-        // Advance the cursor for every examined commit, before the loop-
-        // prevention `continue` below (decisions/0014) — not after. A loop-
-        // prevented commit (one carrying Gitprism-Dest-Commit) holds content
-        // that came *from* dest and is already there; if the cursor stayed
-        // behind it, the next examined commit's diff would include that
-        // content again and gitprism would push dest's own content back at
-        // dest — duplication, or a spurious conflict. That's the normal
-        // steady state once dest→source has run at all, not an exotic shape.
-        // Advancing across a commit that filters to an empty diff (the
-        // `continue` further down) is correct for the same reason, and
-        // keeps the rule uniform: the cursor always tracks "the last pending
-        // commit actually examined," full stop. It also makes a post-conflict
-        // retry recompute byte-identical diffs, since the cursor only ever
-        // depends on already-examined history, never on what was pushed.
-        let diff_base = source_cursor;
-        source_cursor = source_oid;
-
         // Loop prevention (decisions/0003): a source commit that itself came
         // from dest (dest→source sync) already exists on dest — pushing it
-        // back would loop.
+        // back would loop. First thing in the loop now that there's no
+        // cursor left to advance before it.
         if trailer_value(
             source_commit.message().unwrap_or(""),
             "Gitprism-Dest-Commit",
@@ -279,38 +286,42 @@ fn build_pending_dest_tip(
         let parent_commit = repo
             .find_commit(parent)
             .context("resolving the in-progress dest chain's parent")?;
-        let old_tree = repo
-            .find_commit(diff_base)
-            .context("resolving the previously processed pending source commit")?
-            .tree()
-            .context("reading the previously processed pending source commit's tree")?;
-        let new_tree = source_commit
-            .tree()
-            .context("reading a pending source commit's tree")?;
 
-        match apply_filtered_diff(
+        let base_tree = match source_commit.parent(0) {
+            Ok(base_commit) => {
+                filter_tree(repo, &base_commit.tree()?, Path::new(""), exclude_list)?
+            }
+            Err(_) => empty_tree(repo)?,
+        };
+        let theirs_tree = filter_tree(
             repo,
-            &parent_commit.tree()?,
-            &old_tree,
-            &new_tree,
+            &source_commit
+                .tree()
+                .context("reading a pending source commit's tree")?,
+            Path::new(""),
             exclude_list,
-        )? {
-            ApplyOutcome::Conflict => {
+        )?;
+
+        match git::merge_tree(source_root, base_tree, parent_commit.tree_id(), theirs_tree)? {
+            git::MergeTreeOutcome::Conflict { paths } => {
                 return Ok(PendingDestBuild {
                     new_tip: built_any.then_some(parent),
-                    conflict: Some(source_oid),
+                    conflict: Some(Conflict {
+                        commit: source_oid,
+                        paths,
+                    }),
                 });
             }
-            ApplyOutcome::Clean(filtered_tree_oid) => {
-                // This commit's diff, once filtered, changed nothing dest-
-                // side (e.g. it only touched excluded paths) — must not push
-                // an empty commit (requirements/0001).
-                if filtered_tree_oid == parent_commit.tree_id() {
+            git::MergeTreeOutcome::Clean(merged) => {
+                // This commit's merge, once filtered, changed nothing dest-
+                // side (e.g. it only touched excluded paths, or dest already
+                // independently has the same content) — must not push an
+                // empty commit (requirements/0001).
+                if merged == parent_commit.tree_id() {
                     continue;
                 }
 
-                parent =
-                    build_dest_commit(repo, config, parent, &source_commit, filtered_tree_oid)?;
+                parent = build_dest_commit(repo, config, parent, &source_commit, merged)?;
                 built_any = true;
             }
         }
@@ -320,63 +331,6 @@ fn build_pending_dest_tip(
         new_tip: built_any.then_some(parent),
         conflict: None,
     })
-}
-
-/// The result of [`apply_filtered_diff`]: either the resulting tree, or that
-/// the diff didn't apply cleanly onto `onto_tree` — a genuine dest↔source
-/// content conflict (decisions/0007, decisions/0014), not a bug.
-enum ApplyOutcome {
-    Clean(Oid),
-    Conflict,
-}
-
-/// Diffs `old_tree` against `new_tree` (a pending source commit against the
-/// previously processed pending source commit), drops any delta touching an
-/// excluded path *before*
-/// application — not after, since an already-excluded path's own history
-/// (e.g. `.gitprismignore` being edited repeatedly) would otherwise look like
-/// a modify/delete conflict on every sync, dest never having that path to
-/// merge against at all — then applies what's left onto `onto_tree` (dest's
-/// current chain tip).
-///
-/// The diff is built with `show_binary(true)`: with the default
-/// `DiffOptions`, libgit2 emits a binary delta with no actual payload, and
-/// `apply_to_tree` then can't reconstruct that file's content at all — it
-/// fails with `ErrorCode::ApplyFail`, the exact same error code a genuine
-/// text conflict produces, so without this a binary file would be
-/// misreported below as a decisions/0007 content conflict instead of applied.
-fn apply_filtered_diff(
-    repo: &Repository,
-    onto_tree: &git2::Tree,
-    old_tree: &git2::Tree,
-    new_tree: &git2::Tree,
-    exclude_list: &ExcludeList,
-) -> Result<ApplyOutcome> {
-    let mut diff_opts = git2::DiffOptions::new();
-    diff_opts.show_binary(true);
-    let diff = repo
-        .diff_tree_to_tree(Some(old_tree), Some(new_tree), Some(&mut diff_opts))
-        .context("diffing a pending source commit against the previously processed pending source commit")?;
-
-    let mut apply_opts = git2::ApplyOptions::new();
-    apply_opts.delta_callback(|delta| {
-        let path = delta.and_then(|d| d.new_file().path().or_else(|| d.old_file().path()));
-        match path {
-            Some(path) => !exclude_list.is_excluded(path, false),
-            None => true,
-        }
-    });
-
-    match repo.apply_to_tree(onto_tree, &diff, Some(&mut apply_opts)) {
-        Ok(mut index) => {
-            let tree_oid = index
-                .write_tree_to(repo)
-                .context("writing the diff-applied tree")?;
-            Ok(ApplyOutcome::Clean(tree_oid))
-        }
-        Err(err) if err.code() == git2::ErrorCode::ApplyFail => Ok(ApplyOutcome::Conflict),
-        Err(err) => Err(err).context("applying a pending source commit's filtered diff onto dest"),
-    }
 }
 
 /// `setup`'s own real graft between source and dest (decisions/0006) — the
@@ -562,6 +516,83 @@ fn load_current_exclude_list(repo: &Repository, source_tip: Oid) -> Result<Exclu
     ExcludeList::from_contents(&ignore_raw).context("parsing .gitprismignore")
 }
 
+/// Builds a filtered copy of `tree` with every excluded path removed, in
+/// `repo`'s object database. Filtering stays gitprism's own job, not git's
+/// (decisions/0004, 0011) — it has to happen *before* a pending commit ever
+/// reaches [`git::merge_tree`], not after, since an excluded path's own
+/// history (e.g. `.gitprismignore` being edited repeatedly) would otherwise
+/// present as a modify/delete conflict against a dest that never had that
+/// path at all (decisions/0014, 0016).
+///
+/// Excluded entries are skipped without recursing into them — pruning a
+/// `secrets/` tree of 10k files costs one `is_excluded` call, not 10k.
+/// Surviving subtrees are rebuilt recursively and omitted entirely if
+/// filtering leaves them empty, since git doesn't track empty directories.
+/// Non-tree entries are re-inserted with their original `filemode()`
+/// preserved — what keeps executable bits, symlinks, and gitlinks intact,
+/// and stops a submodule being recursed into as if it were an ordinary tree.
+fn filter_tree(
+    repo: &Repository,
+    tree: &git2::Tree,
+    prefix: &Path,
+    exclude_list: &ExcludeList,
+) -> Result<Oid> {
+    let mut builder = repo
+        .treebuilder(None)
+        .context("starting a filtered tree builder")?;
+
+    for entry in tree.iter() {
+        let name = entry
+            .name()
+            .context("a tree entry has a non-UTF-8 name gitprism can't filter by")?;
+        let rel_path = prefix.join(name);
+        let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
+
+        if exclude_list.is_excluded(&rel_path, is_dir) {
+            continue;
+        }
+
+        if is_dir {
+            let subtree = repo
+                .find_tree(entry.id())
+                .with_context(|| format!("reading subtree {}", rel_path.display()))?;
+            let filtered_oid = filter_tree(repo, &subtree, &rel_path, exclude_list)?;
+            // A directory that excluding left with nothing in it must not
+            // appear at all — git doesn't track directories independently
+            // of their contents.
+            if repo
+                .find_tree(filtered_oid)
+                .context("reading a just-filtered subtree back")?
+                .iter()
+                .next()
+                .is_none()
+            {
+                continue;
+            }
+            builder
+                .insert(name, filtered_oid, git2::FileMode::Tree.into())
+                .with_context(|| format!("inserting filtered subtree {}", rel_path.display()))?;
+        } else {
+            builder
+                .insert(name, entry.id(), entry.filemode())
+                .with_context(|| format!("inserting {}", rel_path.display()))?;
+        }
+    }
+
+    builder.write().context("writing a filtered tree")
+}
+
+/// The empty tree, written into `repo`'s odb so a `git` subprocess can name
+/// it as `--merge-base` for a commit with no parent. Defensive only: every
+/// commit `pending_commits` yields strictly descends from `boundary`, so it
+/// always has a parent.
+fn empty_tree(repo: &Repository) -> Result<Oid> {
+    repo.treebuilder(None)
+        .context("starting an empty tree builder")?
+        .write()
+        .context("writing the empty tree")
+}
+
 /// Builds one new dest-bound commit in `repo`'s object database — object
 /// only, no ref update, since the chain is pushed by oid once it's complete.
 /// Preserves the original author, stamps gitprism's own committer identity
@@ -681,7 +712,7 @@ fn sync_pair_from_dest(
                 pair.dest_branch
             )
         })?;
-        let build = build_pending_source_tip(repo, config, pending, source_tip)?;
+        let build = build_pending_source_tip(repo, config, pending, source_tip, source_root)?;
 
         if let Some(new_source_tip) = build.new_tip {
             let source_url = config.source_url()?;
@@ -706,11 +737,13 @@ fn sync_pair_from_dest(
             }
         }
 
-        if let Some(conflict_oid) = build.conflict {
+        if let Some(conflict) = build.conflict {
             anyhow::bail!(
-                "gitprism sync: {:?} <- {:?} hit a real conflict at dest commit {conflict_oid} — resolve it with `gitprism resolve {:?}` (decisions/0007, decisions/0008); commits before it were still pushed to source's {:?} branch",
+                "gitprism sync: {:?} <- {:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {:?}` (decisions/0007, decisions/0008); commits before it were still pushed to source's {:?} branch",
                 pair.source_branch,
                 pair.dest_branch,
+                conflict.commit,
+                conflict.paths,
                 pair.source_branch,
                 pair.source_branch
             );
@@ -934,27 +967,35 @@ pub(crate) fn pending_dest_commits(
 
 /// The result of [`build_pending_source_tip`]: `new_tip` is the chain's tip
 /// if anything was built (`None` only if every pending commit was loop-
-/// prevented, or nothing was pending at all — a clean cherry-pick always
-/// gets its own marker commit even when it changes nothing, see
+/// prevented, or nothing was pending at all — a clean merge always gets its
+/// own marker commit even when it changes nothing, see
 /// `build_pending_source_tip`'s doc comment), and `conflict` names the first
-/// dest commit that couldn't be cherry-picked cleanly, if any — processing
-/// always stops there (decisions/0007's "Consequences": later commits may
-/// depend on it).
+/// dest commit that couldn't be merged cleanly, if any — processing always
+/// stops there (decisions/0007's "Consequences": later commits may depend on
+/// it).
 struct PendingSourceBuild {
     new_tip: Option<Oid>,
-    conflict: Option<Oid>,
+    conflict: Option<Conflict>,
 }
 
 /// Builds, in `repo`'s object database, a chain of new commits reflecting
 /// every commit in `pending` (already loop-prevention-filtered, see
-/// [`pending_dest_commits`]) that cherry-picks cleanly onto source —
-/// stopping at the first one that doesn't (decisions/0007). `source_tip`
-/// seeds the chain's first parent.
+/// [`pending_dest_commits`]) that merges cleanly onto source via a real `git
+/// merge-tree` subprocess (decisions/0016) — stopping at the first one that
+/// doesn't (decisions/0007). `source_tip` seeds the chain's first parent.
+///
+/// The merge base is `dest_commit.parent(0)`'s tree, unfiltered — dest never
+/// holds source-only content, so there is nothing here for gitprism's own
+/// filtering to do. `sync` and `gitprism resolve` (decisions/0015) now agree
+/// on both the merge base and the merge engine (`git cherry-pick` and `git
+/// merge-tree` are both backed by merge-ort), so the two can no longer
+/// disagree about whether a given commit conflicts.
 fn build_pending_source_tip(
     repo: &Repository,
     config: &Config,
     pending: Vec<Oid>,
     source_tip: Oid,
+    source_root: &Path,
 ) -> Result<PendingSourceBuild> {
     let mut parent = source_tip;
     let mut built_any = false;
@@ -966,37 +1007,45 @@ fn build_pending_source_tip(
         let parent_commit = repo
             .find_commit(parent)
             .context("resolving the in-progress source chain's parent")?;
-        // A merge commit's mainline (the parent side treated as "unchanged")
-        // must be picked explicitly; a non-merge commit requires 0
-        // (git2's own convention — passing 1 there is an error).
-        let mainline = if dest_commit.parent_count() > 1 { 1 } else { 0 };
-        let mut index = repo
-            .cherrypick_commit(&dest_commit, &parent_commit, mainline, None)
-            .with_context(|| format!("cherry-picking dest commit {dest_oid} onto source"))?;
 
-        if index.has_conflicts() {
-            return Ok(PendingSourceBuild {
-                new_tip: built_any.then_some(parent),
-                conflict: Some(dest_oid),
-            });
+        let base_tree = match dest_commit.parent(0) {
+            Ok(base_commit) => base_commit.tree_id(),
+            Err(_) => empty_tree(repo)?,
+        };
+
+        match git::merge_tree(
+            source_root,
+            base_tree,
+            parent_commit.tree_id(),
+            dest_commit.tree_id(),
+        )? {
+            git::MergeTreeOutcome::Conflict { paths } => {
+                return Ok(PendingSourceBuild {
+                    new_tip: built_any.then_some(parent),
+                    conflict: Some(Conflict {
+                        commit: dest_oid,
+                        paths,
+                    }),
+                });
+            }
+            git::MergeTreeOutcome::Clean(tree_oid) => {
+                // Unlike source→dest's "don't push an empty commit" rule
+                // (requirements/0001, scoped to that direction only), a dest
+                // commit that merges to no change (e.g. dest's edit was
+                // already present on source) still needs its own marker
+                // commit here, even though its tree is identical to its
+                // parent's — the resume boundary *is* the newest
+                // Gitprism-Dest-Commit trailer on source's history
+                // (decisions/0003), so skipping it would leave that trailer
+                // pointing at an older dest oid forever, permanently blocking
+                // source→dest from ever recognizing this dest commit (and
+                // anything after it) as accounted for (`dest_resume_point`'s
+                // case 2). This asymmetry with source→dest's skip rule is
+                // deliberate, not an inconsistency to unify away.
+                parent = build_source_commit(repo, config, parent, &dest_commit, tree_oid)?;
+                built_any = true;
+            }
         }
-
-        let tree_oid = index
-            .write_tree_to(repo)
-            .with_context(|| format!("writing the merged tree for dest commit {dest_oid}"))?;
-
-        // Unlike source→dest's "don't push an empty commit" rule
-        // (requirements/0001, scoped to that direction only), a dest commit
-        // that cherry-picks to no change (e.g. dest's edit was already
-        // present on source) still needs its own marker commit here, even
-        // though its tree is identical to its parent's — the resume boundary
-        // *is* the newest Gitprism-Dest-Commit trailer on source's history
-        // (decisions/0003), so skipping it would leave that trailer pointing
-        // at an older dest oid forever, permanently blocking source→dest
-        // from ever recognizing this dest commit (and anything after it) as
-        // accounted for (`dest_resume_point`'s case 2).
-        parent = build_source_commit(repo, config, parent, &dest_commit, tree_oid)?;
-        built_any = true;
     }
 
     Ok(PendingSourceBuild {
@@ -1252,6 +1301,45 @@ mod tests {
             &signature,
             &signature,
             "a binary change",
+            &tree,
+            &[&tip],
+        )
+        .unwrap()
+    }
+
+    /// Same shape as `add_commit`, for a commit that also *removes* paths — a
+    /// rename is a removal plus an insertion, and `add_commit` can only
+    /// insert.
+    fn add_commit_removing(
+        repo: &Repository,
+        branch: &str,
+        removals: &[&str],
+        files: &[(&str, &str)],
+    ) -> Oid {
+        let tip = repo
+            .find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut builder = repo.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+        for removal in removals {
+            builder.remove(Path::new(removal)).unwrap();
+        }
+        for (name, contents) in files {
+            let blob = repo.blob(contents.as_bytes()).unwrap();
+            builder
+                .insert(*name, blob, git2::FileMode::Blob.into())
+                .unwrap();
+        }
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &signature,
+            &signature,
+            "a rename",
             &tree,
             &[&tip],
         )
@@ -2608,6 +2696,7 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains(&conflicting_dest_commit.to_string()));
         assert!(message.contains("resolve"));
+        assert!(message.contains("shared.txt"));
 
         // Nothing must have been pushed to source's own remote — there was
         // exactly one pending dest commit, and it conflicted.
@@ -2697,6 +2786,7 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains(&conflicting_source_commit.to_string()));
         assert!(message.contains("resolve"));
+        assert!(message.contains("shared.txt"));
 
         // Nothing must have been pushed to dest at all.
         let still_dest_tip = dest_repo
@@ -2847,5 +2937,604 @@ mod tests {
 
         run(source_dir.path(), config_file.path())
             .expect("a source→dest-only run must not fail merely for lacking a source URL");
+    }
+
+    #[test]
+    fn filter_tree_drops_an_excluded_directory_wholesale() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let deep_blob = repo.blob(b"deep").unwrap();
+        let mut nested_builder = repo.treebuilder(None).unwrap();
+        nested_builder
+            .insert("deep.txt", deep_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let nested_tree = nested_builder.write().unwrap();
+
+        let inner_blob = repo.blob(b"inner").unwrap();
+        let mut secrets_builder = repo.treebuilder(None).unwrap();
+        secrets_builder
+            .insert("inner.txt", inner_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        secrets_builder
+            .insert("nested", nested_tree, git2::FileMode::Tree.into())
+            .unwrap();
+        let secrets_tree = secrets_builder.write().unwrap();
+
+        let shared_blob = repo.blob(b"shared").unwrap();
+        let mut root_builder = repo.treebuilder(None).unwrap();
+        root_builder
+            .insert("shared.txt", shared_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        root_builder
+            .insert("secrets", secrets_tree, git2::FileMode::Tree.into())
+            .unwrap();
+        let root_tree = repo.find_tree(root_builder.write().unwrap()).unwrap();
+
+        let exclude_list = ExcludeList::from_contents("secrets/\n").unwrap();
+        let filtered_oid = filter_tree(&repo, &root_tree, Path::new(""), &exclude_list)
+            .expect("filtering a tree with an excluded directory should succeed");
+        let filtered = repo.find_tree(filtered_oid).unwrap();
+
+        assert!(filtered.get_name("shared.txt").is_some());
+        assert!(
+            filtered.get_name("secrets").is_none(),
+            "an excluded directory must not appear at all, not even as an empty subtree"
+        );
+        assert_eq!(
+            filtered.iter().count(),
+            1,
+            "the excluded directory must not be recursed into and re-added empty"
+        );
+    }
+
+    #[test]
+    fn filter_tree_preserves_file_modes_and_symlinks() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let regular_blob = repo.blob(b"regular").unwrap();
+        let exec_blob = repo.blob(b"#!/bin/sh\n").unwrap();
+        let link_blob = repo.blob(b"target.txt").unwrap();
+        let excluded_blob = repo.blob(b"secret").unwrap();
+
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder
+            .insert("regular.txt", regular_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        builder
+            .insert("run.sh", exec_blob, git2::FileMode::BlobExecutable.into())
+            .unwrap();
+        builder
+            .insert("link.txt", link_blob, git2::FileMode::Link.into())
+            .unwrap();
+        builder
+            .insert("secret.txt", excluded_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+
+        let exclude_list = ExcludeList::from_contents("secret.txt\n").unwrap();
+        let filtered_oid = filter_tree(&repo, &tree, Path::new(""), &exclude_list)
+            .expect("filtering a tree with mixed filemodes should succeed");
+        let filtered = repo.find_tree(filtered_oid).unwrap();
+
+        assert_eq!(
+            filtered.get_name("regular.txt").unwrap().filemode(),
+            i32::from(git2::FileMode::Blob)
+        );
+        assert_eq!(
+            filtered.get_name("run.sh").unwrap().filemode(),
+            i32::from(git2::FileMode::BlobExecutable)
+        );
+        assert_eq!(
+            filtered.get_name("link.txt").unwrap().filemode(),
+            i32::from(git2::FileMode::Link)
+        );
+        assert!(
+            filtered.get_name("secret.txt").is_none(),
+            "an excluded file must still be dropped alongside preserving the others' filemodes"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_carries_a_rename_and_keeps_dests_own_edit_to_the_renamed_file() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(
+            dest_dir.path(),
+            "main",
+            &[("old.txt", "line one\nline two\nline three\n")],
+        );
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let rename_commit = add_commit_removing(
+            &source_repo,
+            "main",
+            &["old.txt"],
+            &[("new.txt", "line one\nline two\nline three\n")],
+        );
+
+        let dest_edit_tip = add_independent_dest_commit(
+            &dest_repo,
+            dest_tip,
+            ("old.txt", "line one\nline two\nline three edited by dest\n"),
+            "an independent dest-side edit",
+        );
+
+        // Stamp a marker commit on source naming the dest edit (same
+        // technique as `sync_pair_to_dest_hard_stops_on_a_real_conflict`) so
+        // the boundary logic isn't what's under test here.
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let source_tip_commit = source_repo.find_commit(rename_commit).unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                &format!(
+                    "gitprism sync: dest -> source\n\nGitprism-Dest-Commit: {dest_edit_tip}\n"
+                ),
+                &source_tip_commit.tree().unwrap(),
+                &[&source_tip_commit],
+            )
+            .unwrap();
+
+        let config = Config::load(
+            write_config(
+                "unused",
+                &dest_dir.path().display().to_string(),
+                &[("main", "main")],
+            )
+            .path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let pair = BranchPair {
+            source_branch: "main".to_string(),
+            dest_branch: "main".to_string(),
+        };
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair)
+            .expect("a rename carrying dest's own edit across it must merge cleanly");
+
+        let new_dest_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = new_dest_tip.tree().unwrap();
+        assert!(
+            tree.get_name("old.txt").is_none(),
+            "the renamed-away path must not survive on dest"
+        );
+        let new_blob = dest_repo
+            .find_blob(tree.get_name("new.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(new_blob.content()),
+            "line one\nline two\nline three edited by dest\n"
+        );
+    }
+
+    #[test]
+    fn sync_pair_from_dest_carries_dests_edit_onto_a_file_source_renamed() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(
+            dest_dir.path(),
+            "main",
+            &[("old.txt", "line one\nline two\nline three\n")],
+        );
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit_removing(
+            &source_repo,
+            "main",
+            &["old.txt"],
+            &[("new.txt", "line one\nline two\nline three\n")],
+        );
+        // `add_commit_removing` only moves the branch ref, the same as every
+        // other low-level fixture in this module — but this test, unlike
+        // most, goes on to call `sync_pair_from_dest` directly, which checks
+        // the merge result out onto the working tree
+        // (`advance_local_source_branch`). A real checkout compares against
+        // the actual on-disk index, so it has to be brought into step with
+        // the rename first, or an unrelated fixture artifact (not gitprism's
+        // own merge) would surface as a checkout conflict.
+        source_repo
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let source_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", source_tip);
+
+        let dest_edit_tip = add_independent_dest_commit(
+            &dest_repo,
+            dest_tip,
+            ("old.txt", "line one\nline two\nline three edited by dest\n"),
+            "an independent dest-side edit",
+        );
+
+        let config = Config::load(
+            write_config(
+                &source_remote.path().display().to_string(),
+                &dest_dir.path().display().to_string(),
+                &[("main", "main")],
+            )
+            .path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let pair = BranchPair {
+            source_branch: "main".to_string(),
+            dest_branch: "main".to_string(),
+        };
+
+        sync_pair_from_dest(&repo, source_dir.path(), &config, &pair)
+            .expect("dest's edit to a file source renamed must carry across cleanly");
+
+        let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+        let new_tip = source_remote_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = new_tip.tree().unwrap();
+        assert!(
+            tree.get_name("old.txt").is_none(),
+            "the renamed-away path must not survive on source"
+        );
+        let new_blob = source_remote_repo
+            .find_blob(tree.get_name("new.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(new_blob.content()),
+            "line one\nline two\nline three edited by dest\n"
+        );
+        assert!(
+            new_tip
+                .message()
+                .unwrap()
+                .contains(&format!("Gitprism-Dest-Commit: {dest_edit_tip}"))
+        );
+    }
+
+    #[test]
+    fn both_directions_treat_the_same_independent_change_as_no_conflict() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("shared.txt", "v2\n")]);
+        let source_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", source_tip);
+
+        let dest_independent = add_independent_dest_commit(
+            &dest_repo,
+            dest_tip,
+            ("shared.txt", "v2\n"),
+            "the same one-line fix, made independently on dest",
+        );
+
+        let config = Config::load(
+            write_config(
+                &source_remote.path().display().to_string(),
+                &dest_dir.path().display().to_string(),
+                &[("main", "main")],
+            )
+            .path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let pair = BranchPair {
+            source_branch: "main".to_string(),
+            dest_branch: "main".to_string(),
+        };
+
+        sync_pair_from_dest(&repo, source_dir.path(), &config, &pair)
+            .expect("an identical independent change must merge cleanly, not conflict");
+
+        let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+        let new_source_tip = source_remote_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            new_source_tip
+                .message()
+                .unwrap()
+                .contains(&format!("Gitprism-Dest-Commit: {dest_independent}")),
+            "a merge-to-no-op must still get its own marker commit on source"
+        );
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair)
+            .expect("a content no-op merge must not be misreported as a conflict");
+
+        let dest_tip_commit = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            dest_tip_commit.id(),
+            dest_independent,
+            "a content no-op must not push an empty commit to dest"
+        );
+        let tree = dest_tip_commit.tree().unwrap();
+        let shared_blob = dest_repo
+            .find_blob(tree.get_name("shared.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(shared_blob.content(), b"v2\n");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair)
+            .expect("a repeat sync of the same no-op merge must still succeed");
+        let dest_tip_after_repeat = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_tip_after_repeat, dest_independent,
+            "the pair must not be bricked by a commit that merges to a no-op and so never gets a trailer"
+        );
+    }
+
+    #[test]
+    fn run_never_leaves_an_intermediate_dest_commit_missing_a_file_from_an_interleaved_merge() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let a1 = add_commit(&source_repo, "main", &[("main.txt", "m1\n")]);
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        let f1 = add_commit(&source_repo, "feature", &[("feature.txt", "f1\n")]);
+
+        // A merge commit on main with parents [a1, f1] whose tree carries
+        // shared.txt, main.txt, and feature.txt.
+        let a1_commit = source_repo.find_commit(a1).unwrap();
+        let f1_commit = source_repo.find_commit(f1).unwrap();
+        let mut builder = source_repo
+            .treebuilder(Some(&a1_commit.tree().unwrap()))
+            .unwrap();
+        let feature_entry = f1_commit
+            .tree()
+            .unwrap()
+            .get_name("feature.txt")
+            .unwrap()
+            .id();
+        builder
+            .insert("feature.txt", feature_entry, git2::FileMode::Blob.into())
+            .unwrap();
+        let merge_tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Merge branch 'feature'",
+                &merge_tree,
+                &[&a1_commit, &f1_commit],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        let config = write_config(
+            "unused",
+            &dest_dir.path().display().to_string(),
+            &[("main", "main")],
+        );
+        run(source_dir.path(), config.path()).expect("sync should succeed");
+
+        let dest_tip_id = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let mut revwalk = dest_repo.revwalk().unwrap();
+        revwalk.push(dest_tip_id).unwrap();
+        revwalk
+            .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+            .unwrap();
+        let commits: Vec<Oid> = revwalk.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            commits.len(),
+            3,
+            "dest history must be exactly: initial, one commit for a1, one commit for f1 \
+             (the merge commit's own merge is a content no-op, skipped per requirements/0001)"
+        );
+
+        let mut seen_so_far: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for oid in commits {
+            let commit = dest_repo.find_commit(oid).unwrap();
+            let names: std::collections::HashSet<String> = commit
+                .tree()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.name().unwrap().to_string())
+                .collect();
+            let dropped: Vec<&String> = seen_so_far.difference(&names).collect();
+            assert!(
+                dropped.is_empty(),
+                "commit {oid} dropped path(s) an earlier commit had: {dropped:?}"
+            );
+            seen_so_far.extend(names);
+        }
+    }
+
+    #[test]
+    fn run_never_pushes_an_excluded_directory_to_dest() {
+        // Guard: this passes both before and after this change — a
+        // regression check that decisions/0014's pre-filtering requirement
+        // (an excluded directory never reaching dest, and its own history
+        // never presenting as a spurious modify/delete conflict) still holds
+        // now that source→dest merges through git merge-tree instead of
+        // applying its own diff.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+        let dest_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        let secret_blob = source_repo.blob(b"shh").unwrap();
+        let mut secrets_builder = source_repo.treebuilder(None).unwrap();
+        secrets_builder
+            .insert("inner.txt", secret_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let secrets_tree = secrets_builder.write().unwrap();
+
+        let mut builder = source_repo
+            .treebuilder(Some(&graft_tip.tree().unwrap()))
+            .unwrap();
+        builder
+            .insert("secrets", secrets_tree, git2::FileMode::Tree.into())
+            .unwrap();
+        let shared_blob = source_repo.blob(b"v2").unwrap();
+        builder
+            .insert("shared.txt", shared_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let ignore_blob = source_repo.blob(b"secrets/\n").unwrap();
+        builder
+            .insert(exclude::FILENAME, ignore_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let first_commit_oid = source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "adds an excluded directory",
+                &tree,
+                &[&graft_tip],
+            )
+            .unwrap();
+
+        let config = write_config(
+            "unused",
+            &dest_dir.path().display().to_string(),
+            &[("main", "main")],
+        );
+        run(source_dir.path(), config.path()).expect("first sync should succeed");
+
+        let dest_tip_after_first = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let dest_tree = dest_tip_after_first.tree().unwrap();
+        let shared_blob_on_dest = dest_repo
+            .find_blob(dest_tree.get_name("shared.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(shared_blob_on_dest.content(), b"v2");
+        assert!(
+            dest_tree.get_name("secrets").is_none(),
+            "an excluded directory must never reach dest"
+        );
+
+        let first_commit = source_repo.find_commit(first_commit_oid).unwrap();
+        let revised_secret_blob = source_repo.blob(b"shh, revised").unwrap();
+        let mut revised_secrets_builder = source_repo.treebuilder(None).unwrap();
+        revised_secrets_builder
+            .insert(
+                "inner.txt",
+                revised_secret_blob,
+                git2::FileMode::Blob.into(),
+            )
+            .unwrap();
+        let revised_secrets_tree = revised_secrets_builder.write().unwrap();
+        let mut second_builder = source_repo
+            .treebuilder(Some(&first_commit.tree().unwrap()))
+            .unwrap();
+        second_builder
+            .insert("secrets", revised_secrets_tree, git2::FileMode::Tree.into())
+            .unwrap();
+        let second_tree = source_repo
+            .find_tree(second_builder.write().unwrap())
+            .unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "edits only the excluded path",
+                &second_tree,
+                &[&first_commit],
+            )
+            .unwrap();
+
+        run(source_dir.path(), config.path()).expect(
+            "a second sync touching only an excluded path must succeed, not hit a spurious \
+             modify/delete conflict",
+        );
+
+        let dest_tip_after_second = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_tip_after_second,
+            dest_tip_after_first.id(),
+            "a commit touching only an excluded path must not produce an empty commit on dest"
+        );
     }
 }
