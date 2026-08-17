@@ -369,3 +369,31 @@ same reason.
 
 decisions/0016 is written as `status: draft` with no `verified` stamp: the decision is
 the owner's, the write-up isn't, so it needs his review before it counts as settled.
+
+**Update**: Decided [decisions/0017](decisions/0017-source-to-dest-mirrors-every-branch.md)
+— the two directions no longer share one configured list. Prompted by the owner
+spelling out the actual development workflow for the first time: feature branches are
+created ad hoc off source's main, pushed to source, filtered and synced to dest,
+merged into dest's main when finished, and that merge is what syncs back; source's
+main also takes direct commits independent of any feature branch. decisions/0005's
+symmetric shared-pairs-list model doesn't fit that — a static config can't track
+branches created at an unpredictable rate with unpredictable names.
+
+source→dest now discovers every branch on source at run time and mirrors each one
+under its own name — no config entry, no renaming. dest→source keeps an explicit
+configured list, simplified from `{source_branch, dest_branch}` pairs to plain branch
+names, since there's nothing left to remap and only a small set of long-lived branches
+(main, typically) legitimately need content ported back — feature branches are
+transient and disappear once merged into dest's main. Branch deletion was raised and
+explicitly decided against: gitprism never deletes a branch on either side, matching
+the project's existing "don't auto-fix, fail loud" rule — a stale mirrored branch on
+dest is left for an operator to clean up.
+
+Only a lightweight prior-art check so far (git's own `refs/heads/*:refs/heads/*`
+mirroring treats "every branch, same name" as the unremarkable default; gitprism still
+needs its own enumeration step since each branch has to be filtered and merge-tree'd
+per decisions/0016 before it can be pushed, unlike a raw mirror push) — not yet
+checked with 0016's rigor against josh's own ref-handling. Flagged in 0017 itself as a
+reason it isn't marked stable yet. No code has changed for this decision: config
+schema, source→dest's discovery loop, and test reshaping are all still open, deferred
+until the write-up itself is confirmed.
