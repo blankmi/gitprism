@@ -315,9 +315,11 @@ three-way merge, and three-way merging an identical change is idempotent.
   both the duplication and the churn at the root; it also changes conflict detection
   from `ApplyFail` to `index.has_conflicts()`, and 0014's reason for filtering before
   applying is satisfiable by pre-filtering the trees instead.
-* Trailers are not pair-qualified: both marker scans accept any `Gitprism-*-Commit`
+* ~~Trailers are not pair-qualified: both marker scans accept any `Gitprism-*-Commit`
   trailer regardless of which branch pair wrote it, so dest branches merged into one
-  another can hand a pair the other pair's marker.
+  another can hand a pair the other pair's marker.~~ — resolved, see
+  [decisions/0019](decisions/0019-marker-scans-are-first-parent-only.md), which makes
+  both scans first-parent-only rather than pair-qualifying the trailer itself.
 * `trailer_value` matches `Key: value` anywhere in a message rather than only in the
   final trailer block, so a commit message that merely *quotes* a trailer (a squash
   merge concatenating bodies, say) can poison the resume scan — verified: it stops the
@@ -541,3 +543,29 @@ the merge-base equality guard.
 
 `cargo test`: 86 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
 --check`: clean.
+
+**Update**: Decided [decisions/0019](decisions/0019-marker-scans-are-first-parent-only.md)
+— resolves the "trailers are not pair-qualified" entry above, which
+decisions/0018's own Case 2 test had already run into and worked around (its
+test body explicitly avoided a real two-parent merge for exactly this
+reason). Reproduced directly: mirror a feature branch to dest
+(decisions/0017), merge its dest tip into a round-tripped branch's dest tip
+via a real, two-parent `git merge` (not decisions/0018's squash-shaped
+single-parent stand-in), and the round-tripped branch's own dest→source sync
+— run in the same invocation right after — has `newest_source_marker` walk
+into the merged-in branch's own `Gitprism-Source-Commit`-bearing commit
+(reachable via the merge's second parent) before ever reaching the
+round-tripped branch's own boundary, returning a source-space oid the
+round-tripped branch never descends from and hard-stopping the whole sync
+with "isn't at a point this clone can safely build on" — a false refusal,
+not a real one.
+
+Fixed with `Revwalk::simplify_first_parent()` (confirmed against the
+installed `git2 = "0.21.0"`) in both `newest_source_marker` and
+`newest_dest_marker`: git's own `--first-parent` history-simplification
+mechanism, so a merge commit's non-first parents (where a merged-in branch's
+own commits live) are never reachable by either scan at all. Documented,
+not engineered around: this assumes the tracked branch stays first-parent
+of its own merges — true for GitHub/GitLab/Azure DevOps' "merge PR" button
+and for `git merge` run from the target branch, not for a merge performed
+the other way around.
