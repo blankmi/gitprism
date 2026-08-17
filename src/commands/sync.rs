@@ -3,19 +3,29 @@
 //! design/decisions/0006-setup-uses-real-shared-history.md,
 //! design/decisions/0007-conflict-policy-hard-stop.md,
 //! design/decisions/0009-push-race-refetch-and-recompute.md,
-//! design/decisions/0013-repo-urls-optional-fall-back-to-env-vars.md, and
-//! design/decisions/0016-both-directions-merge-via-real-git-merge-tree.md.
+//! design/decisions/0013-repo-urls-optional-fall-back-to-env-vars.md,
+//! design/decisions/0016-both-directions-merge-via-real-git-merge-tree.md, and
+//! design/decisions/0017-source-to-dest-mirrors-every-branch.md.
 //!
-//! Both directions, per configured branch pair (decisions/0005), run one
-//! after the other. Neither does its own merge or patch work any more: each
-//! builds a `(base, ours, theirs)` tree triple for a pending commit and hands
-//! it to one real `git merge-tree --write-tree` subprocess (decisions/0016),
-//! which computes the resulting tree exactly the way a human running `git
-//! cherry-pick`/`git merge` would see it — idempotent, rename-aware, and
-//! unable to disagree between directions about what counts as a conflict.
+//! The two directions no longer share one configured list of branches
+//! (decisions/0017 supersedes decisions/0005 for source→dest's scope): every
+//! run does dest→source first for every branch named in `config.branches`,
+//! then discovers every branch that actually exists on source and does
+//! source→dest for each one — a brand-new branch needs no config entry to
+//! start mirroring. Grouping by phase rather than by branch is safe because
+//! branches are otherwise independent, and it still guarantees dest→source
+//! for a given branch completes before source→dest reads that branch's
+//! (possibly just-advanced) local tip. Neither direction does its own merge
+//! or patch work any more: each builds a `(base, ours, theirs)` tree triple
+//! for a pending commit and hands it to one real `git merge-tree
+//! --write-tree` subprocess (decisions/0016), which computes the resulting
+//! tree exactly the way a human running `git cherry-pick`/`git merge` would
+//! see it — idempotent, rename-aware, and unable to disagree between
+//! directions about what counts as a conflict.
 //!
-//! **source→dest**: fetch dest's current tip, find every source commit not
-//! yet reflected there, and for each one merge dest's current chain-tip tree
+//! **source→dest**: for every branch discovered on source, fetch dest's
+//! current tip for the same-named branch, find every source commit not yet
+//! reflected there, and for each one merge dest's current chain-tip tree
 //! (`ours`) against the source commit's own tree (`theirs`), both filtered
 //! against the *current* exclude-list (decisions/0004, 0011 — not a
 //! historical reconstruction of what it looked like at that commit) before
@@ -23,22 +33,26 @@
 //! what stops its own history looking like a modify/delete conflict on every
 //! sync. The merge base is the source commit's first-parent tree, filtered
 //! the same way. Pushes the result — fast-forward only, never forced
-//! (requirements/0001). Refuses to sync a pair at all if dest's tip carries
+//! (requirements/0001). Refuses to sync a branch at all if dest's tip carries
 //! any commit gitprism didn't put there since its own last push, rather than
 //! fast-forwarding a snapshot that would silently drop dest's independent
-//! content — that content is exactly what the next step brings back.
+//! content — that content is exactly what the dest→source phase above
+//! already brought back, for the branches configured to round-trip.
 //!
-//! **dest→source**: find every dest commit not yet reflected into source by
-//! scanning *source's* history for the most recent `Gitprism-Dest-Commit`
-//! trailer (decisions/0003) — setup's own graft commit (decisions/0006)
-//! always carries one, so this never needs a special-cased first run — then
-//! for each pending dest commit merge source's current chain-tip tree
-//! (`ours`) against the dest commit's own tree (`theirs`), unfiltered (dest
-//! never holds source-only content), and push the result to source's own
-//! remote. A real content conflict hard-stops that pair (decisions/0007):
-//! whatever merged cleanly before the conflict is still pushed, and the
-//! conflicting commit is left for a human to resolve (decisions/0008),
-//! retried automatically on the next run once it is.
+//! **dest→source**: for every branch named in `config.branches`, find every
+//! dest commit not yet reflected into source by scanning *source's* history
+//! for the most recent `Gitprism-Dest-Commit` trailer (decisions/0003) —
+//! setup's own graft commit (decisions/0006) always carries one, so this
+//! never needs a special-cased first run — then for each pending dest commit
+//! merge source's current chain-tip tree (`ours`) against the dest commit's
+//! own tree (`theirs`), unfiltered (dest never holds source-only content),
+//! and push the result to source's own remote. A real content conflict
+//! hard-stops that branch (decisions/0007): whatever merged cleanly before
+//! the conflict is still pushed, and the conflicting commit is left for a
+//! human to resolve (decisions/0008), retried automatically on the next run
+//! once it is. Branches not in `config.branches` (e.g. a transient feature
+//! branch) never round-trip this way — decisions/0017's deliberate
+//! asymmetry — and no branch is ever deleted on either side.
 //!
 //! Same discovery convention as `setup` (decisions/0012): `cwd` is a
 //! starting point for git-style upward discovery, and a relative `--config`
@@ -52,7 +66,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
-use crate::config::{BranchPair, Config};
+use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git;
 
@@ -86,45 +100,64 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // needs merging.
     git::ensure_merge_tree_supported()?;
 
-    for pair in &config.pairs {
-        // dest→source first: any content dest carries that gitprism didn't
-        // itself put there (e.g. a merged PR) must be reflected into source
-        // before source→dest's own refusal check below evaluates dest's tip
-        // — that check refuses to build on dest content it doesn't
-        // recognize, and reflecting it into source is exactly what makes it
-        // recognized (see `dest_resume_point`'s third case).
-        sync_pair_from_dest(&repo, &source_root, &config, pair).with_context(|| {
-            format!("syncing {:?} -> {:?}", pair.dest_branch, pair.source_branch)
-        })?;
-        sync_pair_to_dest(&repo, &source_root, &config, pair).with_context(|| {
-            format!("syncing {:?} -> {:?}", pair.source_branch, pair.dest_branch)
-        })?;
+    // dest→source first, for every explicitly configured branch: any content
+    // dest carries that gitprism didn't itself put there (e.g. a merged PR)
+    // must be reflected into source before source→dest's own refusal check
+    // below evaluates dest's tip — that check refuses to build on dest
+    // content it doesn't recognize, and reflecting it into source is exactly
+    // what makes it recognized (see `dest_resume_point`'s third case).
+    // Grouping by phase rather than by branch still guarantees this ordering
+    // per branch, since discovery below only runs once every dest→source call
+    // has returned (decisions/0017).
+    for branch in &config.branches {
+        sync_pair_from_dest(&repo, &source_root, &config, branch)
+            .with_context(|| format!("syncing {branch:?} dest -> source"))?;
+    }
+
+    // source→dest discovers every branch that exists on source at run time
+    // (decisions/0017) rather than reading `config.branches` — a brand-new
+    // branch needs no config entry to start mirroring. Sorted for
+    // deterministic run order: git2's branch iteration order isn't
+    // guaranteed.
+    let mut source_branches: Vec<String> = repo
+        .branches(Some(git2::BranchType::Local))
+        .context("listing source's local branches")?
+        .map(|entry| {
+            let (branch, _) = entry.context("reading a local branch")?;
+            let name = branch
+                .name()
+                .context("reading a local branch's name")?
+                .context("a local branch has a non-UTF-8 name gitprism can't mirror by")?;
+            Ok(name.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    source_branches.sort();
+
+    for branch in &source_branches {
+        sync_pair_to_dest(&repo, &source_root, &config, branch)
+            .with_context(|| format!("syncing {branch:?} source -> dest"))?;
     }
 
     Ok(())
 }
 
-/// Pushes `pair.source_branch`'s pending commits to `pair.dest_branch`,
-/// filtered, one branch pair at a time. Recomputes from scratch (refetch,
-/// rebuild, retry) on a lost fast-forward race rather than rebasing what it
-/// already built (decisions/0009).
+/// Pushes `branch`'s pending commits from source to a same-named branch on
+/// dest, filtered, one branch at a time — `branch` is discovered on source at
+/// run time by [`run`], not read from config (decisions/0017). Recomputes
+/// from scratch (refetch, rebuild, retry) on a lost fast-forward race rather
+/// than rebasing what it already built (decisions/0009).
 fn sync_pair_to_dest(
     repo: &Repository,
     source_root: &Path,
     config: &Config,
-    pair: &BranchPair,
+    branch: &str,
 ) -> Result<()> {
     let source_tip = repo
-        .find_branch(&pair.source_branch, git2::BranchType::Local)
-        .with_context(|| format!("resolving source branch {:?}", pair.source_branch))?
+        .find_branch(branch, git2::BranchType::Local)
+        .with_context(|| format!("resolving source branch {branch:?}"))?
         .get()
         .peel_to_commit()
-        .with_context(|| {
-            format!(
-                "resolving source branch {:?} to a commit",
-                pair.source_branch
-            )
-        })?
+        .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
         .id();
 
     // The exclude-list *current* as of this sync run, loaded once — not
@@ -137,36 +170,54 @@ fn sync_pair_to_dest(
 
     let mut attempt = 0;
     loop {
-        git::fetch(source_root, &dest_url, &pair.dest_branch).with_context(|| {
-            format!(
-                "fetching dest branch {:?} from {dest_url:?}",
-                pair.dest_branch
-            )
-        })?;
-        let dest_tip = repo
-            .find_reference("FETCH_HEAD")
-            .context("reading FETCH_HEAD after fetch")?
-            .peel_to_commit()
-            .context("resolving fetched dest branch to a commit")?
-            .id();
+        // decisions/0017: `branch` was discovered on source, not read from
+        // config, so unlike every branch `setup` has grafted, it may have no
+        // same-named counterpart on dest at all yet (a brand-new feature
+        // branch, say) — checked explicitly rather than attempting a fetch
+        // and treating "no such ref" as the same failure it would be for a
+        // branch that's supposed to already exist.
+        let (dest_tip, boundary) = if git::remote_ref_exists(source_root, &dest_url, branch)? {
+            git::fetch(source_root, &dest_url, branch)
+                .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
+            let dest_tip = repo
+                .find_reference("FETCH_HEAD")
+                .context("reading FETCH_HEAD after fetch")?
+                .peel_to_commit()
+                .context("resolving fetched dest branch to a commit")?
+                .id();
 
-        // There is no safe way to build a new commit straight from source's
-        // filtered snapshot and fast-forward dest onto it unless this
-        // clone's source_tip is known to be caught up with whatever dest
-        // last synced from — either because dest carries independent content
-        // gitprism hasn't reflected into source yet (dest→source, run just
-        // above in `run`, normally handles this before we ever get here), or
-        // because this clone's own source branch is behind or diverged from
-        // the source commit dest was actually last synced from (e.g. another
-        // clone already pushed for this pair). Either way, proceeding could
-        // silently drop content some other commit already contributed, even
-        // though the ref update itself would be a legitimate fast-forward.
-        let boundary = dest_resume_point(repo, source_tip, dest_tip)?.with_context(|| {
-            format!(
-                "gitprism sync: dest branch {:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)",
-                pair.dest_branch, pair.source_branch
-            )
-        })?;
+            // There is no safe way to build a new commit straight from
+            // source's filtered snapshot and fast-forward dest onto it
+            // unless this clone's source_tip is known to be caught up with
+            // whatever dest last synced from — either because dest carries
+            // independent content gitprism hasn't reflected into source yet
+            // (dest→source, run just above in `run`, normally handles this
+            // before we ever get here), or because this clone's own source
+            // branch is behind or diverged from the source commit dest was
+            // actually last synced from (e.g. another clone already pushed
+            // for this branch). Either way, proceeding could silently drop
+            // content some other commit already contributed, even though the
+            // ref update itself would be a legitimate fast-forward.
+            let boundary = dest_resume_point(repo, source_tip, dest_tip)?.with_context(|| {
+                format!(
+                    "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)"
+                )
+            })?;
+            (dest_tip, boundary)
+        } else {
+            // No dest ref to be unsafe about yet, so no safety check applies
+            // either — this branch's own ancestry already carries dest
+            // content, inherited from whichever branch it was created from
+            // (typically a branch `setup` grafted), so the nearest
+            // `Gitprism-Dest-Commit` trailer reachable from `source_tip`
+            // names both the dest-space tree to build the new chain onto and
+            // the source-space boundary `pending_commits` should resume
+            // from — the same graft-derived ancestry decisions/0006
+            // established, just read directly off source's own history
+            // instead of off a dest ref that doesn't exist.
+            let (boundary, dest_tip) = newest_dest_marker(repo, source_tip)?;
+            (dest_tip, boundary)
+        };
 
         let build = build_pending_dest_tip(
             repo,
@@ -179,7 +230,7 @@ fn sync_pair_to_dest(
         )?;
 
         if let Some(new_dest_tip) = build.new_tip {
-            match git::push(source_root, &dest_url, new_dest_tip, &pair.dest_branch)? {
+            match git::push(source_root, &dest_url, new_dest_tip, branch)? {
                 git::PushOutcome::Accepted => {}
                 git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
                     // dest's tip moved between fetch and push — refetch
@@ -189,8 +240,7 @@ fn sync_pair_to_dest(
                     continue;
                 }
                 git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
-                    "gitprism sync: pushing {:?} kept losing a fast-forward race after {} retries",
-                    pair.dest_branch,
+                    "gitprism sync: pushing {branch:?} kept losing a fast-forward race after {} retries",
                     MAX_RACE_RETRIES
                 ),
             }
@@ -198,13 +248,9 @@ fn sync_pair_to_dest(
 
         if let Some(conflict) = build.conflict {
             anyhow::bail!(
-                "gitprism sync: {:?} <- {:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {:?}` (decisions/0007, decisions/0008, decisions/0014); commits before it were still pushed to dest's {:?} branch",
-                pair.dest_branch,
-                pair.source_branch,
+                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}` (decisions/0007, decisions/0008, decisions/0014); commits before it were still pushed to dest's {branch:?} branch",
                 conflict.commit,
-                conflict.paths,
-                pair.source_branch,
-                pair.dest_branch
+                conflict.paths
             );
         }
 
@@ -635,9 +681,11 @@ fn build_dest_commit(
     })
 }
 
-/// Cherry-picks `pair.dest_branch`'s pending commits onto `pair.source_branch`
-/// and pushes the result to source's own remote (decisions/0013), one branch
-/// pair at a time. A real conflict hard-stops this pair (decisions/0007):
+/// Cherry-picks dest's pending commits on `branch` onto source's same-named
+/// branch and pushes the result to source's own remote (decisions/0013), one
+/// branch at a time — `branch` always comes from `config.branches`
+/// (decisions/0017), the explicit, small set of branches dest content is
+/// ported back for. A real conflict hard-stops this branch (decisions/0007):
 /// whatever applied cleanly before it is still pushed, and the conflict is
 /// reported with enough detail for `gitprism resolve` (decisions/0008) to act
 /// on later — no trailer is written for the unresolved commit, so the next
@@ -646,18 +694,14 @@ fn sync_pair_from_dest(
     repo: &Repository,
     source_root: &Path,
     config: &Config,
-    pair: &BranchPair,
+    branch: &str,
 ) -> Result<()> {
     let dest_url = config.dest_url()?;
 
     let mut attempt = 0;
     loop {
-        git::fetch(source_root, &dest_url, &pair.dest_branch).with_context(|| {
-            format!(
-                "fetching dest branch {:?} from {dest_url:?}",
-                pair.dest_branch
-            )
-        })?;
+        git::fetch(source_root, &dest_url, branch)
+            .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
         let dest_tip = repo
             .find_reference("FETCH_HEAD")
             .context("reading FETCH_HEAD after fetch")?
@@ -675,29 +719,21 @@ fn sync_pair_from_dest(
         // refetch-and-recompute principle decisions/0009 already established
         // for the source→dest direction.
         let source_tip = if attempt == 0 {
-            repo.find_branch(&pair.source_branch, git2::BranchType::Local)
-                .with_context(|| format!("resolving source branch {:?}", pair.source_branch))?
+            repo.find_branch(branch, git2::BranchType::Local)
+                .with_context(|| format!("resolving source branch {branch:?}"))?
                 .get()
                 .peel_to_commit()
-                .with_context(|| {
-                    format!(
-                        "resolving source branch {:?} to a commit",
-                        pair.source_branch
-                    )
-                })?
+                .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
                 .id()
         } else {
             // Only resolved once actually needed — a config that omits
             // [source].url/GITPRISM_SOURCE_URL entirely (decisions/0013) is
-            // valid as long as this pair never actually needs to push
+            // valid as long as this branch never actually needs to push
             // anything to source, e.g. a branch that never receives
             // independent dest-side commits.
             let source_url = config.source_url()?;
-            git::fetch(source_root, &source_url, &pair.source_branch).with_context(|| {
-                format!(
-                    "fetching source branch {:?} from {source_url:?}",
-                    pair.source_branch
-                )
+            git::fetch(source_root, &source_url, branch).with_context(|| {
+                format!("fetching source branch {branch:?} from {source_url:?}")
             })?;
             repo.find_reference("FETCH_HEAD")
                 .context("reading FETCH_HEAD after fetch")?
@@ -707,31 +743,22 @@ fn sync_pair_from_dest(
         };
 
         let pending = pending_dest_commits(repo, source_tip, dest_tip).with_context(|| {
-            format!(
-                "has dest branch {:?}'s history been rewritten outside gitprism?",
-                pair.dest_branch
-            )
+            format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
         })?;
         let build = build_pending_source_tip(repo, config, pending, source_tip, source_root)?;
 
         if let Some(new_source_tip) = build.new_tip {
             let source_url = config.source_url()?;
-            match git::push(
-                source_root,
-                &source_url,
-                new_source_tip,
-                &pair.source_branch,
-            )? {
+            match git::push(source_root, &source_url, new_source_tip, branch)? {
                 git::PushOutcome::Accepted => {
-                    advance_local_source_branch(repo, &pair.source_branch, new_source_tip)?;
+                    advance_local_source_branch(repo, branch, new_source_tip)?;
                 }
                 git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
                     attempt += 1;
                     continue;
                 }
                 git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
-                    "gitprism sync: pushing {:?} kept losing a fast-forward race after {} retries",
-                    pair.source_branch,
+                    "gitprism sync: pushing {branch:?} kept losing a fast-forward race after {} retries",
                     MAX_RACE_RETRIES
                 ),
             }
@@ -739,13 +766,9 @@ fn sync_pair_from_dest(
 
         if let Some(conflict) = build.conflict {
             anyhow::bail!(
-                "gitprism sync: {:?} <- {:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {:?}` (decisions/0007, decisions/0008); commits before it were still pushed to source's {:?} branch",
-                pair.source_branch,
-                pair.dest_branch,
+                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}` (decisions/0007, decisions/0008); commits before it were still pushed to source's {branch:?} branch",
                 conflict.commit,
-                conflict.paths,
-                pair.source_branch,
-                pair.source_branch
+                conflict.paths
             );
         }
 
@@ -1137,20 +1160,19 @@ mod tests {
     /// to) when a pair has something dest→source needs to push — plenty of
     /// tests below never reach that path and pass `"unused"`, same
     /// convention `setup`'s own tests use for an irrelevant `[dest].url`.
-    fn write_config(source_url: &str, dest_url: &str, pairs: &[(&str, &str)]) -> NamedTempFile {
-        let pairs_toml: String = pairs
+    fn write_config(source_url: &str, dest_url: &str, branches: &[&str]) -> NamedTempFile {
+        let branches_toml: String = branches
             .iter()
-            .map(|(source_branch, dest_branch)| {
-                format!(
-                    "[[pairs]]\nsource_branch = \"{source_branch}\"\ndest_branch = \"{dest_branch}\"\n"
-                )
-            })
-            .collect();
+            .map(|branch| format!("{branch:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,
             r#"
+            branches = [{branches_toml}]
+
             [committer]
             name = "gitprism"
             email = "gitprism@example.com"
@@ -1160,8 +1182,6 @@ mod tests {
 
             [dest]
             url = "{dest_url}"
-
-            {pairs_toml}
             "#,
         )
         .unwrap();
@@ -1378,6 +1398,39 @@ mod tests {
             .unwrap()
     }
 
+    /// Same shape as [`add_independent_dest_commit`], but for a branch other
+    /// than "main" — decisions/0017's discovered branches don't all mirror to
+    /// "main" on dest, so tests covering them need an independent-dest-commit
+    /// fixture parameterized by branch too.
+    fn add_independent_dest_commit_on(
+        dest_repo: &Repository,
+        branch: &str,
+        parent: Oid,
+        file: (&str, &str),
+        message: &str,
+    ) -> Oid {
+        let parent_commit = dest_repo.find_commit(parent).unwrap();
+        let mut builder = dest_repo
+            .treebuilder(Some(&parent_commit.tree().unwrap()))
+            .unwrap();
+        let blob = dest_repo.blob(file.1.as_bytes()).unwrap();
+        builder
+            .insert(file.0, blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        dest_repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap()
+    }
+
     #[test]
     fn run_pushes_a_new_source_commit_to_dest_filtered() {
         let dest_dir = tempdir().unwrap();
@@ -1399,11 +1452,7 @@ mod tests {
             ],
         );
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("sync should succeed");
 
         let new_dest_tip = dest_repo
@@ -1458,11 +1507,7 @@ mod tests {
         ];
         add_commit_bytes(&source_repo, "main", &[("blob.bin", binary_content)]);
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path())
             .expect("sync should succeed and carry the binary file to dest");
 
@@ -1508,11 +1553,7 @@ mod tests {
             ],
         );
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path())
             .expect("sync should succeed even with nothing to push");
 
@@ -1546,11 +1587,7 @@ mod tests {
         let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
         add_commit(&source_repo, "main", &[("shared.txt", "v2")]);
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("first sync should succeed");
         // A second run with nothing new on source must be a true no-op, not
         // re-walk all the way back to the graft and re-push v2 again.
@@ -1610,11 +1647,7 @@ mod tests {
             )
             .unwrap();
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("sync should succeed");
 
         let still_dest_tip = dest_repo
@@ -1657,11 +1690,7 @@ mod tests {
         // historical snapshot, so this must still catch the earlier commit.
         add_commit(&source_repo, "main", &[(exclude::FILENAME, "secret.txt\n")]);
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("sync should succeed");
 
         let new_dest_tip = dest_repo
@@ -1736,7 +1765,7 @@ mod tests {
         let config = write_config(
             &source_remote.path().display().to_string(),
             &dest_dir.path().display().to_string(),
-            &[("main", "main")],
+            &["main"],
         );
         run(source_dir.path(), config.path()).expect("both directions should succeed");
 
@@ -1822,11 +1851,7 @@ mod tests {
             "main",
             &[("shared.txt", "vA"), ("only-a.txt", "from A")],
         );
-        let config_a = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config_a = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(clone_a_dir.path(), config_a.path()).expect("clone A's sync should succeed");
 
         let dest_tip_after_a = dest_repo
@@ -1849,11 +1874,7 @@ mod tests {
             "main",
             &[("shared.txt", "vB"), ("only-b.txt", "from B")],
         );
-        let config_b = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config_b = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
         let err = run(clone_b_dir.path(), config_b.path()).expect_err(
             "a divergent clone must not rebuild its own snapshot on top of dest just because dest's tip has *some* Gitprism-Source-Commit trailer",
@@ -1896,11 +1917,7 @@ mod tests {
             "main",
             &[("shared.txt", "vA"), ("only-a.txt", "from A")],
         );
-        let config_a = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config_a = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(clone_a_dir.path(), config_a.path()).expect("clone A's sync should succeed");
 
         let dest_tip_after_a = dest_repo
@@ -1945,7 +1962,7 @@ mod tests {
         let config_b = write_config(
             &clone_b_remote.path().display().to_string(),
             &dest_dir.path().display().to_string(),
-            &[("main", "main")],
+            &["main"],
         );
 
         let err = run(clone_b_dir.path(), config_b.path()).expect_err(
@@ -1990,7 +2007,7 @@ mod tests {
         let config = write_config(
             &source_remote.path().display().to_string(),
             &dest_dir.path().display().to_string(),
-            &[("main", "main")],
+            &["main"],
         );
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
@@ -2089,7 +2106,7 @@ mod tests {
         let config = write_config(
             &source_remote.path().display().to_string(),
             &dest_dir.path().display().to_string(),
-            &[("main", "main")],
+            &["main"],
         );
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
@@ -2191,11 +2208,7 @@ mod tests {
         source_repo.set_head("refs/heads/main").unwrap();
         source_repo.checkout_head(None).unwrap();
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
         let dest_tip_commit = dest_repo
@@ -2296,11 +2309,7 @@ mod tests {
         source_repo.set_head("refs/heads/main").unwrap();
         source_repo.checkout_head(None).unwrap();
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
         // Intermediate dest commits are a linearization artifact: whichever
@@ -2365,7 +2374,7 @@ mod tests {
         let config = write_config(
             &source_remote.path().display().to_string(),
             &dest_dir.path().display().to_string(),
-            &[("main", "main")],
+            &["main"],
         );
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
@@ -2538,7 +2547,7 @@ mod tests {
         let config = write_config(
             &source_remote.path().display().to_string(),
             &dest_dir.path().display().to_string(),
-            &[("main", "main")],
+            &["main"],
         );
         run(source_dir.path(), config.path()).expect("first run should succeed");
 
@@ -2609,17 +2618,14 @@ mod tests {
             write_config(
                 &source_remote.path().display().to_string(),
                 &dest_dir.path().display().to_string(),
-                &[("main", "main")],
+                &["main"],
             )
             .path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
-        sync_pair_from_dest(&repo, source_dir.path(), &config, &pair)
+        let branch = "main";
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
             .expect("a loop-prevented sync is still a successful no-op");
 
         let source_remote_repo = Repository::open(source_remote.path()).unwrap();
@@ -2679,18 +2685,15 @@ mod tests {
             write_config(
                 &source_remote.path().display().to_string(),
                 &dest_dir.path().display().to_string(),
-                &[("main", "main")],
+                &["main"],
             )
             .path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
+        let branch = "main";
 
-        let err = sync_pair_from_dest(&repo, source_dir.path(), &config, &pair).expect_err(
+        let err = sync_pair_from_dest(&repo, source_dir.path(), &config, branch).expect_err(
             "a real same-file conflict must hard-stop, not silently resolve either side",
         );
         let message = format!("{err:#}");
@@ -2766,21 +2769,13 @@ mod tests {
             .unwrap();
 
         let config = Config::load(
-            write_config(
-                "unused",
-                &dest_dir.path().display().to_string(),
-                &[("main", "main")],
-            )
-            .path(),
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
+        let branch = "main";
 
-        let err = sync_pair_to_dest(&repo, source_dir.path(), &config, &pair).expect_err(
+        let err = sync_pair_to_dest(&repo, source_dir.path(), &config, branch).expect_err(
             "a real same-file conflict must hard-stop, not silently resolve either side",
         );
         let message = format!("{err:#}");
@@ -2850,17 +2845,14 @@ mod tests {
             write_config(
                 &source_remote.path().display().to_string(),
                 &dest_dir.path().display().to_string(),
-                &[("main", "main")],
+                &["main"],
             )
             .path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
-        sync_pair_from_dest(&repo, source_dir.path(), &config, &pair)
+        let branch = "main";
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
             .expect("dest→source should succeed even when the last commit is a no-op");
 
         // The newest commit on source must still name dest_b exactly, even
@@ -2885,7 +2877,7 @@ mod tests {
         // With that marker in place, source→dest must actually recognize
         // dest_b's tip as accounted for and proceed normally, not refuse.
         let repo = Repository::open(source_dir.path()).unwrap();
-        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair).expect(
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch).expect(
             "source→dest must recognize a dest tip whose only marker is a no-op commit, not refuse it",
         );
     }
@@ -2920,16 +2912,14 @@ mod tests {
         write!(
             config_file,
             r#"
+            branches = ["main"]
+
             [committer]
             name = "gitprism"
             email = "gitprism@example.com"
 
             [dest]
             url = "{}"
-
-            [[pairs]]
-            source_branch = "main"
-            dest_branch = "main"
             "#,
             dest_dir.path().display()
         )
@@ -3081,21 +3071,13 @@ mod tests {
             .unwrap();
 
         let config = Config::load(
-            write_config(
-                "unused",
-                &dest_dir.path().display().to_string(),
-                &[("main", "main")],
-            )
-            .path(),
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
+        let branch = "main";
 
-        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair)
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch)
             .expect("a rename carrying dest's own edit across it must merge cleanly");
 
         let new_dest_tip = dest_repo
@@ -3167,18 +3149,15 @@ mod tests {
             write_config(
                 &source_remote.path().display().to_string(),
                 &dest_dir.path().display().to_string(),
-                &[("main", "main")],
+                &["main"],
             )
             .path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
+        let branch = "main";
 
-        sync_pair_from_dest(&repo, source_dir.path(), &config, &pair)
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
             .expect("dest's edit to a file source renamed must carry across cleanly");
 
         let source_remote_repo = Repository::open(source_remote.path()).unwrap();
@@ -3238,18 +3217,15 @@ mod tests {
             write_config(
                 &source_remote.path().display().to_string(),
                 &dest_dir.path().display().to_string(),
-                &[("main", "main")],
+                &["main"],
             )
             .path(),
         )
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
-        let pair = BranchPair {
-            source_branch: "main".to_string(),
-            dest_branch: "main".to_string(),
-        };
+        let branch = "main";
 
-        sync_pair_from_dest(&repo, source_dir.path(), &config, &pair)
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
             .expect("an identical independent change must merge cleanly, not conflict");
 
         let source_remote_repo = Repository::open(source_remote.path()).unwrap();
@@ -3268,7 +3244,7 @@ mod tests {
         );
 
         let repo = Repository::open(source_dir.path()).unwrap();
-        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair)
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch)
             .expect("a content no-op merge must not be misreported as a conflict");
 
         let dest_tip_commit = dest_repo
@@ -3289,7 +3265,7 @@ mod tests {
         assert_eq!(shared_blob.content(), b"v2\n");
 
         let repo = Repository::open(source_dir.path()).unwrap();
-        sync_pair_to_dest(&repo, source_dir.path(), &config, &pair)
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch)
             .expect("a repeat sync of the same no-op merge must still succeed");
         let dest_tip_after_repeat = dest_repo
             .find_branch("main", git2::BranchType::Local)
@@ -3358,11 +3334,7 @@ mod tests {
         source_repo.set_head("refs/heads/main").unwrap();
         source_repo.checkout_head(None).unwrap();
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("sync should succeed");
 
         let dest_tip_id = dest_repo
@@ -3465,11 +3437,7 @@ mod tests {
             )
             .unwrap();
 
-        let config = write_config(
-            "unused",
-            &dest_dir.path().display().to_string(),
-            &[("main", "main")],
-        );
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
         let dest_tip_after_first = dest_repo
@@ -3535,6 +3503,143 @@ mod tests {
             dest_tip_after_second,
             dest_tip_after_first.id(),
             "a commit touching only an excluded path must not produce an empty commit on dest"
+        );
+    }
+
+    #[test]
+    fn run_mirrors_an_ad_hoc_source_branch_with_no_config_entry() {
+        // decisions/0017's central promise: a branch nobody ran `gitprism
+        // setup` for and that appears nowhere in `config.branches` still
+        // gets discovered and mirrored to dest — filtered and merge-tree'd
+        // exactly like any configured branch — simulating a developer
+        // branching off source's main with no setup step of their own.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(
+            &source_repo,
+            "feature-x",
+            &[
+                ("feature.txt", "line1\n"),
+                ("secret.txt", "only for source"),
+                (exclude::FILENAME, "secret.txt\n"),
+            ],
+        );
+
+        // "feature-x" appears nowhere here.
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("sync should succeed");
+
+        let dest_feature_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must be mirrored to dest even with zero config entry for it")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = dest_feature_tip.tree().unwrap();
+        let feature_blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(feature_blob.content(), b"line1\n");
+        assert!(
+            tree.get_name("secret.txt").is_none(),
+            "an excluded file must never reach dest, even on a discovered branch"
+        );
+        assert!(
+            tree.get_name(exclude::FILENAME).is_none(),
+            ".gitprismignore itself must never reach dest, even on a discovered branch"
+        );
+    }
+
+    #[test]
+    fn run_does_not_pull_back_independent_content_from_a_non_configured_branch() {
+        // decisions/0017's deliberate asymmetry: dest→source only ever
+        // reflects content back for branches named in `config.branches`.
+        // Content landing directly on a discovered-but-unconfigured branch's
+        // dest mirror must never be pulled back into source — feature
+        // branches are transient and never round-trip.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "line1\n")]);
+        let source_feature_tip = source_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("first sync should mirror feature-x to dest");
+
+        let dest_feature_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        // Content landing directly on dest's mirror — e.g. someone pushing
+        // straight to it — independent of anything gitprism put there.
+        add_independent_dest_commit_on(
+            &dest_repo,
+            "feature-x",
+            dest_feature_tip,
+            ("dest-only.txt", "pushed straight to the mirror"),
+            "an independent change on the mirrored feature branch",
+        );
+
+        // "feature-x" isn't in config.branches, so dest→source never
+        // considers it at all — this run's source→dest half correctly
+        // refuses to fast-forward feature-x over dest content it doesn't
+        // recognize, the same safety check any configured branch gets
+        // (decisions/0009) — expected to surface as an error here precisely
+        // because nothing will ever bring this branch's dest content back
+        // into source to make it recognized.
+        let err = run(source_dir.path(), config.path()).expect_err(
+            "source→dest must refuse to build over dest content it doesn't recognize, even on a discovered branch",
+        );
+        assert!(format!("{err:#}").contains("feature-x"));
+
+        let source_feature_tip_after = source_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            source_feature_tip_after, source_feature_tip,
+            "feature-x's independent dest content must never be pulled back into source — \
+             dest→source is scoped to config.branches only"
         );
     }
 }

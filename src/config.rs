@@ -3,7 +3,14 @@
 //!
 //! Holds what every command needs: source's and dest's locations, the
 //! committer identity gitprism stamps on commits it creates (decisions/0010),
-//! and the configured branch-pair list (decisions/0005).
+//! and `branches` — one plain list of branch names serving two different jobs
+//! (decisions/0005, decisions/0017). `setup` grafts every named branch onto
+//! dest's same-named tip. `sync`'s dest→source direction treats this same
+//! list as the explicit, small set of branches whose independent dest content
+//! gets ported back to source. `sync`'s source→dest direction doesn't read
+//! this list at all — it discovers every branch that exists on source at run
+//! time and mirrors each one to dest under its own name, so a brand-new
+//! branch needs no config entry to start syncing.
 
 use std::fs;
 use std::path::Path;
@@ -38,7 +45,7 @@ pub struct Config {
     #[serde(default)]
     pub dest: Dest,
     #[serde(default)]
-    pub pairs: Vec<BranchPair>,
+    pub branches: Vec<String>,
 }
 
 /// The identity gitprism stamps as committer on every commit it creates,
@@ -62,12 +69,6 @@ pub struct Source {
 #[derive(Debug, Default, Deserialize)]
 pub struct Dest {
     pub url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BranchPair {
-    pub source_branch: String,
-    pub dest_branch: String,
 }
 
 impl Config {
@@ -136,20 +137,14 @@ mod tests {
     fn load_parses_a_well_formed_config() {
         let file = write_config(
             r#"
+            branches = ["main", "release-2.0"]
+
             [committer]
             name = "gitprism"
             email = "gitprism@example.com"
 
             [dest]
             url = "git@example.com:group/dest.git"
-
-            [[pairs]]
-            source_branch = "main"
-            dest_branch = "main"
-
-            [[pairs]]
-            source_branch = "release-2.0"
-            dest_branch = "release-2.0"
             "#,
         );
 
@@ -158,15 +153,11 @@ mod tests {
         assert_eq!(config.committer.name, "gitprism");
         assert_eq!(config.committer.email, "gitprism@example.com");
         assert_eq!(config.dest_url().unwrap(), "git@example.com:group/dest.git");
-        assert_eq!(config.pairs.len(), 2);
-        assert_eq!(config.pairs[0].source_branch, "main");
-        assert_eq!(config.pairs[0].dest_branch, "main");
-        assert_eq!(config.pairs[1].source_branch, "release-2.0");
-        assert_eq!(config.pairs[1].dest_branch, "release-2.0");
+        assert_eq!(config.branches, vec!["main", "release-2.0"]);
     }
 
     #[test]
-    fn load_defaults_pairs_to_empty_when_omitted() {
+    fn load_defaults_branches_to_empty_when_omitted() {
         let file = write_config(
             r#"
             [committer]
@@ -178,9 +169,9 @@ mod tests {
             "#,
         );
 
-        let config = Config::load(file.path()).expect("config without pairs should still parse");
+        let config = Config::load(file.path()).expect("config without branches should still parse");
 
-        assert!(config.pairs.is_empty());
+        assert!(config.branches.is_empty());
     }
 
     #[test]

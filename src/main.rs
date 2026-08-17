@@ -16,8 +16,8 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Commands::Setup => commands::setup::run(Path::new("."), &cli.config),
         Commands::Sync => commands::sync::run(Path::new("."), &cli.config),
-        Commands::Resolve { pair, r#continue } => {
-            commands::resolve::run(Path::new("."), &cli.config, pair, *r#continue)
+        Commands::Resolve { branch, r#continue } => {
+            commands::resolve::run(Path::new("."), &cli.config, branch, *r#continue)
         }
     }
 }

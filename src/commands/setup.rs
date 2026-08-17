@@ -2,10 +2,10 @@
 //! design/decisions/0012-config-versioned-in-source.md, and
 //! design/decisions/0011-exclude-list-is-gitignore-syntax.md.
 //!
-//! For every configured branch pair (decisions/0005), independently: fetch
-//! dest's tip for that pair's `dest_branch` (real `git` subprocess, per
-//! decisions/0002), then create source's `source_branch` as a brand-new
-//! commit — dest's tree plus this same `.gitprism.toml` and
+//! For every configured branch (decisions/0005, decisions/0017),
+//! independently: fetch dest's tip for that branch name (real `git`
+//! subprocess, per decisions/0002), then create a same-named branch on source
+//! as a brand-new commit — dest's tree plus this same `.gitprism.toml` and
 //! `.gitprismignore` — parented directly on dest's tip commit.
 //!
 //! That graft commit also carries a `Gitprism-Dest-Commit` trailer
@@ -61,7 +61,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     // A fresh `git init` already leaves HEAD symbolically pointing at some
     // default branch (commonly "main") while still unborn. If that name
-    // collides with a configured pair, rollback below needs to move HEAD
+    // collides with a configured branch, rollback below needs to move HEAD
     // off of it before it can delete that branch — captured now so it can
     // be restored to exactly this afterward.
     let original_head = repo
@@ -81,9 +81,9 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let config_raw = fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
     let config = Config::parse(&config_raw, &config_path)?;
-    if config.pairs.is_empty() {
+    if config.branches.is_empty() {
         anyhow::bail!(
-            "gitprism setup: no branch pairs configured in {} — nothing to graft",
+            "gitprism setup: no branches configured in {} — nothing to graft",
             config_path.display()
         );
     }
@@ -105,18 +105,14 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     ExcludeList::from_contents(&ignore_raw)
         .with_context(|| format!("parsing {}", ignore_path.display()))?;
 
-    // Fetch every pair's dest tip before writing anything, so a fetch
+    // Fetch every branch's dest tip before writing anything, so a fetch
     // failure partway through never leaves some branches grafted and
     // others not.
     let dest_url = config.dest_url()?;
-    let mut dest_tips = Vec::with_capacity(config.pairs.len());
-    for pair in &config.pairs {
-        git::fetch(&source_root, &dest_url, &pair.dest_branch).with_context(|| {
-            format!(
-                "fetching dest branch {:?} from {dest_url:?}",
-                pair.dest_branch
-            )
-        })?;
+    let mut dest_tips = Vec::with_capacity(config.branches.len());
+    for branch in &config.branches {
+        git::fetch(&source_root, &dest_url, branch)
+            .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
         // FETCH_HEAD gets overwritten by the next fetch, so resolve it to a
         // concrete oid right away rather than re-reading it later.
         let dest_tip = repo
@@ -129,13 +125,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     }
 
     // Commit phase: every precondition above already held, so failure here
-    // should be rare — but if one pair still fails partway (e.g. an invalid
-    // branch name), roll back this run's already-created branches rather
-    // than leaving a half-grafted repo behind.
-    let mut created_branches = Vec::with_capacity(config.pairs.len());
-    for (pair, dest_tip) in config.pairs.iter().zip(&dest_tips) {
-        match graft_pair(&repo, &config, &config_raw, &ignore_raw, pair, *dest_tip) {
-            Ok(()) => created_branches.push(pair.source_branch.as_str()),
+    // should be rare — but if one branch still fails partway (e.g. an
+    // invalid branch name), roll back this run's already-created branches
+    // rather than leaving a half-grafted repo behind.
+    let mut created_branches = Vec::with_capacity(config.branches.len());
+    for (branch, dest_tip) in config.branches.iter().zip(&dest_tips) {
+        match graft_branch(&repo, &config, &config_raw, &ignore_raw, branch, *dest_tip) {
+            Ok(()) => created_branches.push(branch.as_str()),
             Err(err) => {
                 rollback_branches(&repo, &created_branches, original_head.as_deref());
                 return Err(err);
@@ -157,15 +153,15 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         }
     }
 
-    // Materialize the graft: point HEAD at the first configured pair's
-    // branch and check its tree out into the working directory, same as a
-    // fresh `git clone` leaves you on a real, populated checkout rather than
-    // an unborn HEAD with content that only exists as unreachable objects.
-    // A checkout conflict here is treated the same as a commit-phase
-    // failure — roll back every branch this run created rather than leaving
-    // grafted branches behind that HEAD never actually landed on.
-    if let Some(first) = config.pairs.first()
-        && let Err(err) = checkout_branch(&repo, &first.source_branch)
+    // Materialize the graft: point HEAD at the first configured branch and
+    // check its tree out into the working directory, same as a fresh `git
+    // clone` leaves you on a real, populated checkout rather than an unborn
+    // HEAD with content that only exists as unreachable objects. A checkout
+    // conflict here is treated the same as a commit-phase failure — roll
+    // back every branch this run created rather than leaving grafted
+    // branches behind that HEAD never actually landed on.
+    if let Some(first) = config.branches.first()
+        && let Err(err) = checkout_branch(&repo, first)
     {
         // The control files were just deleted above to let checkout land
         // them cleanly; a failed checkout must not leave the user without
@@ -217,12 +213,12 @@ fn checkout_branch(repo: &Repository, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn graft_pair(
+fn graft_branch(
     repo: &Repository,
     config: &Config,
     config_raw: &str,
     ignore_raw: &str,
-    pair: &crate::config::BranchPair,
+    branch: &str,
     dest_tip: git2::Oid,
 ) -> Result<()> {
     let dest_tip = repo
@@ -254,22 +250,20 @@ fn graft_pair(
     let signature = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
     let message = format!(
-        "gitprism setup: graft {:?} onto dest {:?}@{}\n\nGitprism-Dest-Commit: {}\n",
-        pair.source_branch,
-        pair.dest_branch,
+        "gitprism setup: graft {branch:?} onto dest's tip {}\n\nGitprism-Dest-Commit: {}\n",
         dest_tip.id(),
         dest_tip.id()
     );
 
     repo.commit(
-        Some(&format!("refs/heads/{}", pair.source_branch)),
+        Some(&format!("refs/heads/{branch}")),
         &signature,
         &signature,
         &message,
         &tree,
         &[&dest_tip],
     )
-    .with_context(|| format!("creating graft commit for {:?}", pair.source_branch))?;
+    .with_context(|| format!("creating graft commit for {branch:?}"))?;
 
     Ok(())
 }
@@ -308,28 +302,25 @@ mod tests {
         .unwrap()
     }
 
-    fn write_config(dest_url: &str, pairs: &[(&str, &str)]) -> NamedTempFile {
-        let pairs_toml: String = pairs
+    fn write_config(dest_url: &str, branches: &[&str]) -> NamedTempFile {
+        let branches_toml: String = branches
             .iter()
-            .map(|(source_branch, dest_branch)| {
-                format!(
-                    "[[pairs]]\nsource_branch = \"{source_branch}\"\ndest_branch = \"{dest_branch}\"\n"
-                )
-            })
-            .collect();
+            .map(|branch| format!("{branch:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,
             r#"
+            branches = [{branches_toml}]
+
             [committer]
             name = "gitprism"
             email = "gitprism@example.com"
 
             [dest]
             url = "{dest_url}"
-
-            {pairs_toml}
             "#,
         )
         .unwrap();
@@ -337,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn run_grafts_every_configured_pair_onto_dests_tip() {
+    fn run_grafts_every_configured_branch_onto_dests_tip() {
         let dest_dir = tempdir().unwrap();
         let main_tip = repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
         let release_tip = repo_with_a_commit_on(dest_dir.path(), "release-2.0", &[("b.txt", "b")]);
@@ -348,7 +339,7 @@ mod tests {
 
         let config = write_config(
             &dest_dir.path().display().to_string(),
-            &[("main", "main"), ("release-2.0", "release-2.0")],
+            &["main", "release-2.0"],
         );
 
         run(source_dir.path(), config.path()).expect("setup should succeed");
@@ -385,7 +376,7 @@ mod tests {
         assert!(release_tree.get_name("b.txt").is_some());
         assert!(release_tree.get_name(crate::config::FILENAME).is_some());
 
-        // The first configured pair's branch — "main" — must be materialized:
+        // The first configured branch — "main" — must be materialized:
         // HEAD points at it, and its tree is actually checked out on disk.
         assert_eq!(repo.head().unwrap().name().unwrap(), "refs/heads/main");
         assert!(!repo.head_detached().unwrap());
@@ -404,10 +395,10 @@ mod tests {
 
         let source_dir = tempdir().unwrap();
         // Simulate a prior setup run (or any other pre-existing history) —
-        // not necessarily even the same branch name as a configured pair.
+        // not necessarily even the same branch name as a configured branch.
         repo_with_a_commit_on(source_dir.path(), "unrelated", &[("existing.txt", "x")]);
 
-        let config = write_config(&dest_dir.path().display().to_string(), &[("main", "main")]);
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
         let err = run(source_dir.path(), config.path())
             .expect_err("re-running setup over an existing history must not succeed");
@@ -423,7 +414,7 @@ mod tests {
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
         let config_toml = format!(
-            "[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n\n[[pairs]]\nsource_branch = \"main\"\ndest_branch = \"main\"\n",
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n",
             dest_dir.path().display()
         );
         fs::write(source_dir.path().join(crate::config::FILENAME), config_toml).unwrap();
@@ -460,7 +451,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = write_config(&dest_dir.path().display().to_string(), &[("main", "main")]);
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
         run(source_dir.path(), config.path())
             .expect_err("a conflicting untracked file must stop setup, not be overwritten");
@@ -489,7 +480,7 @@ mod tests {
         )
         .unwrap();
         let config_toml = format!(
-            "[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n\n[[pairs]]\nsource_branch = \"main\"\ndest_branch = \"main\"\n",
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n",
             dest_dir.path().display()
         );
         fs::write(
@@ -518,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn run_fails_loudly_on_an_empty_pairs_list() {
+    fn run_fails_loudly_on_an_empty_branches_list() {
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
         let config_toml = "[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"unused\"\n";
@@ -528,13 +519,13 @@ mod tests {
             source_dir.path(),
             &source_dir.path().join(crate::config::FILENAME),
         )
-        .expect_err("an empty pairs list must not silently succeed");
+        .expect_err("an empty branches list must not silently succeed");
 
-        assert!(err.to_string().contains("no branch pairs configured"));
+        assert!(err.to_string().contains("no branches configured"));
         assert_eq!(
             fs::read_to_string(source_dir.path().join(crate::config::FILENAME)).unwrap(),
             config_toml,
-            "rejecting an empty pairs list must not touch the user's config file"
+            "rejecting an empty branches list must not touch the user's config file"
         );
     }
 
@@ -546,7 +537,7 @@ mod tests {
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
         // No .gitprismignore written here at all.
-        let config = write_config(&dest_dir.path().display().to_string(), &[("main", "main")]);
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
         run(source_dir.path(), config.path())
             .expect("a missing .gitprismignore should not fail setup");
@@ -572,7 +563,7 @@ mod tests {
         // A plain directory, deliberately never `git init`'d — same as
         // running any other git command outside a repo.
         let not_a_repo = tempdir().unwrap();
-        let config = write_config(&dest_dir.path().display().to_string(), &[("main", "main")]);
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
         let err = run(not_a_repo.path(), config.path())
             .expect_err("setup must not silently create a repo that was never git-init'd");
@@ -581,29 +572,39 @@ mod tests {
     }
 
     #[test]
-    fn run_rolls_back_created_branches_when_a_later_pair_fails_to_commit() {
+    fn run_rolls_back_created_branches_when_a_later_branch_fails_to_commit() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
-        repo_with_a_commit_on(dest_dir.path(), "broken", &[("b.txt", "b")]);
+        repo_with_a_commit_on(dest_dir.path(), "release-2.0", &[("b.txt", "b")]);
 
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
 
-        // "invalid..name" is not a legal git ref name (two consecutive dots)
-        // — a real failure mode, not a contrived one — so its commit fails
-        // after "main" already succeeded.
+        // Every branch's dest tip is fetched successfully before any commit
+        // happens (both branches are configured as a plain name now, source
+        // and dest can no longer disagree on it) — so the only way left to
+        // fail a *later* branch's commit specifically is a real git-level
+        // obstruction on the ref write itself. A stale `.lock` file sitting
+        // next to where `refs/heads/release-2.0` would be written is exactly
+        // that: a real failure mode (another process — or a crashed prior
+        // run — holding the lock), not a contrived one, and it leaves "main"
+        // free to succeed first.
+        let refs_heads = source_dir.path().join(".git/refs/heads");
+        fs::create_dir_all(&refs_heads).unwrap();
+        fs::write(refs_heads.join("release-2.0.lock"), "").unwrap();
+
         let config = write_config(
             &dest_dir.path().display().to_string(),
-            &[("main", "main"), ("invalid..name", "broken")],
+            &["main", "release-2.0"],
         );
 
         run(source_dir.path(), config.path())
-            .expect_err("an invalid branch name for a later pair must fail the whole run");
+            .expect_err("a locked ref for a later branch must fail the whole run");
 
         let repo = Repository::open(source_dir.path()).unwrap();
         assert!(
             repo.find_branch("main", git2::BranchType::Local).is_err(),
-            "the earlier pair's branch must be rolled back, not left behind"
+            "the earlier branch must be rolled back, not left behind"
         );
     }
 }

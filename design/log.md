@@ -397,3 +397,52 @@ checked with 0016's rigor against josh's own ref-handling. Flagged in 0017 itsel
 reason it isn't marked stable yet. No code has changed for this decision: config
 schema, source→dest's discovery loop, and test reshaping are all still open, deferred
 until the write-up itself is confirmed.
+
+**Update**: Implemented decisions/0017. `Config.pairs: Vec<BranchPair>` is gone;
+`Config.branches: Vec<String>` replaces it, TOML shape `branches = ["main", "release-2.0"]`
+in place of `[[pairs]]` blocks. `setup` grafts every name in that list the same way it
+grafted pairs before — `graft_pair` is now `graft_branch`, keyed by a plain string.
+`sync::run` no longer loops "per pair, both directions" — it runs dest→source for every
+branch in `config.branches` first, *then* discovers every local branch git2 reports on
+source (`repo.branches(Some(BranchType::Local))`, sorted for deterministic order) and
+runs source→dest for each one found, config entry or not. `sync_pair_to_dest`/
+`sync_pair_from_dest` both take a plain `branch: &str` now instead of a `&BranchPair`.
+`gitprism resolve`'s CLI argument was renamed `pair` → `branch` to match (its own
+`config.pairs.find(source_branch == ...)` lookup is now `config.branches.find(...)`) —
+not called for by the concrete task list, but `BranchPair`'s removal left nothing else
+for "pair" to mean.
+
+One real gap surfaced only once the end-to-end tests were written, not foreseen by the
+write-up itself: source→dest's existing "refuse to build on a dest tip we don't
+recognize" safety check (decisions/0009) assumed a same-named dest branch always
+already exists — true for every pair `setup` had grafted, false for a brand-new branch
+discovered by decisions/0017 that dest has never seen at all. Fetching a nonexistent
+dest ref just fails, which isn't the right shape for "nothing to be unsafe about yet."
+Fixed with a new `git::remote_ref_exists` (a real `git ls-remote --exit-code` check,
+run before deciding whether to fetch at all): when dest genuinely has no branch by this
+name yet, source→dest seeds its chain from the nearest `Gitprism-Dest-Commit` trailer
+already reachable in the new branch's own ancestry (inherited from whatever branch it
+was created from, typically one `setup` grafted) instead of from a dest ref that isn't
+there — no fetch needed for that content either, since it's the literal parent object
+of some ancestor commit already sitting in source's own object database.
+
+Added seven end-to-end tests in `commands::sync`'s style (real on-disk source/dest
+repos, driving the public `run()` entry point) and two in `git`'s: one branch that gets
+mirrored to dest with zero config entry and its excluded path still stripped
+(`run_mirrors_an_ad_hoc_source_branch_with_no_config_entry`); one confirming dest→source
+never reflects a non-configured branch's independent dest content back into source
+— asserted via source→dest's own pre-existing safety refusal correctly firing on a
+branch nothing will ever bring back into "recognized" state
+(`run_does_not_pull_back_independent_content_from_a_non_configured_branch`); and
+`git::remote_ref_exists`'s own true/false cases. Every existing pair-shaped test was
+reshaped rather than rewritten from scratch — `BranchPair { source_branch, dest_branch }`
+constructions became a plain `&str`, `[[pairs]]` TOML literals became `branches = [...]`
+placed *before* any `[section]` header (TOML scopes a bare key to whichever table
+preceded it, so the config shape sketched when this decision was made — `branches`
+listed after `[dest]` — silently nested it inside `Dest` and dropped it every time
+during the actual TDD pass; corrected here without changing the field itself).
+
+`cargo test`: 82 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
+--check`: clean. decisions/0017's own frontmatter is untouched (`status: draft`) —
+same precedent decisions/0016 set: implementing the code doesn't settle the owner's own
+review of the write-up.

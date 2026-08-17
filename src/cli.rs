@@ -5,7 +5,8 @@
 //!
 //! - `setup`   — the one-time graft in decisions/0006.
 //! - `sync`    — the recurring job in playbooks/0001; handles both sync
-//!   directions for every configured branch pair in one run.
+//!   directions in one run (decisions/0017: dest→source for every configured
+//!   branch, then source→dest for every branch discovered on source).
 //! - `resolve` — the conflict-resolution helper in decisions/0008.
 
 use std::path::PathBuf;
@@ -33,7 +34,7 @@ pub enum Commands {
     /// Graft source's initial commit onto dest's real tip (decisions/0006).
     Setup,
 
-    /// Sync every configured branch pair, both directions, in one run.
+    /// Sync both directions in one run (decisions/0017).
     ///
     /// Safe to invoke redundantly: resume and no-op detection come from the
     /// trailer-based history scan (decisions/0003), not from anything about
@@ -43,13 +44,12 @@ pub enum Commands {
     /// Reproduce a dest<->source conflict and hand off to normal git
     /// conflict-resolution UX (decisions/0007, decisions/0008, decisions/0015).
     Resolve {
-        /// Which branch pair the conflict is on, identified by its
-        /// configured `source_branch` — the same identifier `sync`'s own
-        /// conflict error prints (decisions/0015).
-        pair: String,
+        /// Which configured branch the conflict is on — the same identifier
+        /// `sync`'s own conflict error prints (decisions/0015).
+        branch: String,
 
         /// Finish a cherry-pick already started by a prior `gitprism resolve
-        /// <pair>` run, once the human has resolved its conflicts and `git
+        /// <branch>` run, once the human has resolved its conflicts and `git
         /// add`ed them. Explicit, matching git's own `rebase`/`cherry-pick`/
         /// `merge --continue` convention rather than having the bare command
         /// guess start-vs-resume from repo state (decisions/0015).

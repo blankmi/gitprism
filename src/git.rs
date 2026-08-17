@@ -29,6 +29,36 @@ pub fn fetch(repo_dir: &Path, url: &str, refspec: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `refspec` currently exists as a branch on `url` — a real `git
+/// ls-remote --exit-code` subprocess check, run before attempting a [`fetch`]
+/// where "doesn't exist yet" is an expected, ordinary outcome rather than a
+/// failure: a branch source→dest discovers that was never through `gitprism
+/// setup` (decisions/0017 — a brand-new feature branch, say) has no
+/// same-named counterpart on dest until this very sync run creates one, and
+/// [`fetch`]'s own "no such ref" failure is the wrong shape for that case.
+pub fn remote_ref_exists(repo_dir: &Path, url: &str, refspec: &str) -> Result<bool> {
+    let refname = format!("refs/heads/{refspec}");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("ls-remote")
+        .arg("--exit-code")
+        .arg(url)
+        .arg(&refname)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("running git ls-remote --exit-code {url} {refname}"))?;
+
+    match status.code() {
+        Some(0) => Ok(true),
+        // git's own convention for `--exit-code`: 2 means the query
+        // succeeded but matched nothing, distinct from any other failure
+        // (bad URL, network, auth, ...).
+        Some(2) => Ok(false),
+        _ => anyhow::bail!("git ls-remote --exit-code {url} {refname} failed ({status})"),
+    }
+}
+
 /// What happened to a [`push`] attempt: either it landed, or it was
 /// rejected specifically for being a non-fast-forward update — the one
 /// failure decisions/0009 says is worth refetching dest and recomputing for.
@@ -451,6 +481,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(fetched.id(), expected);
+    }
+
+    #[test]
+    fn remote_ref_exists_reports_true_for_a_branch_that_exists() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        assert!(
+            remote_ref_exists(
+                source_dir.path(),
+                &dest_dir.path().display().to_string(),
+                "main",
+            )
+            .expect("checking an existing branch should succeed")
+        );
+    }
+
+    #[test]
+    fn remote_ref_exists_reports_false_for_a_branch_that_does_not_exist() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        assert!(
+            !remote_ref_exists(
+                source_dir.path(),
+                &dest_dir.path().display().to_string(),
+                "no-such-branch",
+            )
+            .expect("checking a missing branch should succeed, just report false")
+        );
     }
 
     #[test]
