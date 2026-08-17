@@ -1001,7 +1001,21 @@ fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) ->
 /// resume question.
 ///
 /// Always finds something for a properly set-up branch: setup's own graft
-/// commit (decisions/0006) carries this trailer too.
+/// commit (decisions/0006) carries this trailer too, and is always a
+/// first-parent ancestor of every branch it grafts.
+///
+/// The walk is first-parent-only (decisions/0019,
+/// `Revwalk::simplify_first_parent()`) — full ancestry used to mean a
+/// mirror-only branch merged into this one via a real, two-parent merge
+/// could hand this scan *that* branch's own `Gitprism-Dest-Commit` trailer
+/// (reachable only through the merge's non-first parent) instead of this
+/// branch's, once decisions/0017 made every branch on source eligible to be
+/// merged into another. First-parent-only makes that unreachable: a merge
+/// commit's non-first parents, and everything reachable only through them,
+/// are never visited. This relies on the tracked branch staying first-parent
+/// of its own merges — true for GitHub/GitLab/Azure DevOps' "merge PR"
+/// button and for `git merge` run from the target branch, not guaranteed
+/// otherwise (decisions/0019's documented limitation).
 fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> {
     let mut revwalk = repo
         .revwalk()
@@ -1012,6 +1026,9 @@ fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> 
     revwalk
         .set_sorting(git2::Sort::TOPOLOGICAL)
         .context("ordering source's resume-point scan newest-first")?;
+    revwalk.simplify_first_parent().context(
+        "restricting source's resume-point scan to first-parent history (decisions/0019)",
+    )?;
 
     for oid in revwalk {
         let oid = oid.context("walking source's history for a resume point")?;
@@ -1040,14 +1057,29 @@ fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> 
 /// `Gitprism-Dest-Commit` trailer), dest legitimately has no gitprism commit
 /// at all before its very first sync.
 ///
-/// The scan is deliberately unbounded — it does NOT `revwalk.hide` the graft
-/// point as an optimization. Hiding it would be a pure optimization on the
-/// usual case, but a marker sitting *before* the graft point (e.g. a source
-/// repo re-grafted onto a dest gitprism had already written to) would become
-/// invisible to the scan, and the caller would then silently fall back to
-/// the graft and push instead of refusing. Unbounded, plus
-/// [`dest_resume_point`]'s own ancestry guard on the result, fails safe
-/// instead.
+/// The scan is deliberately unbounded along the history it walks — it does
+/// NOT `revwalk.hide` the graft point as an optimization. Hiding it would be
+/// a pure optimization on the usual case, but a marker sitting *before* the
+/// graft point (e.g. a source repo re-grafted onto a dest gitprism had
+/// already written to) would become invisible to the scan, and the caller
+/// would then silently fall back to the graft and push instead of refusing.
+/// Unbounded, plus [`dest_resume_point`]'s own ancestry guard on the result,
+/// fails safe instead.
+///
+/// What the walk *is* bounded to, since decisions/0019, is first-parent
+/// history (`Revwalk::simplify_first_parent()`): a full-ancestry walk used
+/// to mean that a mirror-only branch merged into this one on dest via a
+/// real, two-parent merge (decisions/0017 makes every source branch
+/// eligible to be merged into another) could hand this scan *that* branch's
+/// own `Gitprism-Source-Commit` trailer — reachable only through the
+/// merge's non-first parent — instead of this branch's own, wrongly
+/// refusing (or, worse, wrongly resuming from a stale boundary) a perfectly
+/// healthy sync. First-parent-only makes a merged-in branch's own history
+/// unreachable from this scan entirely. This relies on the tracked branch
+/// staying first-parent of its own merges — true for GitHub/GitLab/Azure
+/// DevOps' "merge PR" button and for `git merge` run from the target
+/// branch, not guaranteed otherwise (decisions/0019's documented
+/// limitation).
 fn newest_source_marker(repo: &Repository, dest_tip: Oid) -> Result<Option<Oid>> {
     let mut revwalk = repo
         .revwalk()
@@ -1058,6 +1090,9 @@ fn newest_source_marker(repo: &Repository, dest_tip: Oid) -> Result<Option<Oid>>
     revwalk
         .set_sorting(git2::Sort::TOPOLOGICAL)
         .context("ordering dest's resume-point scan newest-first")?;
+    revwalk
+        .simplify_first_parent()
+        .context("restricting dest's resume-point scan to first-parent history (decisions/0019)")?;
 
     for oid in revwalk {
         let oid = oid.context("walking dest's history for a resume point")?;
@@ -3908,13 +3943,12 @@ mod tests {
         // new commit made directly on dest (not gitprism's own mirrored commit,
         // which would carry a Gitprism-Source-Commit trailer and get
         // loop-prevented) — single-parent, the same shape a squash-merge
-        // produces, and deliberately *not* a real two-parent git merge: making
-        // gitprism's own `dest_feature_tip` (which itself carries a
-        // Gitprism-Source-Commit trailer for feature-x) a second parent would
-        // fold that trailer into main's own ancestry and confuse
-        // `newest_source_marker`'s unrelated, pre-existing "trailers aren't
-        // pair-qualified" gap (design/log.md) — not what this test means to
-        // exercise.
+        // produces, and deliberately *not* a real two-parent git merge: this
+        // test means to exercise decisions/0018's merge-status check in
+        // isolation, not decisions/0019's first-parent-only marker scan (see
+        // `run_ignores_a_merged_in_branchs_own_trailer_when_resuming_after_a_real_merge`
+        // for the real-merge case, which decisions/0019 now handles
+        // correctly).
         let dest_main_tip_before = dest_repo
             .find_branch("main", git2::BranchType::Local)
             .unwrap()
@@ -4034,11 +4068,11 @@ mod tests {
             .unwrap();
         let squash_tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
         let merge_signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
-        // Single-parent, same reasoning as the sibling test above: a real
-        // second parent naming gitprism's own mirrored `dest_feature_tip`
-        // would fold its Gitprism-Source-Commit trailer into main's ancestry
-        // and trip the unrelated, pre-existing "trailers aren't
-        // pair-qualified" gap (design/log.md), not what this test exercises.
+        // Single-parent, same reasoning as the sibling test above: this test
+        // means to exercise decisions/0018's merge-status check (a genuinely
+        // unmerged remainder must still be recreated) in isolation from
+        // decisions/0019's first-parent-only marker scan, which a real
+        // two-parent second parent here would also exercise.
         dest_repo
             .commit(
                 Some("refs/heads/main"),
@@ -4083,6 +4117,117 @@ mod tests {
             recreated.tree().unwrap().id(),
             feature_tip.tree().unwrap().id(),
             "the recreated mirror must match feature-x's own current content"
+        );
+    }
+
+    #[test]
+    fn run_ignores_a_merged_in_branchs_own_trailer_when_resuming_after_a_real_merge() {
+        // decisions/0019: a real, two-parent merge of a mirror-only branch
+        // into a round-tripped branch on dest must not let the round-tripped
+        // branch's own resume-point scan (`newest_source_marker`) cross into
+        // the merged-in branch's own `Gitprism-Source-Commit` trailer via the
+        // merge's second parent. Unlike decisions/0018's own Case 2 fixture
+        // (which deliberately used a single-parent, squash-shaped stand-in to
+        // avoid exactly this — see its comment and design/log.md), this test
+        // performs the real thing: main stays first parent, feature-x's own
+        // gitprism-authored mirror commit is the second — the ordinary shape
+        // GitHub's/GitLab's "merge pull request" button, or `git merge`
+        // run from the checked-out target branch, both produce.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "line1\n")]);
+
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+
+        // First sync: feature-x is mirrored to dest with no config entry —
+        // its dest tip carries gitprism's own Gitprism-Source-Commit trailer.
+        run(source_dir.path(), config.path()).expect("first sync should mirror feature-x to dest");
+        let dest_feature_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        // A real PR merge: main stays first parent, feature-x's own gitprism
+        // mirror commit (carrying its own trailer) is the second parent —
+        // deliberately the shape decisions/0018's own fixtures avoided.
+        let dest_main_tip_before = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let merge_signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        let merge_commit = dest_repo
+            .commit(
+                Some("refs/heads/main"),
+                &merge_signature,
+                &merge_signature,
+                "Merge branch 'feature-x' into 'main'",
+                &dest_feature_tip.tree().unwrap(),
+                &[&dest_main_tip_before, &dest_feature_tip],
+            )
+            .unwrap();
+
+        // Second sync: dest→source reflects the merge back into source's
+        // main, then source→dest's own resume-point scan for main must not
+        // be confused by feature-x's own trailer, reachable via the merge's
+        // second parent. Before decisions/0019's fix, this fails with a false
+        // "isn't at a point this clone can safely build on" refusal, since
+        // `newest_source_marker`'s full-ancestry walk reaches feature-x's own
+        // marker before main's, and main's source tip isn't a descendant of
+        // that unrelated oid.
+        run(source_dir.path(), config.path()).expect(
+            "second sync must not mistake feature-x's own merged-in trailer for main's own resume point",
+        );
+
+        let source_main_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            source_main_tip
+                .tree()
+                .unwrap()
+                .get_name("feature.txt")
+                .is_some(),
+            "source's main must carry feature-x's content via dest→source"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, merge_commit,
+            "dest's main already carries everything source has (via the real merge); a \
+             correct resume must find nothing new to push, leaving dest's tip unmoved"
         );
     }
 }

@@ -569,3 +569,38 @@ not engineered around: this assumes the tracked branch stays first-parent
 of its own merges — true for GitHub/GitLab/Azure DevOps' "merge PR" button
 and for `git merge` run from the target branch, not for a merge performed
 the other way around.
+
+**Implemented decisions/0019.** Both `newest_source_marker` and
+`newest_dest_marker` (`src/commands/sync.rs`) now call
+`revwalk.simplify_first_parent()` alongside their existing `push`/
+`set_sorting` calls; their doc comments were rewritten to explain why the
+walk is first-parent-only now instead of full-ancestry, and to name
+decisions/0019's documented limitation (the tracked branch must stay
+first-parent of its own merges).
+
+New regression test,
+`run_ignores_a_merged_in_branchs_own_trailer_when_resuming_after_a_real_merge`:
+mirrors a feature branch to dest (decisions/0017), merges it into a
+round-tripped `main` on dest via a real two-parent commit (main first,
+feature-x's own gitprism-authored mirror commit second — decisions/0018's
+own fixtures deliberately used a single-parent stand-in instead, exactly to
+avoid this), then runs `sync` again. Confirmed to fail before the fix with
+the false "isn't at a point this clone can safely build on" refusal this
+decision's Context section traces in detail, and to succeed after it, with
+dest's `main` left unmoved (it already carries everything source has) and
+source's `main` correctly carrying feature-x's content via dest→source.
+
+decisions/0018's own two test fixtures that had explicitly worked around
+this gap (their comments said so) had their comments updated to point at
+the new test and at decisions/0019 rather than describe an open gap that no
+longer exists — their fixtures themselves are unchanged, since each still
+means to exercise its own decision in isolation.
+
+`cargo test`: 87 passed, 0 failed — no regressions in the existing
+multi-parent-merge tests
+(`run_does_not_duplicate_a_no_ff_merges_content_on_dest`,
+`run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`),
+decisions/0018's own Case 1/Case 2/fall-through tests, or
+`newest_dest_marker`'s "always finds setup's own graft commit" guarantee —
+all of those already keep the tracked branch as first parent of its own
+merges. `cargo clippy --all-targets`: clean. `cargo fmt --check`: clean.
