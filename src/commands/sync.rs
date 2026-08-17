@@ -176,7 +176,8 @@ fn sync_pair_to_dest(
         // branch, say) — checked explicitly rather than attempting a fetch
         // and treating "no such ref" as the same failure it would be for a
         // branch that's supposed to already exist.
-        let (dest_tip, boundary) = if git::remote_ref_exists(source_root, &dest_url, branch)? {
+        let dest_ref_exists = git::remote_ref_exists(source_root, &dest_url, branch)?;
+        let (dest_tip, boundary) = if dest_ref_exists {
             git::fetch(source_root, &dest_url, branch)
                 .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
             let dest_tip = repo
@@ -229,7 +230,17 @@ fn sync_pair_to_dest(
             source_root,
         )?;
 
-        if let Some(new_dest_tip) = build.new_tip {
+        // `build.new_tip` is `None` both when the branch has nothing new to
+        // merge onto an existing dest ref (a genuine no-op) *and* when it's a
+        // brand-new branch with no commits of its own beyond whatever
+        // graft/marker point it shares with dest (decisions/0017: still has
+        // to be created on dest). Only the latter needs `dest_tip` itself
+        // pushed — it's already the right content, just missing a ref name.
+        let new_dest_tip = build
+            .new_tip
+            .or((!dest_ref_exists).then_some(dest_tip));
+
+        if let Some(new_dest_tip) = new_dest_tip {
             match git::push(source_root, &dest_url, new_dest_tip, branch)? {
                 git::PushOutcome::Accepted => {}
                 git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
@@ -3563,6 +3574,43 @@ mod tests {
             tree.get_name(exclude::FILENAME).is_none(),
             ".gitprismignore itself must never reach dest, even on a discovered branch"
         );
+    }
+
+    #[test]
+    fn run_mirrors_an_ad_hoc_branch_with_no_commits_of_its_own() {
+        // decisions/0017: "every branch that exists on source is mirrored to
+        // a same-named branch on dest" — including one that's freshly
+        // branched off an already-synced tip with no commits of its own yet.
+        // `build_pending_dest_tip` finds zero pending commits for a branch
+        // like this (its boundary already equals its tip), which must not be
+        // mistaken for "nothing to do": the branch itself still doesn't
+        // exist on dest and has to be created there.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-empty", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+
+        // "feature-empty" appears nowhere in config, and carries no commits
+        // beyond the graft it was branched from.
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("sync should succeed");
+
+        dest_repo
+            .find_branch("feature-empty", git2::BranchType::Local)
+            .expect("feature-empty must be mirrored to dest even with no commits of its own");
     }
 
     #[test]
