@@ -171,3 +171,46 @@ git-trim's own classification.
 * **Still no deletion anywhere** — this decision only changes whether gitprism
   *recreates* something dest already let go of; decisions/0017's "gitprism never
   deletes a branch on either side" is untouched.
+
+# Addendum (2026-08-18): the check must compare filtered trees, not raw ones
+
+**What was wrong.** `already_merged_into_a_landing_branch`'s three-way merge compared
+`base_tree`/`landing_tree`/`branch_tree` straight off each commit's raw, unfiltered
+source-side tree. Every other cross-side content comparison in `sync.rs` —
+`build_pending_dest_tip` most directly, the function this one exists alongside —
+filters each tree through `filter_tree`/the current exclude-list first, because dest
+only ever sees the filtered subset of source (decisions/0004, 0011). This function
+never did.
+
+**Why it mattered.** A mirror-only branch's own commits touching an excluded path
+(anything listed in `.gitprismignore`) alongside their ordinary mirrored changes is
+completely routine in a source-is-a-superset repo — it's the entire reason an
+exclude-list exists. When that happened, the raw `theirs` tree carried content (the
+excluded path) the landing branch's raw `ours` tree never had and never will, since
+dest never received it either way. The merge still came back clean, but
+`merged != landing_tree`, so the function concluded "not merged" — even though
+everything dest would ever actually see from this branch had already reached the
+landing branch. `sync_pair_to_dest` then fell through to its ordinary rebuild-and-push
+path, resurrecting the branch on dest and undoing the PR's own cleanup, every single
+sync run, forever. Not an edge case: the ordinary case for any project that excludes
+anything at all.
+
+**The fix.** `already_merged_into_a_landing_branch` now takes the same `exclude_list`
+`sync_pair_to_dest` already loads once per run via `load_current_exclude_list` — passed
+in as a parameter from the caller, not reloaded redundantly — and filters `base_tree`,
+`landing_tree`, and `branch_tree` through `filter_tree` before handing them to
+`git::merge_tree`, the identical primitive `build_pending_dest_tip` already uses for
+its own base/theirs trees. No new state, no second filtering mechanism: this makes the
+question the function asks correctly "is everything dest would ever see from this
+branch already in the landing branch," rather than "is 100% of this branch's raw
+source content already there" — the latter was never the question this decision meant
+to ask, just an oversight in translating "content-based, not oid-ancestry-based" into
+code.
+
+Regression test:
+`run_does_not_resurrect_a_mirror_only_branch_merged_except_for_excluded_paths`
+(`src/commands/sync.rs`) — same fixture shape as
+`run_does_not_resurrect_a_mirror_only_branch_already_merged_and_deleted_on_dest`, with
+`.gitprismignore` on `main` excluding `secret.txt` and `feature-x`'s own commit
+touching both `feature.txt` and `secret.txt` together. Confirmed to fail against the
+pre-fix code (third sync recreated `feature-x` on dest) and pass once the fix landed.

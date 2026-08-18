@@ -604,3 +604,40 @@ decisions/0018's own Case 1/Case 2/fall-through tests, or
 `newest_dest_marker`'s "always finds setup's own graft commit" guarantee —
 all of those already keep the tracked branch as first parent of its own
 merges. `cargo clippy --all-targets`: clean. `cargo fmt --check`: clean.
+
+## 2026-08-18
+
+**Fixed a real bug in decisions/0018's Case 2 check**, documented as an
+addendum to [decisions/0018](decisions/0018-branch-deletion-failure-modes.md)
+rather than a new decision — the design itself ("content-based, via
+`git merge-tree`, checked against a landing branch's current tip") was
+already right; the code just compared the wrong trees.
+`already_merged_into_a_landing_branch` ran its three-way merge over raw,
+unfiltered source-side trees, while every other cross-side content
+comparison in `sync.rs` (`build_pending_dest_tip` in particular) filters
+through `filter_tree`/the current exclude-list first, since dest only ever
+sees the filtered subset of source (decisions/0004, 0011). A mirror-only
+branch's own commit touching an excluded path (`.gitprismignore`) alongside
+an ordinary mirrored change — routine in a source-is-a-superset repo — made
+the raw `theirs` tree carry content the landing branch's raw `ours` tree
+never received and never will, so the merge came back clean but unequal to
+`ours`, and the function wrongly concluded "not merged." `sync_pair_to_dest`
+then resurrected the branch on dest every single run, undoing the PR's own
+cleanup — not an edge case, but the ordinary case for any project that
+excludes anything.
+
+Fixed by filtering `base_tree`, `landing_tree`, and `branch_tree` through
+`filter_tree` before the merge, using the same `exclude_list`
+`sync_pair_to_dest` already loads once per run — passed in as a new
+parameter rather than reloaded. No new state, no second filtering mechanism.
+
+New regression test,
+`run_does_not_resurrect_a_mirror_only_branch_merged_except_for_excluded_paths`:
+same fixture shape as decisions/0018's own Case 2 test, with
+`.gitprismignore` on `main` excluding `secret.txt` and `feature-x`'s own
+commit touching both `feature.txt` and `secret.txt` together. Confirmed to
+fail against the pre-fix code (third sync recreated `feature-x` on dest) and
+pass once the fix landed.
+
+`cargo test`: 88 passed, 0 failed. `cargo clippy --all-targets`: clean.
+`cargo fmt --check`: clean.
