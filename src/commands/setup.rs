@@ -15,12 +15,19 @@
 //!
 //! Like `git` itself, gitprism takes no source-location config: `cwd` is a
 //! discovery starting point (walked upward exactly like `git` does from a
-//! subdirectory), and setup requires a real, already-`git init`'d — but
-//! still completely empty — repo there. It doesn't create one, and it
-//! refuses to touch one that already has history (decisions/0012's
-//! "Consequences" now says so explicitly). Nothing here decides *how* dest
-//! is reached; that stays entirely in `.gitprism.toml`'s `[dest] url`.
+//! subdirectory), and setup requires a real, already-`git init`'d repo
+//! there. It doesn't create one. That repo must be either completely empty
+//! or already a clean, unmodified clone of dest (decisions/0021): every
+//! existing local branch's name must be one of `config.branches`, and its
+//! tip must be identical to a fresh fetch of dest's own current tip for that
+//! name — anything else, including a detached HEAD or a previous `gitprism
+//! setup` run's own graft commits, is real independent history and still
+//! hard-fails (decisions/0012's "Consequences" originally said so
+//! unconditionally; decisions/0021 narrows that to this per-branch check).
+//! Nothing here decides *how* dest is reached; that stays entirely in
+//! `.gitprism.toml`'s `[dest] url`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -43,27 +50,11 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         .context("gitprism setup requires a repo with a working tree, not a bare repo")?
         .to_path_buf();
 
-    // setup is a one-time graft onto an empty, freshly-initialized repo
-    // (decisions/0006, decisions/0012) — never onto one with existing
-    // history. Checking both branches and HEAD: a detached HEAD with no
-    // branches, or branches that HEAD doesn't currently point at, would
-    // each dodge just one of the two checks alone.
-    let has_existing_branches = repo
-        .branches(Some(git2::BranchType::Local))
-        .context("listing source repo's existing branches")?
-        .next()
-        .is_some();
-    if has_existing_branches || repo.head().is_ok() {
-        anyhow::bail!(
-            "gitprism setup: source repo already has commits and/or branches — setup is a one-time graft onto an empty, freshly-initialized repo, not something to run against existing history"
-        );
-    }
-
     // A fresh `git init` already leaves HEAD symbolically pointing at some
     // default branch (commonly "main") while still unborn. If that name
     // collides with a configured branch, rollback below needs to move HEAD
-    // off of it before it can delete that branch — captured now so it can
-    // be restored to exactly this afterward.
+    // off of it before it can delete or reset that branch — captured now so
+    // it can be restored to exactly this afterward.
     let original_head = repo
         .find_reference("HEAD")
         .ok()
@@ -80,12 +71,59 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     };
     let config_raw = fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
+    // decisions/0021 needs config.branches available before the precondition
+    // check below runs (to know which existing local branch names are
+    // expected), so parsing config has to move ahead of that check —
+    // reordered from where it originally sat in this function.
     let config = Config::parse(&config_raw, &config_path)?;
     if config.branches.is_empty() {
         anyhow::bail!(
             "gitprism setup: no branches configured in {} — nothing to graft",
             config_path.display()
         );
+    }
+
+    // setup is a one-time graft onto an empty, freshly-initialized repo
+    // (decisions/0006, decisions/0012) — or, per decisions/0021, onto a
+    // repo that's already a clean, unmodified clone of dest. Never onto one
+    // with real independent history. A detached HEAD is unconditionally
+    // unrecognized (a clone always leaves HEAD attached to a branch), and
+    // any existing local branch whose name isn't in `config.branches` is
+    // unrecognized too — both hard-fail here exactly as the old
+    // completely-empty-only check did. A branch that *is* in
+    // `config.branches` is allowed to exist for now; its tip is checked
+    // against dest's freshly-fetched tip further down, folded into the
+    // fetch loop rather than a second pass over the repo.
+    if repo
+        .head_detached()
+        .context("checking whether source repo's HEAD is detached")?
+    {
+        anyhow::bail!(
+            "gitprism setup: source repo already has commits and/or branches — setup is a one-time graft onto an empty, freshly-initialized repo, not something to run against existing history"
+        );
+    }
+    let mut pre_existing_branches: HashMap<String, git2::Oid> = HashMap::new();
+    for branch_result in repo
+        .branches(Some(git2::BranchType::Local))
+        .context("listing source repo's existing branches")?
+    {
+        let (branch, _) = branch_result.context("reading an existing local branch")?;
+        let name = branch
+            .name()
+            .context("reading existing branch's name")?
+            .context("existing local branch name is not valid UTF-8")?
+            .to_owned();
+        if !config.branches.contains(&name) {
+            anyhow::bail!(
+                "gitprism setup: source repo already has commits and/or branches — setup is a one-time graft onto an empty, freshly-initialized repo, not something to run against existing history"
+            );
+        }
+        let oid = branch
+            .get()
+            .peel_to_commit()
+            .with_context(|| format!("resolving existing branch {name:?} to a commit"))?
+            .id();
+        pre_existing_branches.insert(name, oid);
     }
 
     // Mirrors `.gitprism.toml`'s own bootstrap handling (decisions/0012): the
@@ -107,9 +145,12 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     // Fetch every branch's dest tip before writing anything, so a fetch
     // failure partway through never leaves some branches grafted and
-    // others not.
+    // others not. Also, per decisions/0021, this is where a pre-existing
+    // local branch (already confirmed above to be one of config.branches)
+    // gets checked against dest's own tip — folded into this same pass
+    // rather than a second fetch loop.
     let dest_url = config.dest_url()?;
-    let mut dest_tips = Vec::with_capacity(config.branches.len());
+    let mut branch_plans = Vec::with_capacity(config.branches.len());
     for branch in &config.branches {
         git::fetch(&source_root, &dest_url, branch)
             .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
@@ -121,19 +162,36 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             .peel_to_commit()
             .context("resolving fetched dest branch to a commit")?
             .id();
-        dest_tips.push(dest_tip);
+        // `original_oid` is `Some` exactly when this branch already existed
+        // locally before this run and matched dest's tip byte-for-byte — the
+        // "clean clone of dest" case decisions/0021 recognizes as safe. Any
+        // mismatch (a previous `gitprism setup` run's own graft commit
+        // included, since that always sits one commit ahead of dest's raw
+        // tip) is real independent history and hard-fails here rather than
+        // being silently grafted over.
+        let original_oid = match pre_existing_branches.get(branch) {
+            Some(&existing_oid) if existing_oid == dest_tip => Some(existing_oid),
+            Some(_) => anyhow::bail!(
+                "gitprism setup: source's local branch {branch:?} already has content that doesn't match dest's current tip — refusing to graft over independent history"
+            ),
+            None => None,
+        };
+        branch_plans.push((dest_tip, original_oid));
     }
 
     // Commit phase: every precondition above already held, so failure here
     // should be rare — but if one branch still fails partway (e.g. an
-    // invalid branch name), roll back this run's already-created branches
+    // invalid branch name), roll back this run's already-touched branches
     // rather than leaving a half-grafted repo behind.
-    let mut created_branches = Vec::with_capacity(config.branches.len());
-    for (branch, dest_tip) in config.branches.iter().zip(&dest_tips) {
+    let mut touched_branches: Vec<TouchedBranch> = Vec::with_capacity(config.branches.len());
+    for (branch, (dest_tip, original_oid)) in config.branches.iter().zip(&branch_plans) {
         match graft_branch(&repo, &config, &config_raw, &ignore_raw, branch, *dest_tip) {
-            Ok(()) => created_branches.push(branch.as_str()),
+            Ok(()) => touched_branches.push(TouchedBranch {
+                name: branch.as_str(),
+                original_oid: *original_oid,
+            }),
             Err(err) => {
-                rollback_branches(&repo, &created_branches, original_head.as_deref());
+                rollback_branches(&repo, &touched_branches, original_head.as_deref());
                 return Err(err);
             }
         }
@@ -168,7 +226,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         // their own bootstrap `.gitprism.toml` — restore them from the exact
         // bytes already read, same as rollback restores the branch refs.
         restore_control_files(&source_root, &config_raw, &ignore_raw);
-        rollback_branches(&repo, &created_branches, original_head.as_deref());
+        rollback_branches(&repo, &touched_branches, original_head.as_deref());
         return Err(err);
     }
 
@@ -180,19 +238,45 @@ fn restore_control_files(source_root: &Path, config_raw: &str, ignore_raw: &str)
     let _ = fs::write(source_root.join(exclude::FILENAME), ignore_raw);
 }
 
-/// Deletes `names`' branches, restoring HEAD to `original_head` afterward —
-/// used when a later pair fails partway through the commit phase, so a
-/// failed run leaves the repo exactly as it found it.
+/// One branch this run touched, and what rolling it back means.
 ///
-/// HEAD has to be moved off of any branch being deleted first: libgit2
-/// refuses to delete the branch HEAD symbolically points at even while
-/// still unborn, which a fresh `git init`'s default branch name (commonly
-/// "main") can easily collide with.
-fn rollback_branches(repo: &Repository, names: &[&str], original_head: Option<&str>) {
+/// `original_oid: None` — setup created this branch fresh; rollback deletes
+/// it. `original_oid: Some(oid)` — this branch already existed before this
+/// run and matched dest's tip (decisions/0021's "clean clone of dest" case);
+/// rollback resets it back to `oid` instead of deleting it, since deleting a
+/// branch the user's own `git clone` produced would be a worse outcome than
+/// the failure rollback is guarding against.
+struct TouchedBranch<'a> {
+    name: &'a str,
+    original_oid: Option<git2::Oid>,
+}
+
+/// Rolls back `touched`'s branches (see [`TouchedBranch`]), restoring HEAD
+/// to `original_head` afterward — used when a later pair fails partway
+/// through the commit phase, so a failed run leaves the repo exactly as it
+/// found it.
+///
+/// HEAD has to be moved off of any branch being deleted or reset first:
+/// libgit2 refuses to touch the branch HEAD symbolically points at even
+/// while still unborn, which a fresh `git init`'s default branch name
+/// (commonly "main") can easily collide with.
+fn rollback_branches(repo: &Repository, touched: &[TouchedBranch], original_head: Option<&str>) {
     let _ = repo.set_head("refs/heads/gitprism-setup-rollback-scratch");
-    for name in names {
-        if let Ok(mut branch) = repo.find_branch(name, git2::BranchType::Local) {
-            let _ = branch.delete();
+    for branch in touched {
+        match branch.original_oid {
+            Some(oid) => {
+                let _ = repo.reference(
+                    &format!("refs/heads/{}", branch.name),
+                    oid,
+                    true,
+                    "gitprism setup: rollback to pre-existing tip",
+                );
+            }
+            None => {
+                if let Ok(mut b) = repo.find_branch(branch.name, git2::BranchType::Local) {
+                    let _ = b.delete();
+                }
+            }
         }
     }
     if let Some(target) = original_head {
@@ -605,6 +689,144 @@ mod tests {
         assert!(
             repo.find_branch("main", git2::BranchType::Local).is_err(),
             "the earlier branch must be rolled back, not left behind"
+        );
+    }
+
+    #[test]
+    fn run_succeeds_against_a_pre_existing_branch_matching_dests_tip() {
+        let dest_dir = tempdir().unwrap();
+        let main_tip = repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        // Arrive at the same state a plain `git clone <dest-url> source`
+        // would leave behind (decisions/0021): dest's tip fetched and landed
+        // on a same-named local branch — not a synthetic shortcut around
+        // what setup itself checks for.
+        git::fetch(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+        )
+        .unwrap();
+        let fetched_tip = repo
+            .find_reference("FETCH_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference("refs/heads/main", fetched_tip, true, "simulate git clone")
+            .unwrap();
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path())
+            .expect("setup should accept a clean, unmodified clone of dest");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let main = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(main.parent_id(0).unwrap(), main_tip);
+        assert!(
+            main.message()
+                .unwrap()
+                .contains(&format!("Gitprism-Dest-Commit: {main_tip}"))
+        );
+    }
+
+    #[test]
+    fn run_fails_loudly_when_a_pre_existing_branch_diverges_from_dests_tip() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        // "main" already exists locally, and is a configured branch name —
+        // but its tip is real, independent history, not dest's tip and not
+        // an empty placeholder either.
+        repo_with_a_commit_on(source_dir.path(), "main", &[("independent.txt", "x")]);
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        let err = run(source_dir.path(), config.path()).expect_err(
+            "a pre-existing branch that diverges from dest's tip must not be grafted over",
+        );
+
+        let message = err.to_string();
+        assert!(message.contains("\"main\""), "message was: {message}");
+        assert!(
+            message.contains("doesn't match dest's current tip"),
+            "message was: {message}"
+        );
+    }
+
+    #[test]
+    fn run_rolls_back_a_pre_existing_branch_to_its_original_tip_when_a_later_branch_fails() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+        repo_with_a_commit_on(dest_dir.path(), "release-2.0", &[("b.txt", "b")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        // "main" is already a clean clone of dest's tip (decisions/0021) and
+        // must survive a later branch's failure by being reset back to this
+        // exact oid, not deleted — deleting a branch the user's own `git
+        // clone` produced would be worse than the failure being guarded
+        // against.
+        git::fetch(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+        )
+        .unwrap();
+        let original_main_tip = repo
+            .find_reference("FETCH_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference(
+            "refs/heads/main",
+            original_main_tip,
+            true,
+            "simulate git clone",
+        )
+        .unwrap();
+
+        // Same lock-file trick as
+        // run_rolls_back_created_branches_when_a_later_branch_fails_to_commit:
+        // force release-2.0's ref write to fail after main's graft succeeds.
+        let refs_heads = source_dir.path().join(".git/refs/heads");
+        fs::create_dir_all(&refs_heads).unwrap();
+        fs::write(refs_heads.join("release-2.0.lock"), "").unwrap();
+
+        let config = write_config(
+            &dest_dir.path().display().to_string(),
+            &["main", "release-2.0"],
+        );
+
+        run(source_dir.path(), config.path())
+            .expect_err("a locked ref for a later branch must fail the whole run");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let main = repo
+            .find_branch("main", git2::BranchType::Local)
+            .expect("the pre-existing branch must survive rollback, not be deleted")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            main.id(),
+            original_main_tip,
+            "the pre-existing branch must be reset to its original tip, not left on the graft commit"
+        );
+        assert!(
+            repo.find_branch("release-2.0", git2::BranchType::Local)
+                .is_err(),
+            "the branch this run would have newly created must not be left behind"
         );
     }
 }

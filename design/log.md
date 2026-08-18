@@ -682,3 +682,47 @@ Consequences rather than replacing them. Not yet implemented — `setup.rs`'s
 precondition check, its ordering relative to config parsing, and
 `rollback_branches`' reset-vs-delete distinction for pre-existing branches all
 still need to change; no code written yet.
+
+## 2026-08-18 (yet again)
+
+**Implemented decisions/0021**: config is now parsed before `setup.rs`'s
+precondition check runs (the check needs `config.branches` to recognize
+expected branch names), and the old single `has_existing_branches ||
+repo.head().is_ok()` gate is replaced with a narrower one folded into the
+existing "fetch every branch's dest tip before writing anything" loop, no
+second fetch pass. A detached HEAD, or any local branch whose name isn't in
+`config.branches`, still hard-fails with the same message as before. A local
+branch that is in `config.branches` may now already exist, provided its tip
+is identical to a fresh fetch of dest's own current tip for that name;
+otherwise setup hard-fails with `"gitprism setup: source's local branch
+{branch:?} already has content that doesn't match dest's current tip —
+refusing to graft over independent history"`. `graft_branch` needed no
+change at all — confirmed `repo.commit(Some(refname), ...)` already enforces
+fast-forward-from-current-tip itself (libgit2's `update_ref` requires the
+first parent to be the ref's current target when the ref already exists),
+which is exactly a no-op graft onto a verified-matching pre-existing branch.
+
+`rollback_branches` now works off a `TouchedBranch` list carrying, per
+branch, `original_oid: Option<Oid>`, and resets a pre-existing branch back
+to its original oid instead of deleting it, while a branch setup created
+fresh this run is still deleted, exactly as before — threaded through both
+the commit-phase and checkout-failure rollback call sites.
+
+New tests: `run_succeeds_against_a_pre_existing_branch_matching_dests_tip`
+(a local branch already sitting at exactly dest's fetched tip — the "clean
+clone" case — grafts normally, same assertions as the original happy-path
+test), `run_fails_loudly_when_a_pre_existing_branch_diverges_from_dests_tip`
+(a local branch with real independent history under a configured name hard
+fails, naming the branch and dest's tip in the message), and
+`run_rolls_back_a_pre_existing_branch_to_its_original_tip_when_a_later_branch_fails`
+(two configured branches, one pre-existing and matching dest's tip, the
+other forced to fail its ref write via the existing lock-file trick —
+confirms the pre-existing branch survives at its original oid, not deleted
+and not left on the graft commit, while the branch this run would have
+newly created is not left behind). All pre-existing tests kept their
+original intent unchanged, including
+`run_fails_loudly_against_a_non_empty_source_repo`, which still hard-fails
+because its `"unrelated"` branch name isn't in config.
+
+`cargo test`: 111 passed, 0 failed. `cargo clippy --all-targets`: clean.
+`cargo fmt --check`: clean.

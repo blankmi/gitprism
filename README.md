@@ -114,12 +114,14 @@ excludes itself automatically.
 
 ### `gitprism setup`
 
-One-time step. Run inside an empty, freshly `git init`'d repo that will
-become source. Fetches dest's current tip for every branch in
-`.gitprism.toml`'s `branches` list and grafts a new same-named branch onto
-it on source, carrying over `.gitprism.toml` and `.gitprismignore`. Refuses
-to run against a repo that already has commits or branches — this is a
-one-time graft, not something to re-run.
+One-time step. Run inside a freshly `git init`'d repo that will become
+source — either completely empty, or already a clean, unmodified clone of
+dest (e.g. `git clone <dest-url> source && cd source`). Fetches dest's
+current tip for every branch in `.gitprism.toml`'s `branches` list and
+grafts a new same-named branch onto it on source, carrying over
+`.gitprism.toml` and `.gitprismignore`. Refuses to run against any other
+pre-existing history — a previous `gitprism setup` run's own graft commits
+included — this is a one-time graft, not something to re-run.
 
 ### `gitprism sync`
 
