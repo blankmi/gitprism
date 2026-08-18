@@ -641,3 +641,44 @@ pass once the fix landed.
 
 `cargo test`: 88 passed, 0 failed. `cargo clippy --all-targets`: clean.
 `cargo fmt --check`: clean.
+
+## 2026-08-18 (later)
+
+**Drafted [decisions/0020](decisions/0020-sync-status-output-is-a-pinned-progress-display.md)**:
+`sync`'s status output (five plain `eprintln!` call sites, all in
+`src/commands/sync.rs` — confirmed via grep that `setup`/`resolve` have
+nothing equivalent) becomes an `indicatif`-backed display, following
+Gradle's own rich/plain console duality: a pinned overall progress bar plus
+current-step line at the bottom, completed branch-operations scrolling
+above as colored, scannable summary lines (green/yellow/red for
+done/skipped/error; cyan for round-tripped branch names vs. plain for
+decisions/0017's mirror-only ones; explanatory text demoted to a note line,
+Cargo's convention), with the bar's total computed upfront — source's branch
+list read once before either sync phase starts, not discovered mid-run — and
+a full plain-text fallback whenever stderr isn't a terminal (the CI case
+`design/playbooks/0001` already documents). Dimming the mirror-only majority
+was considered and rejected: it borrows a "de-emphasize" meaning that
+doesn't fit (they're decisions/0017's normal, zero-config case, not a lesser
+one) and reads worse on a fast scan than a plain line. Purely a
+presentation-layer decision — no change to merge/push/conflict logic, and no
+existing regression test asserts on stderr text. Not yet implemented.
+
+## 2026-08-18 (later still)
+
+**Drafted [decisions/0021](decisions/0021-setup-accepts-a-clean-clone-of-dest.md)**:
+raised by the project owner — `git clone <dest-url> source && cd source &&
+gitprism setup` is a plausible, arguably more natural bootstrap sequence than
+the one `setup` currently requires, but it's rejected outright today, since a
+plain clone always leaves a local branch checked out and `setup`'s precondition
+(decisions/0012's "completely empty repo, no branches, no commits") is an
+unconditional gate. Resolved by narrowing that gate: a local branch is now
+accepted if it's in `config.branches` *and* its tip is identical (by oid) to a
+fresh fetch of dest's own current tip for that name — reusing setup's existing
+fetch-everything-upfront pass, no new fetch mechanism. Anything else (an
+unrecognized branch name, detached HEAD, or a local branch whose tip diverges
+from dest's, including a previous `setup` run's own graft commit sitting one
+commit ahead) still hard-fails exactly as before. Amends decisions/0012's
+Consequences rather than replacing them. Not yet implemented — `setup.rs`'s
+precondition check, its ordering relative to config parsing, and
+`rollback_branches`' reset-vs-delete distinction for pre-existing branches all
+still need to change; no code written yet.
