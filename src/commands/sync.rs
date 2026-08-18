@@ -69,6 +69,7 @@ use git2::{Oid, Repository, Signature};
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git;
+use crate::progress::{Direction, Outcome, Reporter};
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
 /// from scratch this many times before sync gives up and fails loudly. Exact
@@ -100,6 +101,15 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // needs merging.
     git::ensure_merge_tree_supported()?;
 
+    // Listed here — before either phase runs — purely to size the progress
+    // bar's total (decisions/0020, point 3): `n = config.branches.len() +
+    // source_branches.len()` has to be known from the very first line, not
+    // discovered mid-run the way this listing used to happen (immediately
+    // before the source→dest loop below, and only there). The listing itself
+    // is unchanged, just moved earlier and reused below rather than repeated.
+    let source_branches = list_source_branches(&repo)?;
+    let reporter = Reporter::new(config.branches.len() + source_branches.len());
+
     // dest→source first, for every explicitly configured branch: any content
     // dest carries that gitprism didn't itself put there (e.g. a merged PR)
     // must be reflected into source before source→dest's own refusal check
@@ -107,18 +117,40 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // content it doesn't recognize, and reflecting it into source is exactly
     // what makes it recognized (see `dest_resume_point`'s third case).
     // Grouping by phase rather than by branch still guarantees this ordering
-    // per branch, since discovery below only runs once every dest→source call
-    // has returned (decisions/0017).
+    // per branch, since discovery above only runs once, before either phase
+    // (decisions/0017, decisions/0020).
     for branch in &config.branches {
-        sync_pair_from_dest(&repo, &source_root, &config, branch)
+        sync_pair_from_dest(&repo, &source_root, &config, branch, &reporter)
             .with_context(|| format!("syncing {branch:?} dest -> source"))?;
     }
 
     // source→dest discovers every branch that exists on source at run time
     // (decisions/0017) rather than reading `config.branches` — a brand-new
-    // branch needs no config entry to start mirroring. Sorted for
-    // deterministic run order: git2's branch iteration order isn't
-    // guaranteed.
+    // branch needs no config entry to start mirroring. `source_branches` was
+    // already listed (and sorted) above, before the dest→source loop, so
+    // there's nothing left to (re-)discover here.
+    for branch in &source_branches {
+        sync_pair_to_dest(&repo, &source_root, &config, branch, &reporter)
+            .with_context(|| format!("syncing {branch:?} source -> dest"))?;
+    }
+
+    // Every branch is accounted for — clear the pinned bar rather than
+    // leaving it frozen on whatever its last step message happened to be
+    // (decisions/0020's own Context cites clearing transient UI once a step
+    // is done). The completed lines already printed above it are the
+    // permanent record of the run, not the bar itself.
+    reporter.finish();
+
+    Ok(())
+}
+
+/// Every local branch that exists on source right now, sorted for
+/// deterministic run order (git2's branch iteration order isn't guaranteed).
+/// Read once by [`run`] — before either sync phase starts, purely to size
+/// [`Reporter`]'s upfront total (decisions/0020, point 3) — and reused for
+/// the source→dest loop rather than listed again. A local, read-only `git
+/// branch` enumeration; no fetch involved.
+fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
     let mut source_branches: Vec<String> = repo
         .branches(Some(git2::BranchType::Local))
         .context("listing source's local branches")?
@@ -132,13 +164,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     source_branches.sort();
-
-    for branch in &source_branches {
-        sync_pair_to_dest(&repo, &source_root, &config, branch)
-            .with_context(|| format!("syncing {branch:?} source -> dest"))?;
-    }
-
-    Ok(())
+    Ok(source_branches)
 }
 
 /// Pushes `branch`'s pending commits from source to a same-named branch on
@@ -151,7 +177,14 @@ fn sync_pair_to_dest(
     source_root: &Path,
     config: &Config,
     branch: &str,
+    reporter: &Reporter,
 ) -> Result<()> {
+    // decisions/0020: cyan in a completed line iff round-tripped (named in
+    // `config.branches`) — computed once here and reused for every
+    // `reporter` call this function makes, rather than re-derived at each
+    // one.
+    let round_tripped = config.branches.iter().any(|b| b == branch);
+
     let source_tip = repo
         .find_branch(branch, git2::BranchType::Local)
         .with_context(|| format!("resolving source branch {branch:?}"))?
@@ -188,7 +221,7 @@ fn sync_pair_to_dest(
         // current tips, its absence on dest is expected, not something to
         // resurrect (GitLab's own push-mirror does the same for its mirrors).
         if !dest_ref_exists
-            && !config.branches.iter().any(|b| b == branch)
+            && !round_tripped
             && let Some(landing) = already_merged_into_a_landing_branch(
                 repo,
                 config,
@@ -197,19 +230,31 @@ fn sync_pair_to_dest(
                 &exclude_list,
             )?
         {
-            eprintln!(
-                "{branch}: not recreating on dest — already merged into {landing:?} and cleaned up there (expected for a mirror-only branch)"
+            reporter.complete(
+                Outcome::Skipped,
+                branch,
+                Direction::SourceToDest,
+                round_tripped,
+                Some(&format!(
+                    "already merged into {landing:?} and cleaned up there (expected for a mirror-only branch)"
+                )),
             );
             return Ok(());
         }
 
         let (dest_tip, boundary) = if dest_ref_exists {
-            if config.branches.iter().any(|b| b == branch) {
-                eprintln!(
-                    "{branch}: fetching dest (finding resume point before merging from source)"
+            if round_tripped {
+                reporter.step(
+                    branch,
+                    Direction::SourceToDest,
+                    "fetching dest (finding resume point before merging from source)",
                 );
             } else {
-                eprintln!("{branch}: fetching dest (mirror-only branch, not round-tripped)");
+                reporter.step(
+                    branch,
+                    Direction::SourceToDest,
+                    "fetching dest (mirror-only branch, not round-tripped)",
+                );
             }
             git::fetch(source_root, &dest_url, branch)
                 .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
@@ -289,6 +334,21 @@ fn sync_pair_to_dest(
         }
 
         if let Some(conflict) = build.conflict {
+            reporter.complete(
+                Outcome::Error,
+                branch,
+                Direction::SourceToDest,
+                round_tripped,
+                Some(&format!(
+                    "hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to dest's {branch:?} branch",
+                    conflict.commit, conflict.paths
+                )),
+            );
+            // Decisions/0007's hard-stop ends this run right here — clear
+            // the pinned bar rather than leaving it frozen mid-step above
+            // the error text `anyhow::bail!` is about to print, which would
+            // otherwise read as "the run hung," not "the run errored."
+            reporter.finish();
             anyhow::bail!(
                 "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to dest's {branch:?} branch",
                 conflict.commit,
@@ -296,6 +356,17 @@ fn sync_pair_to_dest(
             );
         }
 
+        reporter.complete(
+            if new_dest_tip.is_some() {
+                Outcome::Done
+            } else {
+                Outcome::Skipped
+            },
+            branch,
+            Direction::SourceToDest,
+            round_tripped,
+            (new_dest_tip.is_none()).then_some("up to date, nothing to sync"),
+        );
         return Ok(());
     }
 }
@@ -848,6 +919,7 @@ fn sync_pair_from_dest(
     source_root: &Path,
     config: &Config,
     branch: &str,
+    reporter: &Reporter,
 ) -> Result<()> {
     let dest_url = config.dest_url()?;
 
@@ -867,8 +939,10 @@ fn sync_pair_from_dest(
             );
         }
 
-        eprintln!(
-            "{branch}: fetching dest (checking for independent content to reflect into source)"
+        reporter.step(
+            branch,
+            Direction::DestToSource,
+            "fetching dest (checking for independent content to reflect into source)",
         );
         git::fetch(source_root, &dest_url, branch)
             .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
@@ -902,7 +976,11 @@ fn sync_pair_from_dest(
             // anything to source, e.g. a branch that never receives
             // independent dest-side commits.
             let source_url = config.source_url()?;
-            eprintln!("{branch}: refetching source (lost a push race, recomputing)");
+            reporter.step(
+                branch,
+                Direction::DestToSource,
+                "refetching source (lost a push race, recomputing)",
+            );
             git::fetch(source_root, &source_url, branch).with_context(|| {
                 format!("fetching source branch {branch:?} from {source_url:?}")
             })?;
@@ -936,6 +1014,25 @@ fn sync_pair_from_dest(
         }
 
         if let Some(conflict) = build.conflict {
+            // Always round-tripped (`true`): `branch` here is always named in
+            // `config.branches` (decisions/0017's own doc comment above), so
+            // there's no mirror-only case for this direction's completed line
+            // to distinguish.
+            reporter.complete(
+                Outcome::Error,
+                branch,
+                Direction::DestToSource,
+                true,
+                Some(&format!(
+                    "hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to source's {branch:?} branch",
+                    conflict.commit, conflict.paths
+                )),
+            );
+            // Decisions/0007's hard-stop ends this run right here — clear
+            // the pinned bar rather than leaving it frozen mid-step above
+            // the error text `anyhow::bail!` is about to print, which would
+            // otherwise read as "the run hung," not "the run errored."
+            reporter.finish();
             anyhow::bail!(
                 "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to source's {branch:?} branch",
                 conflict.commit,
@@ -943,6 +1040,20 @@ fn sync_pair_from_dest(
             );
         }
 
+        reporter.complete(
+            if build.new_tip.is_some() {
+                Outcome::Done
+            } else {
+                Outcome::Skipped
+            },
+            branch,
+            Direction::DestToSource,
+            true,
+            build
+                .new_tip
+                .is_none()
+                .then_some("nothing new to reflect back into source"),
+        );
         return Ok(());
     }
 }
@@ -2831,7 +2942,8 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
+        let reporter = Reporter::new(1);
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("a loop-prevented sync is still a successful no-op");
 
         let source_remote_repo = Repository::open(source_remote.path()).unwrap();
@@ -2898,10 +3010,12 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
+        let reporter = Reporter::new(1);
 
-        let err = sync_pair_from_dest(&repo, source_dir.path(), &config, branch).expect_err(
-            "a real same-file conflict must hard-stop, not silently resolve either side",
-        );
+        let err = sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
+            .expect_err(
+                "a real same-file conflict must hard-stop, not silently resolve either side",
+            );
         let message = format!("{err:#}");
         assert!(message.contains(&conflicting_dest_commit.to_string()));
         assert!(message.contains("resolve"));
@@ -2980,10 +3094,12 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
+        let reporter = Reporter::new(1);
 
-        let err = sync_pair_to_dest(&repo, source_dir.path(), &config, branch).expect_err(
-            "a real same-file conflict must hard-stop, not silently resolve either side",
-        );
+        let err = sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter)
+            .expect_err(
+                "a real same-file conflict must hard-stop, not silently resolve either side",
+            );
         let message = format!("{err:#}");
         assert!(message.contains(&conflicting_source_commit.to_string()));
         assert!(message.contains("resolve"));
@@ -3058,7 +3174,8 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
+        let reporter = Reporter::new(1);
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("dest→source should succeed even when the last commit is a no-op");
 
         // The newest commit on source must still name dest_b exactly, even
@@ -3083,7 +3200,7 @@ mod tests {
         // With that marker in place, source→dest must actually recognize
         // dest_b's tip as accounted for and proceed normally, not refuse.
         let repo = Repository::open(source_dir.path()).unwrap();
-        sync_pair_to_dest(&repo, source_dir.path(), &config, branch).expect(
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter).expect(
             "source→dest must recognize a dest tip whose only marker is a no-op commit, not refuse it",
         );
     }
@@ -3133,6 +3250,44 @@ mod tests {
 
         run(source_dir.path(), config_file.path())
             .expect("a source→dest-only run must not fail merely for lacking a source URL");
+    }
+
+    #[test]
+    fn list_source_branches_lists_every_local_branch_sorted() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let root = repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "root",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let root_commit = repo.find_commit(root).unwrap();
+        // Created out of alphabetical order — asserting a specific sorted
+        // order below pins the sorted-by-construction guarantee explicitly
+        // (an explicit `.sort()`, not an assumption about git2's own
+        // iteration order, which its docs don't promise) even though this
+        // machine's libgit2 happens to already iterate loose refs
+        // alphabetically.
+        repo.branch("zeta", &root_commit, false).unwrap();
+        repo.branch("alpha", &root_commit, false).unwrap();
+
+        let branches =
+            list_source_branches(&repo).expect("listing source's local branches should succeed");
+
+        assert_eq!(
+            branches,
+            vec!["alpha".to_string(), "main".to_string(), "zeta".to_string()],
+            "every local branch must be listed, sorted for deterministic run order"
+        );
     }
 
     #[test]
@@ -3282,8 +3437,9 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
+        let reporter = Reporter::new(1);
 
-        sync_pair_to_dest(&repo, source_dir.path(), &config, branch)
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("a rename carrying dest's own edit across it must merge cleanly");
 
         let new_dest_tip = dest_repo
@@ -3362,8 +3518,9 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
+        let reporter = Reporter::new(1);
 
-        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("dest's edit to a file source renamed must carry across cleanly");
 
         let source_remote_repo = Repository::open(source_remote.path()).unwrap();
@@ -3430,8 +3587,9 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
+        let reporter = Reporter::new(1);
 
-        sync_pair_from_dest(&repo, source_dir.path(), &config, branch)
+        sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("an identical independent change must merge cleanly, not conflict");
 
         let source_remote_repo = Repository::open(source_remote.path()).unwrap();
@@ -3450,7 +3608,7 @@ mod tests {
         );
 
         let repo = Repository::open(source_dir.path()).unwrap();
-        sync_pair_to_dest(&repo, source_dir.path(), &config, branch)
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("a content no-op merge must not be misreported as a conflict");
 
         let dest_tip_commit = dest_repo
@@ -3471,7 +3629,7 @@ mod tests {
         assert_eq!(shared_blob.content(), b"v2\n");
 
         let repo = Repository::open(source_dir.path()).unwrap();
-        sync_pair_to_dest(&repo, source_dir.path(), &config, branch)
+        sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("a repeat sync of the same no-op merge must still succeed");
         let dest_tip_after_repeat = dest_repo
             .find_branch("main", git2::BranchType::Local)
