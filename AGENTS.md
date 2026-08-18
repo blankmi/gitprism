@@ -46,3 +46,12 @@ recording the chronological history of what was added/decided and when.
   that makes it pass. Rust's built-in `#[test]` + `cargo test` is the framework;
   reach for an added dev-dependency (e.g. `tempfile`) only when the built-in tools
   can't express the test cleanly.
+
+# Response style
+
+Applies to both conversation and anything written to `design/` or the code:
+
+* Be clear and precise. State facts, skip preamble, skip unnecessary output.
+* No long explanations unless asked for one.
+* No code comments that duplicate existing documentation or restate what the
+  code already makes obvious.
