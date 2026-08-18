@@ -189,8 +189,13 @@ fn sync_pair_to_dest(
         // resurrect (GitLab's own push-mirror does the same for its mirrors).
         if !dest_ref_exists
             && !config.branches.iter().any(|b| b == branch)
-            && let Some(landing) =
-                already_merged_into_a_landing_branch(repo, config, source_tip, source_root)?
+            && let Some(landing) = already_merged_into_a_landing_branch(
+                repo,
+                config,
+                source_tip,
+                source_root,
+                &exclude_list,
+            )?
         {
             eprintln!(
                 "{branch}: not recreating on dest — already merged into {landing:?} and cleaned up there (expected for a mirror-only branch)"
@@ -423,6 +428,18 @@ fn build_pending_dest_tip(
 /// well as a real merge or a rebase/fast-forward (a squash merge's result has
 /// no ordinary ancestor relationship to the branch it came from at all).
 ///
+/// All three trees are filtered through `exclude_list` before comparison
+/// (decisions/0018 addendum), the same as every other cross-side content
+/// comparison in this file (e.g. [`build_pending_dest_tip`]) — dest only ever
+/// sees the filtered subset of source, so the question this function has to
+/// ask is "is everything dest would ever see from this branch already in the
+/// landing branch," not "is 100% of this branch's raw source content already
+/// there." An excluded path touched on `branch` alongside ordinary mirrored
+/// changes is routine in a source-is-a-superset repo, not evidence of
+/// genuinely unmerged content — comparing raw trees would see that excluded
+/// path as content the landing branch never received and wrongly conclude
+/// "not merged," resurrecting the branch on dest every run.
+///
 /// Safe to read each landing branch's *current* tip here because `run`
 /// finishes dest→source for every `config.branches` entry before source→dest
 /// ever discovers a branch (decisions/0017's phase ordering) — those tips are
@@ -438,6 +455,7 @@ fn already_merged_into_a_landing_branch(
     config: &Config,
     branch_tip: Oid,
     source_root: &Path,
+    exclude_list: &ExcludeList,
 ) -> Result<Option<String>> {
     for landing in &config.branches {
         // A landing branch named in config that doesn't (yet) exist on source
@@ -472,18 +490,36 @@ fn already_merged_into_a_landing_branch(
             continue;
         }
 
-        let base_tree = repo
-            .find_commit(merge_base)
-            .context("resolving a landing branch's merge-base commit")?
-            .tree_id();
-        let landing_tree = repo
-            .find_commit(landing_tip)
-            .context("resolving a landing branch's tip commit")?
-            .tree_id();
-        let branch_tree = repo
-            .find_commit(branch_tip)
-            .context("resolving a mirror-only branch's tip commit")?
-            .tree_id();
+        let base_tree = filter_tree(
+            repo,
+            &repo
+                .find_commit(merge_base)
+                .context("resolving a landing branch's merge-base commit")?
+                .tree()
+                .context("reading a landing branch's merge-base tree")?,
+            Path::new(""),
+            exclude_list,
+        )?;
+        let landing_tree = filter_tree(
+            repo,
+            &repo
+                .find_commit(landing_tip)
+                .context("resolving a landing branch's tip commit")?
+                .tree()
+                .context("reading a landing branch's tip tree")?,
+            Path::new(""),
+            exclude_list,
+        )?;
+        let branch_tree = filter_tree(
+            repo,
+            &repo
+                .find_commit(branch_tip)
+                .context("resolving a mirror-only branch's tip commit")?
+                .tree()
+                .context("reading a mirror-only branch's tip tree")?,
+            Path::new(""),
+            exclude_list,
+        )?;
 
         if let git::MergeTreeOutcome::Clean(merged) =
             git::merge_tree(source_root, base_tree, landing_tree, branch_tree)?
@@ -4001,6 +4037,138 @@ mod tests {
                 .is_err(),
             "a mirror-only branch already merged into a round-tripped branch, then \
              deleted on dest, must not be resurrected"
+        );
+    }
+
+    #[test]
+    fn run_does_not_resurrect_a_mirror_only_branch_merged_except_for_excluded_paths() {
+        // decisions/0018 addendum: `already_merged_into_a_landing_branch` must
+        // compare *filtered* trees, not raw source-side ones. A mirror-only
+        // branch's commit touching an excluded path (`.gitprismignore`)
+        // alongside an ordinary mirrored one is completely normal in a
+        // source-is-a-superset repo — dest never receives that excluded path
+        // either way, so its presence on `branch` but not on the landing
+        // branch must not read as "genuinely unmerged." Before the fix, the
+        // raw (unfiltered) tree comparison saw `secret.txt` as content
+        // `landing` never received and wrongly concluded "not merged,"
+        // resurrecting feature-x on dest every single run.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // `.gitprismignore` excludes secret.txt from ever reaching dest
+        // (decisions/0011) — versioned on main like any other source content.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "secret.txt\n")]);
+        let main_after_ignore = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch(
+                "feature-x",
+                &source_repo.find_commit(main_after_ignore).unwrap(),
+                false,
+            )
+            .unwrap();
+        // feature-x's own commit touches both a mirrored path and an excluded
+        // path together — ordinary in a source-is-a-superset repo, and
+        // exactly the shape the pre-fix bug mishandled.
+        add_commit(
+            &source_repo,
+            "feature-x",
+            &[
+                ("feature.txt", "line1\n"),
+                ("secret.txt", "only for source"),
+            ],
+        );
+
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+
+        // First sync: feature-x is mirrored to dest with no config entry —
+        // secret.txt is filtered out.
+        run(source_dir.path(), config.path()).expect("first sync should mirror feature-x to dest");
+        let dest_feature_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            dest_feature_tip
+                .tree()
+                .unwrap()
+                .get_name("secret.txt")
+                .is_none(),
+            "secret.txt must never reach dest"
+        );
+
+        // Simulate a real PR: feature-x is merged into dest's main via a
+        // genuine new commit made directly on dest — single-parent, same
+        // squash-shaped stand-in the sibling fixture uses, to isolate
+        // decisions/0018's merge-status check from decisions/0019's
+        // first-parent-only marker scan.
+        let dest_main_tip_before = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let merge_signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        dest_repo
+            .commit(
+                Some("refs/heads/main"),
+                &merge_signature,
+                &merge_signature,
+                "Merge branch 'feature-x' into 'main'",
+                &dest_feature_tip.tree().unwrap(),
+                &[&dest_main_tip_before],
+            )
+            .unwrap();
+
+        // Second sync: dest→source reflects that merge back into source's
+        // main — main's own tree still never gains secret.txt, since dest
+        // never had it to bring back.
+        run(source_dir.path(), config.path())
+            .expect("second sync should bring the PR merge back into source's main");
+
+        // dest deletes feature-x as routine post-merge cleanup.
+        dest_repo
+            .find_reference("refs/heads/feature-x")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        // Third sync must not recreate feature-x on dest, even though
+        // feature-x's raw source-side tree carries secret.txt — an excluded
+        // path main's tree never received and never will.
+        run(source_dir.path(), config.path())
+            .expect("third sync should succeed without recreating feature-x");
+        assert!(
+            dest_repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .is_err(),
+            "a mirror-only branch already merged into a round-tripped branch (modulo \
+             excluded paths dest never receives), then deleted on dest, must not be \
+             resurrected"
         );
     }
 
