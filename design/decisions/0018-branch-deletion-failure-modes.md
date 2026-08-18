@@ -3,8 +3,10 @@ type: Decision
 title: A round-tripped branch's missing dest ref fails loudly; a mirror-only branch's missing dest ref is checked against merge status before recreating
 description: Two branch-deletion failure modes decisions/0017 explicitly deferred, now resolved differently on purpose. A round-tripped branch (config.branches) with no ref on dest is a genuine error — source and dest have gone out of sync — and sync now fails with a clear, gitprism-authored message instead of leaking git's raw fetch error. A mirror-only (discovered) branch with no ref on dest is checked, content-first and with no persisted state, against whether it's already fully merged into a round-tripped branch's current tip before being rebuilt and pushed — if so, its absence on dest is treated as expected post-merge cleanup, not something to resurrect.
 tags: [architecture, branches, error-handling]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-17T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
 ---
 
 # Context

@@ -3,8 +3,10 @@ type: Decision
 title: Sync's status output becomes a pinned progress bar over colored, scannable branch/result lines
 description: sync's five eprintln! call sites (all in src/commands/sync.rs) are replaced with an indicatif-backed display, Gradle rich-console-style — a pinned bottom region (overall progress bar plus a current branch/step line) with every completed branch-operation printed as a permanent line above it once it finishes. Each completed line is a short colored summary (done/skipped/error in green/yellow/red; the branch name in cyan if it's round-tripped per config.branches, plain if it's a decisions/0017 mirror-only branch) with any explanatory "why" text demoted to an indented note line beneath it, Cargo's verb/noun-plus-note convention. The overall total is computed upfront — source's branch list is read once before either phase starts, not discovered mid-run — so the bar's denominator is accurate from the very first line. Falls back to today's plain sequential lines whenever stderr isn't a terminal (CI, redirected logs), the same non-interactive case design/playbooks/0001 already documents.
 tags: [ux, cli, output, sync]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
 ---
 
 # Context

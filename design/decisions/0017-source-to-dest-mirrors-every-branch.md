@@ -3,8 +3,10 @@ type: Decision
 title: source→dest mirrors every branch; dest→source stays an explicit list
 description: The two directions no longer share one configured list. source→dest discovers and mirrors every branch on source under its own name, with no per-branch config entry; dest→source keeps an explicit configured list, simplified from {source_branch, dest_branch} pairs to plain branch names now that source→dest never renames. Supersedes decisions/0005's shared-pairs-list model for source→dest's scope.
 tags: [architecture, scope, branches]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-17T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
 ---
 
 # Context

@@ -3,8 +3,10 @@ type: Decision
 title: Setup accepts a repo that's already a clean clone of dest, not just a completely empty one
 description: setup's precondition relaxes from "no branches, no HEAD" to "every existing local branch's tip is identical to dest's own current tip for that branch name, and no other local branches exist" — recognizing `git clone <dest-url> && cd && gitprism setup` as a safe starting state instead of rejecting it outright, while still hard-failing on any real independent history.
 tags: [architecture, setup, bootstrap]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
 ---
 
 # Context

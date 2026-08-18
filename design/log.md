@@ -683,6 +683,27 @@ precondition check, its ordering relative to config parsing, and
 `rollback_branches`' reset-vs-delete distinction for pre-existing branches all
 still need to change; no code written yet.
 
+## 2026-08-18 (later still)
+
+**Drafted [decisions/0022](decisions/0022-setup-gains-an-interactive-first-run-wizard.md)**:
+raised by the project owner — when `setup`'s config file doesn't exist yet,
+prompt for it interactively instead of just failing. Settled through
+conversation: the wizard asks for dest's URL (prefilled from an existing
+`origin` remote — the decisions/0021 clone-first case), branches (`git
+ls-remote --heads` against dest, `main`/`master`/`develop`/`release*` sorted to
+the top, plus a manual free-text catch-all, since dest can have far more
+branches than fit on one screen), source's URL (skippable per decisions/0013),
+and committer identity (prefilled from local git config) — then offers to
+repoint (or add) the local `origin` remote to source's URL, since this
+checkout is source going forward. A missing config with no attached terminal
+(checked via `console::user_attended()`) still hard-fails exactly as today.
+Prior-art check: `dialoguer` (same vendor family as `console`/`indicatif`,
+already dependencies) has no filtering on its `MultiSelect`; `inquire` does
+(type-to-filter plus page size), which is the actual feature needed once dest
+has more branches than fit on screen — chosen over staying in the existing
+vendor family for that reason specifically. Not yet implemented — no code
+written, no new dependency added yet.
+
 ## 2026-08-18 (yet again)
 
 **Implemented decisions/0021**: config is now parsed before `setup.rs`'s
@@ -726,3 +747,68 @@ because its `"unrelated"` branch name isn't in config.
 
 `cargo test`: 111 passed, 0 failed. `cargo clippy --all-targets`: clean.
 `cargo fmt --check`: clean.
+
+## 2026-08-18 (still going)
+
+**Drafted [decisions/0023](decisions/0023-setup-adopt-flag-merges-dest-into-real-independent-history.md)**:
+surfaced by actually running decisions/0021's build against the project
+owner's real GitLab repo (`~/work/catenax-connector`) — it hard-failed, and
+diagnosis showed why: that repo isn't a clone of dest at all (`origin` is
+source's own GitLab URL), has real independent commits on `main` predating
+any of this, and carries two other local branches (`ai-setup`, `backup`) not
+in `config.branches`. Neither decisions/0006's single-parent graft nor
+decisions/0021's identical-to-dest check has any way to express "this history
+already existed independently before dest was involved."
+
+Resolved through conversation: a new `--adopt` flag lets a configured
+branch's real independent history merge with dest instead of hard-failing,
+via the same `git merge-tree --write-tree` primitive decisions/0016 already
+uses for both sync directions (base = git's empty tree, since no common
+ancestor exists by construction; ours = the branch's own tree; theirs =
+dest's tip) — clean merges get `.gitprism.toml`/`.gitprismignore` inserted
+and commit with two parents (branch's own previous tip first, dest's tip
+second, ordinary `git merge` convention), a real conflict hard-stops per
+decisions/0007, naming the paths, with no `-X ours`/`-X theirs`
+auto-resolution — the project owner's own answer. `--adopt` requires
+`HEAD` to already be on the branch being adopted (no forced checkout, no
+moving `HEAD`), and only ever affects that one branch. Separately amends
+decisions/0021: setup no longer enumerates every local branch and requires
+each to be in `config.branches` — it now only ever looks at branches
+actually named there, so `ai-setup`/`backup` are left alone entirely, per the
+project owner's explicit answer, rather than blocking the run just for
+existing.
+
+Prior art backing the shape, both already in this project's own references:
+`git subtree add`'s actual primary use case is merging external history into
+an *already-existing* repo (decisions/0006 had only followed its "graft onto
+emptiness" shape until now); `git merge --allow-unrelated-histories` is git's
+own precedent for gating a no-common-ancestor merge behind an explicit flag
+rather than inferring intent — directly justifying `--adopt` as an opt-in
+rather than auto-detected behavior.
+
+Left deliberately open: what an operator does after `--adopt` hard-stops on
+a conflict. No `resolve`-equivalent exists for this one-time case yet — for
+now the hard-stop message points at completing a real
+`git merge --allow-unrelated-histories` by hand and stamping
+`Gitprism-Dest-Commit` themselves, since every other command only depends on
+that trailer's presence, not on how the commit was produced. Not yet
+implemented — no code written.
+
+## 2026-08-18 (once more)
+
+**Status audit, no design change**: decisions/0016 through 0021 were all
+sitting at `status: draft` with no `verified` stamp despite each having its
+own "Implemented decisions/00XX" entry above and a matching commit
+(`48068ca`, `ae601b5`, `ff74994`, `d774484`, `bf95ae1`, `bde40ab`) — confirmed
+by cross-checking git log against `src/`: `git::merge_tree` is live in
+`sync.rs` (0016), branch discovery/mirroring and the deletion checks are in
+place (0017, 0018), both marker scans call
+`Revwalk::simplify_first_parent()` (0019), the `indicatif` progress display
+is wired into `sync` (0020), and `setup.rs`'s precondition check is the
+narrowed per-branch oid comparison (0021). decisions/0022 and 0023 were left
+at `draft`, correctly — neither `dialoguer`/`inquire` nor an `--adopt` flag
+exists anywhere in `src/` or `Cargo.toml` yet, matching their own "Not yet
+implemented" log entries above. Flipped 0016-0021 to `status: stable` with a
+`verified: [{ by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }]`
+stamp, same shape 0001-0015 already use — the project owner confirmed this
+counts as his review, having used/exercised each through today's check.

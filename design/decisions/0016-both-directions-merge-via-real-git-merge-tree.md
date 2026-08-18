@@ -3,8 +3,10 @@ type: Decision
 title: Both sync directions merge via a real `git merge-tree` subprocess
 description: Neither direction does its own merge or patch work any more. One primitive — `git merge-tree --write-tree` over pre-filtered trees — computes the resulting tree for source→dest and dest→source alike. Supersedes decisions/0014's diff-and-apply mechanism and amends decisions/0002's "local merge work goes through git2-rs" clause.
 tags: [architecture, git-library, filtering, conflict-handling]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-14T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
 ---
 
 # Context

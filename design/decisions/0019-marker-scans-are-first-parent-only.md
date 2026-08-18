@@ -3,8 +3,10 @@ type: Decision
 title: Marker scans walk first-parent-only, not full ancestry
 description: newest_source_marker and newest_dest_marker (design/log.md's "trailers are not pair-qualified" gap) now revwalk with git2's simplify_first_parent(), matching git rev-list --first-parent, instead of every reachable commit. A real, two-parent merge of a mirror-only branch into a round-tripped branch on dest can no longer make the round-tripped branch's own resume-point scan cross into the merged-in branch's own trailer history. Documented limitation: this assumes the tracked branch is first-parent of its own merges, true for GitHub/GitLab/Azure DevOps' "merge PR" button and for `git merge` run from the target branch.
 tags: [architecture, state, mapping, branches]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-17T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
 ---
 
 # Context
