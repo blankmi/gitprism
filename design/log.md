@@ -812,3 +812,82 @@ implemented" log entries above. Flipped 0016-0021 to `status: stable` with a
 `verified: [{ by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }]`
 stamp, same shape 0001-0015 already use — the project owner confirmed this
 counts as his review, having used/exercised each through today's check.
+
+## 2026-08-18 (yet once more)
+
+**Revised decisions/0023**, replacing the `--adopt`-flag draft above before
+any of it was implemented. Talking through the design, the project owner
+pushed back on the flag itself: "I can create a new folder, run git init,
+create a config and then run gp setup... where is the difference if my local
+state is the same as on dest for the branches configured?" Tracing what
+`graft_branch` actually does confirmed the point — decisions/0021 already
+works by reusing that one function unchanged, because libgit2's
+first-parent-must-match-current-ref-target check passes trivially when local
+tip equals dest tip. Empty repo, clean clone of dest, and real independent
+history aren't three cases needing three mechanisms; they're one
+reconciliation operation (merge-base, then `merge_tree`) with three points on
+a spectrum.
+
+decisions/0023 now generalizes 0021's oid-equality precondition into a real
+merge-base check (`repo.merge_base`, already used elsewhere in `sync.rs`'s
+`graft_point` and `already_merged_into_a_landing_branch`): a merge-base
+existing means reconcile via decisions/0016's `merge_tree` primitive into a
+real two-parent commit, hard-stopping on any real conflict per decisions/0007
+exactly as before; no merge-base at all is a permanent, unconditional
+hard-fail with no flag to bypass it. Asked directly whether to keep any
+override for the one edge a clean merge-tree result can't catch — two
+unrelated trees with zero overlapping paths merging silently with no
+conflict to hard-stop on — the project owner's answer removed the override
+question entirely: "If the history is unrelated fail, no flag to work around
+it." Combining truly unrelated histories is left to real git, deliberately,
+before `setup` ever runs again.
+
+Superseded, not just amended: 0021's mechanism becomes a special case of
+0023's general rule rather than a separately-implemented precondition.
+Renamed the file from
+`0023-setup-adopt-flag-merges-dest-into-real-independent-history.md` to
+`0023-setup-reconciles-pre-existing-branches-via-merge-base.md` to match.
+Still not yet implemented — no code written; still needs a subagent-delegated
+TDD implementation, independent review, and explicit go-ahead before
+committing, matching how decisions/0021 was actually built.
+
+## 2026-08-18 (and once more)
+
+**Implemented decisions/0023.** Delegated to a subagent with a detailed
+TDD-first spec covering the merge-base generalization, the two-parent commit
+ordering, the new "no history in common" hard-fail wording, and the subtle
+test-suite consequence that an unconfigured local branch (`ai-setup`,
+`backup`) must now be *invisible* rather than blocking, which flips the
+expectation of the old `run_fails_loudly_against_a_non_empty_source_repo`
+test entirely. `cargo test`/`clippy`/`fmt` all came back clean from the
+subagent; independently re-ran all three myself and read the full diff by
+hand (`src/commands/setup.rs` only, as instructed) before trusting it.
+
+While reviewing, tested a scenario decisions/0023 never actually considered
+when drafted: running `setup` a second time against its own prior graft
+output. It should have hard-failed (decisions/0021's own stated consequence:
+"a repo that already had `gitprism setup` run against it once still
+hard-fails... re-running setup remains unsupported") but instead silently
+succeeded — a prior graft's parent already *is* dest's old tip, so the new
+merge-base generalization found a real merge-base and happily merged dest's
+newer tip in, producing a second commit with no error at all. Confirmed this
+directly with a throwaway probe test before raising it (also recovered
+`setup.rs` from a self-inflicted `git checkout --` mishap mid-review — no
+work was actually lost, since the full file had just been read).
+
+Asked the project owner how to handle it: hard-fail on setup's own graft, or
+accept idempotent re-merging. Chose the hard-fail, matching decisions/0021's
+original guarantee. Added a TDD-first test
+(`run_fails_loudly_when_a_pre_existing_branch_is_setups_own_prior_graft`) and
+the fix: `setup` now recognizes a pre-existing branch's tip already carrying
+a `Gitprism-Dest-Commit` trailer (decisions/0003 — the same bookkeeping every
+other command already trusts) and hard-fails before the merge-base question
+even arises, since a prior graft's parent always has one. `sync.rs`'s private
+`trailer_value` helper became `pub(crate)` so `setup.rs` could reuse it
+rather than duplicating trailer parsing. Updated decisions/0023's Decision,
+Why, and Consequences sections to document this as case 2 of the reconciled
+rule, not just a code-level patch.
+
+Final state: 114 tests passing (up from 113 pre-0023), `cargo clippy
+--all-targets` clean, `cargo fmt --check` clean. Not yet committed — pending
+the project owner's review of the working tree.

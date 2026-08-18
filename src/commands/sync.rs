@@ -767,8 +767,10 @@ fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Result<Vec<Oid
 /// the same trailer shape `setup` already writes
 /// (`Gitprism-Dest-Commit: <oid>`), read back here for
 /// `Gitprism-Source-Commit` (and, for loop prevention,
-/// `Gitprism-Dest-Commit`).
-fn trailer_value<'a>(message: &'a str, key: &str) -> Option<&'a str> {
+/// `Gitprism-Dest-Commit`). `pub(crate)` so `setup` can reuse it too
+/// (decisions/0023's re-run guard: recognizing a pre-existing branch as
+/// setup's own prior output).
+pub(crate) fn trailer_value<'a>(message: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}: ");
     message
         .lines()

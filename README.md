@@ -114,14 +114,20 @@ excludes itself automatically.
 
 ### `gitprism setup`
 
-One-time step. Run inside a freshly `git init`'d repo that will become
-source — either completely empty, or already a clean, unmodified clone of
-dest (e.g. `git clone <dest-url> source && cd source`). Fetches dest's
-current tip for every branch in `.gitprism.toml`'s `branches` list and
-grafts a new same-named branch onto it on source, carrying over
-`.gitprism.toml` and `.gitprismignore`. Refuses to run against any other
-pre-existing history — a previous `gitprism setup` run's own graft commits
-included — this is a one-time graft, not something to re-run.
+One-time step. Run inside a real, already-`git init`'d repo that will become
+source. Fetches dest's current tip for every branch in `.gitprism.toml`'s
+`branches` list and, for each one, either grafts a new same-named branch
+onto it (if source has nothing there yet, or exactly matches dest's tip
+already — e.g. a plain `git clone <dest-url> source && cd source`) or
+reconciles source's own existing history with dest's tip into a real merge
+commit, whenever the two genuinely share history — carrying over
+`.gitprism.toml` and `.gitprismignore` either way. A branch whose history has
+*nothing* in common with dest hard-fails outright: gitprism never merges
+unrelated histories on its own, so that has to be done by hand with real git
+first. A local branch not listed in `.gitprism.toml` is left completely
+alone, whatever it contains. Refuses to run against its own prior output —
+this is a one-time step per branch, not something to re-run once it has
+succeeded; `gitprism sync` is how dest's later changes come in after that.
 
 ### `gitprism sync`
 

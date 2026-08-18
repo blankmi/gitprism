@@ -16,14 +16,18 @@
 //! Like `git` itself, gitprism takes no source-location config: `cwd` is a
 //! discovery starting point (walked upward exactly like `git` does from a
 //! subdirectory), and setup requires a real, already-`git init`'d repo
-//! there. It doesn't create one. That repo must be either completely empty
-//! or already a clean, unmodified clone of dest (decisions/0021): every
-//! existing local branch's name must be one of `config.branches`, and its
-//! tip must be identical to a fresh fetch of dest's own current tip for that
-//! name — anything else, including a detached HEAD or a previous `gitprism
-//! setup` run's own graft commits, is real independent history and still
-//! hard-fails (decisions/0012's "Consequences" originally said so
-//! unconditionally; decisions/0021 narrows that to this per-branch check).
+//! there. It doesn't create one. A detached HEAD unconditionally hard-fails
+//! (a clone always leaves HEAD attached to a branch); beyond that, each
+//! configured branch that already exists locally is reconciled with dest via
+//! a merge-base check rather than required to match exactly
+//! (decisions/0023, superseding decisions/0021's narrower oid-equality
+//! precondition): identical tips graft as before, a real but differing
+//! shared history produces a two-parent merge commit via the same
+//! `merge_tree` primitive both sync directions use (decisions/0016), and no
+//! shared history at all hard-fails permanently, with no flag to force it —
+//! see [`run`]'s fetch loop below. A local branch not named in
+//! `config.branches` (e.g. a stray `ai-setup` or `backup` branch) is outside
+//! setup's view entirely: never inspected, never blocking, never touched.
 //! Nothing here decides *how* dest is reached; that stays entirely in
 //! `.gitprism.toml`'s `[dest] url`.
 
@@ -83,17 +87,23 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         );
     }
 
-    // setup is a one-time graft onto an empty, freshly-initialized repo
-    // (decisions/0006, decisions/0012) — or, per decisions/0021, onto a
-    // repo that's already a clean, unmodified clone of dest. Never onto one
-    // with real independent history. A detached HEAD is unconditionally
-    // unrecognized (a clone always leaves HEAD attached to a branch), and
-    // any existing local branch whose name isn't in `config.branches` is
-    // unrecognized too — both hard-fail here exactly as the old
-    // completely-empty-only check did. A branch that *is* in
-    // `config.branches` is allowed to exist for now; its tip is checked
-    // against dest's freshly-fetched tip further down, folded into the
-    // fetch loop rather than a second pass over the repo.
+    // Checked once per run, not only once a pre-existing branch turns out to
+    // need it (decisions/0016, mirrored from `sync::run`) — an operator on a
+    // too-old git gets one clear version message up front instead of a
+    // confusing failure the first time a real merge-base reconciliation
+    // (decisions/0023) needs `merge_tree`.
+    git::ensure_merge_tree_supported()?;
+
+    // decisions/0023 supersedes decisions/0021's mechanism (not just its
+    // precondition wording): a detached HEAD remains an unconditional
+    // hard-fail (a clone always leaves HEAD attached to a branch), but a
+    // local branch is no longer required to either not exist or match dest
+    // exactly. Every configured branch that already exists locally gets
+    // reconciled via a merge-base check further down (folded into the fetch
+    // loop, same as decisions/0021 already did for its narrower oid-equality
+    // check). A local branch whose name isn't in `config.branches` is simply
+    // invisible to setup — never inspected, never recorded, never blocks a
+    // run.
     if repo
         .head_detached()
         .context("checking whether source repo's HEAD is detached")?
@@ -114,9 +124,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             .context("existing local branch name is not valid UTF-8")?
             .to_owned();
         if !config.branches.contains(&name) {
-            anyhow::bail!(
-                "gitprism setup: source repo already has commits and/or branches — setup is a one-time graft onto an empty, freshly-initialized repo, not something to run against existing history"
-            );
+            continue;
         }
         let oid = branch
             .get()
@@ -145,10 +153,12 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     // Fetch every branch's dest tip before writing anything, so a fetch
     // failure partway through never leaves some branches grafted and
-    // others not. Also, per decisions/0021, this is where a pre-existing
-    // local branch (already confirmed above to be one of config.branches)
-    // gets checked against dest's own tip — folded into this same pass
-    // rather than a second fetch loop.
+    // others not. Also, per decisions/0021 (generalized by decisions/0023),
+    // this is where a pre-existing local branch (already confirmed above to
+    // be one of config.branches) gets reconciled against dest's own tip —
+    // folded into this same pass rather than a second fetch loop, so any
+    // hard-fail (no shared history, or a real conflict) surfaces before the
+    // commit phase touches anything.
     let dest_url = config.dest_url()?;
     let mut branch_plans = Vec::with_capacity(config.branches.len());
     for branch in &config.branches {
@@ -162,30 +172,108 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             .peel_to_commit()
             .context("resolving fetched dest branch to a commit")?
             .id();
-        // `original_oid` is `Some` exactly when this branch already existed
-        // locally before this run and matched dest's tip byte-for-byte — the
-        // "clean clone of dest" case decisions/0021 recognizes as safe. Any
-        // mismatch (a previous `gitprism setup` run's own graft commit
-        // included, since that always sits one commit ahead of dest's raw
-        // tip) is real independent history and hard-fails here rather than
-        // being silently grafted over.
-        let original_oid = match pre_existing_branches.get(branch) {
-            Some(&existing_oid) if existing_oid == dest_tip => Some(existing_oid),
-            Some(_) => anyhow::bail!(
-                "gitprism setup: source's local branch {branch:?} already has content that doesn't match dest's current tip — refusing to graft over independent history"
-            ),
-            None => None,
+        // decisions/0023: `original_oid` is `Some` exactly when this branch
+        // already existed locally before this run — whether it turns out to
+        // exactly match dest's tip (single-parent graft, decisions/0021's
+        // original case) or to have its own real shared history reconciled
+        // via a two-parent merge below. `None` means the branch doesn't
+        // exist locally yet, grafted fresh exactly as decisions/0006 always
+        // has.
+        let (plan, original_oid) = match pre_existing_branches.get(branch) {
+            Some(&existing_oid) if existing_oid == dest_tip => {
+                // Identical tips: skip merge machinery entirely rather than
+                // constructing a two-parent commit whose parents are the
+                // same commit (decisions/0023, point 3).
+                (BranchPlan::Graft { dest_tip }, Some(existing_oid))
+            }
+            Some(&existing_oid) => {
+                let existing_commit = repo
+                    .find_commit(existing_oid)
+                    .context("resolving a pre-existing branch's local tip commit")?;
+                // decisions/0023's merge-base reconciliation would otherwise
+                // happily merge dest's newer tip into setup's *own* prior
+                // graft output — its parent already being dest's old tip
+                // means a merge-base always exists. setup is a one-time step
+                // (decisions/0006, decisions/0012); recognizing its own
+                // trailer here restores that guarantee instead of silently
+                // re-running against it. `gitprism sync` is the tool for
+                // picking up dest's newer commits afterward, not a second
+                // `setup`.
+                if super::sync::trailer_value(
+                    existing_commit.message().unwrap_or(""),
+                    "Gitprism-Dest-Commit",
+                )
+                .is_some()
+                {
+                    anyhow::bail!(
+                        "gitprism setup: source's local branch {branch:?} already carries a Gitprism-Dest-Commit trailer — it's setup's own prior output, and setup is a one-time step that must never run against its own graft; run `gitprism sync` instead to pick up dest's newer commits."
+                    );
+                }
+                let base = repo.merge_base(existing_oid, dest_tip).map_err(|_| {
+                    anyhow::anyhow!(
+                        "gitprism setup: source's local branch {branch:?} has no history in common with dest — gitprism won't merge unrelated histories automatically; merge dest into it yourself with real git first (e.g. `git merge --allow-unrelated-histories <dest-remote>/{branch}`), then re-run setup."
+                    )
+                })?;
+                let base_tree = repo
+                    .find_commit(base)
+                    .context("resolving a pre-existing branch's merge-base commit")?
+                    .tree_id();
+                let local_tree = repo
+                    .find_commit(existing_oid)
+                    .context("resolving a pre-existing branch's local tip commit")?
+                    .tree_id();
+                let dest_tree = repo
+                    .find_commit(dest_tip)
+                    .context("resolving dest's fetched tip commit")?
+                    .tree_id();
+                match git::merge_tree(&source_root, base_tree, local_tree, dest_tree)? {
+                    git::MergeTreeOutcome::Clean(merged_tree) => (
+                        BranchPlan::Merge {
+                            local_tip: existing_oid,
+                            dest_tip,
+                            merged_tree,
+                        },
+                        Some(existing_oid),
+                    ),
+                    git::MergeTreeOutcome::Conflict { paths } => anyhow::bail!(
+                        "gitprism setup: {branch:?} has a real conflict between its existing content and dest's tip in {paths:?} — resolve it yourself with real git (e.g. `git merge <dest-remote>/{branch}` in this repo), then re-run setup once done; there is no `gitprism resolve` for this one-time case."
+                    ),
+                }
+            }
+            None => (BranchPlan::Graft { dest_tip }, None),
         };
-        branch_plans.push((dest_tip, original_oid));
+        branch_plans.push((plan, original_oid));
     }
 
     // Commit phase: every precondition above already held, so failure here
     // should be rare — but if one branch still fails partway (e.g. an
     // invalid branch name), roll back this run's already-touched branches
     // rather than leaving a half-grafted repo behind.
+    let control_files = ControlFiles {
+        config_raw: &config_raw,
+        ignore_raw: &ignore_raw,
+    };
     let mut touched_branches: Vec<TouchedBranch> = Vec::with_capacity(config.branches.len());
-    for (branch, (dest_tip, original_oid)) in config.branches.iter().zip(&branch_plans) {
-        match graft_branch(&repo, &config, &config_raw, &ignore_raw, branch, *dest_tip) {
+    for (branch, (plan, original_oid)) in config.branches.iter().zip(&branch_plans) {
+        let result = match plan {
+            BranchPlan::Graft { dest_tip } => {
+                graft_branch(&repo, &config, &control_files, branch, *dest_tip)
+            }
+            BranchPlan::Merge {
+                local_tip,
+                dest_tip,
+                merged_tree,
+            } => merge_branch(
+                &repo,
+                &config,
+                &control_files,
+                branch,
+                *local_tip,
+                *dest_tip,
+                *merged_tree,
+            ),
+        };
+        match result {
             Ok(()) => touched_branches.push(TouchedBranch {
                 name: branch.as_str(),
                 original_oid: *original_oid,
@@ -238,14 +326,33 @@ fn restore_control_files(source_root: &Path, config_raw: &str, ignore_raw: &str)
     let _ = fs::write(source_root.join(exclude::FILENAME), ignore_raw);
 }
 
+/// What the commit phase does for one configured branch, decided during the
+/// fetch/planning loop (decisions/0023) so any hard-fail (no shared history,
+/// or a real conflict) surfaces before the commit phase touches anything.
+enum BranchPlan {
+    /// No local branch yet, or one whose tip is already identical to dest's
+    /// (decisions/0021's original case, decisions/0023 point 3) — a plain
+    /// single-parent graft onto `dest_tip`.
+    Graft { dest_tip: git2::Oid },
+    /// A local branch with real shared history that differs from dest's tip
+    /// — reconciled into a two-parent commit from `merge_tree`'s clean
+    /// result (decisions/0023 point 4).
+    Merge {
+        local_tip: git2::Oid,
+        dest_tip: git2::Oid,
+        merged_tree: git2::Oid,
+    },
+}
+
 /// One branch this run touched, and what rolling it back means.
 ///
 /// `original_oid: None` — setup created this branch fresh; rollback deletes
 /// it. `original_oid: Some(oid)` — this branch already existed before this
-/// run and matched dest's tip (decisions/0021's "clean clone of dest" case);
+/// run, whether it matched dest's tip exactly (decisions/0021's "clean clone
+/// of dest" case) or had its own real, reconciled history (decisions/0023);
 /// rollback resets it back to `oid` instead of deleting it, since deleting a
-/// branch the user's own `git clone` produced would be a worse outcome than
-/// the failure rollback is guarding against.
+/// branch the user's own `git clone` (or independent work) produced would be
+/// a worse outcome than the failure rollback is guarding against.
 struct TouchedBranch<'a> {
     name: &'a str,
     original_oid: Option<git2::Oid>,
@@ -297,26 +404,30 @@ fn checkout_branch(repo: &Repository, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn graft_branch(
-    repo: &Repository,
-    config: &Config,
-    config_raw: &str,
-    ignore_raw: &str,
-    branch: &str,
-    dest_tip: git2::Oid,
-) -> Result<()> {
-    let dest_tip = repo
-        .find_commit(dest_tip)
-        .context("resolving dest's fetched tip commit")?;
+/// This run's own bootstrap control files, read once up front — bundled
+/// together purely to keep `graft_branch`/`merge_branch`'s argument counts
+/// down, since the two bytes always travel together.
+struct ControlFiles<'a> {
+    config_raw: &'a str,
+    ignore_raw: &'a str,
+}
 
+/// Seeds a tree builder from `base_tree` and layers this same run's
+/// `.gitprism.toml`/`.gitprismignore` on top, writing the result — the one
+/// step every commit setup creates (plain graft or merge alike) shares.
+fn layer_control_files(
+    repo: &Repository,
+    base_tree: &git2::Tree,
+    control_files: &ControlFiles,
+) -> Result<git2::Oid> {
     let mut tree_builder = repo
-        .treebuilder(Some(&dest_tip.tree().context("reading dest tip's tree")?))
-        .context("seeding tree builder from dest's tree")?;
+        .treebuilder(Some(base_tree))
+        .context("seeding tree builder from the base tree")?;
     let config_blob = repo
-        .blob(config_raw.as_bytes())
+        .blob(control_files.config_raw.as_bytes())
         .context("writing .gitprism.toml blob")?;
     let ignore_blob = repo
-        .blob(ignore_raw.as_bytes())
+        .blob(control_files.ignore_raw.as_bytes())
         .context("writing .gitprismignore blob")?;
     tree_builder
         .insert(
@@ -324,11 +435,29 @@ fn graft_branch(
             config_blob,
             git2::FileMode::Blob.into(),
         )
-        .context("inserting .gitprism.toml into the graft tree")?;
+        .context("inserting .gitprism.toml into the tree")?;
     tree_builder
         .insert(exclude::FILENAME, ignore_blob, git2::FileMode::Blob.into())
-        .context("inserting .gitprismignore into the graft tree")?;
-    let tree_oid = tree_builder.write().context("writing the graft tree")?;
+        .context("inserting .gitprismignore into the tree")?;
+    tree_builder.write().context("writing the tree")
+}
+
+fn graft_branch(
+    repo: &Repository,
+    config: &Config,
+    control_files: &ControlFiles,
+    branch: &str,
+    dest_tip: git2::Oid,
+) -> Result<()> {
+    let dest_tip = repo
+        .find_commit(dest_tip)
+        .context("resolving dest's fetched tip commit")?;
+
+    let tree_oid = layer_control_files(
+        repo,
+        &dest_tip.tree().context("reading dest tip's tree")?,
+        control_files,
+    )?;
     let tree = repo.find_tree(tree_oid).context("reading the graft tree")?;
 
     let signature = Signature::now(&config.committer.name, &config.committer.email)
@@ -348,6 +477,62 @@ fn graft_branch(
         &[&dest_tip],
     )
     .with_context(|| format!("creating graft commit for {branch:?}"))?;
+
+    Ok(())
+}
+
+/// The decisions/0023 two-parent path: a pre-existing local branch has real
+/// shared history with dest that differs from dest's current tip, and
+/// `merge_tree` reported a clean merge. Builds the final commit from that
+/// merged tree with `.gitprism.toml`/`.gitprismignore` layered on top, same
+/// as `graft_branch` layers them onto dest's tree directly.
+///
+/// Parent order is load-bearing: the local branch's own tip must be parent
+/// 0, since `update_ref` (below, via `refs/heads/{branch}`) requires the
+/// ref's current target to already be the commit passed as the *first*
+/// parent — which holds here because the ref is currently at `local_tip`,
+/// not at `dest_tip`. This also keeps decisions/0019's first-parent-only
+/// marker scans treating this branch's own history as primary going
+/// forward.
+fn merge_branch(
+    repo: &Repository,
+    config: &Config,
+    control_files: &ControlFiles,
+    branch: &str,
+    local_tip: git2::Oid,
+    dest_tip: git2::Oid,
+    merged_tree: git2::Oid,
+) -> Result<()> {
+    let local_commit = repo
+        .find_commit(local_tip)
+        .context("resolving a pre-existing branch's local tip commit")?;
+    let dest_commit = repo
+        .find_commit(dest_tip)
+        .context("resolving dest's fetched tip commit")?;
+    let merged_tree = repo
+        .find_tree(merged_tree)
+        .context("reading merge_tree's resulting tree")?;
+
+    let tree_oid = layer_control_files(repo, &merged_tree, control_files)?;
+    let tree = repo.find_tree(tree_oid).context("reading the merge tree")?;
+
+    let signature = Signature::now(&config.committer.name, &config.committer.email)
+        .context("building gitprism's committer signature")?;
+    let message = format!(
+        "gitprism setup: merge dest's tip {} into {branch:?}'s existing history\n\nGitprism-Dest-Commit: {}\n",
+        dest_commit.id(),
+        dest_commit.id()
+    );
+
+    repo.commit(
+        Some(&format!("refs/heads/{branch}")),
+        &signature,
+        &signature,
+        &message,
+        &tree,
+        &[&local_commit, &dest_commit],
+    )
+    .with_context(|| format!("creating merge commit for {branch:?}"))?;
 
     Ok(())
 }
@@ -382,6 +567,43 @@ mod tests {
             "initial",
             &tree,
             &[],
+        )
+        .unwrap()
+    }
+
+    /// A second commit on top of `parent`, layering `files` onto `parent`'s
+    /// tree — used to build genuine shared history (a common ancestor both
+    /// sides diverge from) for decisions/0023's merge-base reconciliation
+    /// tests, as distinct from `repo_with_a_commit_on`'s parentless roots
+    /// which share no object database at all across two separate
+    /// `Repository::init` calls.
+    fn commit_on_top(
+        dir: &Path,
+        branch: &str,
+        parent: git2::Oid,
+        files: &[(&str, &str)],
+    ) -> git2::Oid {
+        let repo = Repository::open(dir).unwrap();
+        let parent_commit = repo.find_commit(parent).unwrap();
+        let mut builder = repo
+            .treebuilder(Some(&parent_commit.tree().unwrap()))
+            .unwrap();
+        for (name, contents) in files {
+            let blob = repo.blob(contents.as_bytes()).unwrap();
+            builder
+                .insert(*name, blob, git2::FileMode::Blob.into())
+                .unwrap();
+        }
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("Dest Author", "author@example.com").unwrap();
+
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &signature,
+            &signature,
+            "advance",
+            &tree,
+            &[&parent_commit],
         )
         .unwrap()
     }
@@ -473,21 +695,40 @@ mod tests {
     }
 
     #[test]
-    fn run_fails_loudly_against_a_non_empty_source_repo() {
+    fn run_leaves_an_unconfigured_local_branch_untouched_and_grafts_the_configured_one() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
 
         let source_dir = tempdir().unwrap();
-        // Simulate a prior setup run (or any other pre-existing history) —
-        // not necessarily even the same branch name as a configured branch.
-        repo_with_a_commit_on(source_dir.path(), "unrelated", &[("existing.txt", "x")]);
+        // decisions/0023: a local branch not named in `config.branches` (the
+        // real-world motivating case: an `ai-setup` or `backup` branch) is
+        // entirely outside setup's view — never inspected, never blocking,
+        // never touched — not the "source repo already has commits" hard-fail
+        // decisions/0021 used to apply here.
+        let unrelated_tip =
+            repo_with_a_commit_on(source_dir.path(), "unrelated", &[("existing.txt", "x")]);
 
         let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
-        let err = run(source_dir.path(), config.path())
-            .expect_err("re-running setup over an existing history must not succeed");
+        run(source_dir.path(), config.path())
+            .expect("an unconfigured local branch must not block setup");
 
-        assert!(err.to_string().contains("already has commits"));
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let unrelated = repo
+            .find_branch("unrelated", git2::BranchType::Local)
+            .expect("the unconfigured branch must survive untouched")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            unrelated.id(),
+            unrelated_tip,
+            "the unconfigured branch must not move at all"
+        );
+        assert!(
+            repo.find_branch("main", git2::BranchType::Local).is_ok(),
+            "the configured branch, having no local copy, must still get a fresh graft"
+        );
     }
 
     #[test]
@@ -739,27 +980,213 @@ mod tests {
     }
 
     #[test]
-    fn run_fails_loudly_when_a_pre_existing_branch_diverges_from_dests_tip() {
+    fn run_fails_loudly_when_a_pre_existing_branch_has_no_history_in_common_with_dest() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
 
         let source_dir = tempdir().unwrap();
         // "main" already exists locally, and is a configured branch name —
-        // but its tip is real, independent history, not dest's tip and not
-        // an empty placeholder either.
+        // but it comes from an entirely separate `Repository::init`/object
+        // database, so it shares no common ancestor with dest at all. This
+        // is decisions/0023's "no merge-base exists" case, distinct from a
+        // real (but conflicting) shared history.
         repo_with_a_commit_on(source_dir.path(), "main", &[("independent.txt", "x")]);
 
         let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
         let err = run(source_dir.path(), config.path()).expect_err(
-            "a pre-existing branch that diverges from dest's tip must not be grafted over",
+            "a pre-existing branch with no history in common with dest must not be merged or grafted over",
         );
 
         let message = err.to_string();
         assert!(message.contains("\"main\""), "message was: {message}");
         assert!(
-            message.contains("doesn't match dest's current tip"),
+            message.contains("no history in common with dest"),
             "message was: {message}"
+        );
+        assert!(
+            !message.contains("doesn't match dest's current tip"),
+            "message was: {message} — this is the distinct no-merge-base case, not the oid-mismatch one"
+        );
+    }
+
+    #[test]
+    fn run_fails_loudly_when_a_pre_existing_branch_is_setups_own_prior_graft() {
+        let dest_dir = tempdir().unwrap();
+        let dest_first_tip = repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        // First run: an ordinary fresh graft.
+        run(source_dir.path(), config.path()).expect("first run should succeed");
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let first_tip = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // dest advances independently between the two setup runs — exactly
+        // the situation a real merge-base reconciliation would otherwise
+        // happily merge through, since the graft's own parent is dest's
+        // (now-old) tip. setup must still refuse: its own prior output is
+        // never something to run setup against again (decisions/0012,
+        // decisions/0021's "not decided differently" carried forward by
+        // decisions/0023) — `gitprism sync` is the tool for picking up
+        // dest's newer commits, not a second `setup`.
+        commit_on_top(dest_dir.path(), "main", dest_first_tip, &[("a.txt", "a2")]);
+
+        let err = run(source_dir.path(), config.path()).expect_err(
+            "setup must refuse to run again against its own prior graft, not merge over it",
+        );
+
+        let message = err.to_string();
+        assert!(message.contains("\"main\""), "message was: {message}");
+        assert!(message.contains("gitprism sync"), "message was: {message}");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let main = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            main.id(),
+            first_tip,
+            "the branch must be left exactly as the first setup run left it"
+        );
+    }
+
+    #[test]
+    fn run_reconciles_a_pre_existing_branch_with_real_shared_history_into_a_merge_commit() {
+        let dest_dir = tempdir().unwrap();
+        let base = repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "base")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        // Land the shared base commit locally first (as if a prior partial
+        // setup, or a checkout predating dest's later commits) — before dest
+        // advances any further, so the fetch below actually captures `base`
+        // rather than whatever dest's tip becomes afterward.
+        git::fetch(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+        )
+        .unwrap();
+        let fetched_base = repo
+            .find_reference("FETCH_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(fetched_base, base);
+        repo.reference("refs/heads/main", fetched_base, true, "seed local main")
+            .unwrap();
+        // ... then diverge from it on both sides: locally on a file dest
+        // never touches, and on dest on a different file entirely.
+        let local_tip = commit_on_top(source_dir.path(), "main", base, &[("local_only.txt", "l")]);
+        let dest_tip = commit_on_top(dest_dir.path(), "main", base, &[("dest_only.txt", "d")]);
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path())
+            .expect("real, non-conflicting shared history must reconcile cleanly");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let main = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            main.parent_id(0).unwrap(),
+            local_tip,
+            "the local branch's own tip must be parent 0"
+        );
+        assert_eq!(
+            main.parent_id(1).unwrap(),
+            dest_tip,
+            "dest's tip must be parent 1"
+        );
+        assert!(
+            main.message()
+                .unwrap()
+                .contains(&format!("Gitprism-Dest-Commit: {dest_tip}"))
+        );
+        let tree = main.tree().unwrap();
+        assert!(tree.get_name("shared.txt").is_some());
+        assert!(tree.get_name("local_only.txt").is_some());
+        assert!(tree.get_name("dest_only.txt").is_some());
+        assert!(tree.get_name(crate::config::FILENAME).is_some());
+        assert!(tree.get_name(exclude::FILENAME).is_some());
+    }
+
+    #[test]
+    fn run_fails_loudly_on_a_real_conflict_leaving_the_pre_existing_branch_untouched() {
+        let dest_dir = tempdir().unwrap();
+        let base = repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "base")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        // Fetch the shared base commit before dest advances any further, so
+        // the fetch actually captures `base` rather than dest's later tip.
+        git::fetch(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+        )
+        .unwrap();
+        let fetched_base = repo
+            .find_reference("FETCH_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(fetched_base, base);
+        repo.reference("refs/heads/main", fetched_base, true, "seed local main")
+            .unwrap();
+        // Both sides modify the very same path, differently, since their
+        // real common ancestor — a genuine, unresolvable conflict.
+        let local_tip = commit_on_top(
+            source_dir.path(),
+            "main",
+            base,
+            &[("shared.txt", "local's change")],
+        );
+        commit_on_top(
+            dest_dir.path(),
+            "main",
+            base,
+            &[("shared.txt", "dest's change")],
+        );
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        let err = run(source_dir.path(), config.path())
+            .expect_err("a real content conflict must hard-stop, not guess a resolution");
+
+        let message = err.to_string();
+        assert!(message.contains("\"main\""), "message was: {message}");
+        assert!(message.contains("shared.txt"), "message was: {message}");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let main = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            main.id(),
+            local_tip,
+            "the pre-existing branch must be left completely untouched by a failed reconciliation"
         );
     }
 
