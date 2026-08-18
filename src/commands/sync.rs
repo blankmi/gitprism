@@ -108,7 +108,14 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // before the source→dest loop below, and only there). The listing itself
     // is unchanged, just moved earlier and reused below rather than repeated.
     let source_branches = list_source_branches(&repo)?;
-    let reporter = Reporter::new(config.branches.len() + source_branches.len());
+    let reporter = Reporter::new(
+        config.branches.len() + source_branches.len(),
+        config
+            .branches
+            .iter()
+            .map(String::as_str)
+            .chain(source_branches.iter().map(String::as_str)),
+    );
 
     // dest→source first, for every explicitly configured branch: any content
     // dest carries that gitprism didn't itself put there (e.g. a merged PR)
@@ -235,8 +242,13 @@ fn sync_pair_to_dest(
                 branch,
                 Direction::SourceToDest,
                 round_tripped,
+                // "(expected for a mirror-only branch)" used to be spelled
+                // out here, but the completed line's own color already
+                // conveys round-trip vs. mirror-only (decisions/0020) — the
+                // note is for the reason, not a restatement of what the
+                // color already showed.
                 Some(&format!(
-                    "already merged into {landing:?} and cleaned up there (expected for a mirror-only branch)"
+                    "already merged into {landing:?}, cleaned up there"
                 )),
             );
             return Ok(());
@@ -2942,7 +2954,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
         sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("a loop-prevented sync is still a successful no-op");
 
@@ -3010,7 +3022,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
 
         let err = sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect_err(
@@ -3094,7 +3106,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
 
         let err = sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect_err(
@@ -3174,7 +3186,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
         sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("dest→source should succeed even when the last commit is a no-op");
 
@@ -3437,7 +3449,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
 
         sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("a rename carrying dest's own edit across it must merge cleanly");
@@ -3518,7 +3530,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
 
         sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("dest's edit to a file source renamed must carry across cleanly");
@@ -3587,7 +3599,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let branch = "main";
-        let reporter = Reporter::new(1);
+        let reporter = Reporter::new(1, std::iter::empty());
 
         sync_pair_from_dest(&repo, source_dir.path(), &config, branch, &reporter)
             .expect("an identical independent change must merge cleanly, not conflict");
