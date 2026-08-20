@@ -4,14 +4,46 @@
 //! agent/`GIT_ASKPASS` handling a human running `git` would get, rather than
 //! a library reimplementation of it.
 
+use std::env;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 300;
+const MIN_GIT_TIMEOUT_SECONDS: u64 = 1;
+const MAX_GIT_TIMEOUT_SECONDS: u64 = 3_600;
+const MAX_PARSE_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SMALL_STDOUT_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_STDERR_BYTES: usize = 1024 * 1024;
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const CAPTURE_CHUNK_BYTES: usize = 16 * 1024;
+const CAPTURE_CHANNEL_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy)]
+struct OutputLimits {
+    stdout: usize,
+    stderr: usize,
+    total: usize,
+}
+
+const SMALL_OUTPUT: OutputLimits = OutputLimits {
+    stdout: MAX_SMALL_STDOUT_BYTES,
+    stderr: MAX_DIAGNOSTIC_STDERR_BYTES,
+    total: MAX_SMALL_STDOUT_BYTES + MAX_DIAGNOSTIC_STDERR_BYTES,
+};
+
+const PARSE_OUTPUT: OutputLimits = OutputLimits {
+    stdout: MAX_PARSE_STDOUT_BYTES,
+    stderr: MAX_DIAGNOSTIC_STDERR_BYTES,
+    total: MAX_PARSE_STDOUT_BYTES + MAX_DIAGNOSTIC_STDERR_BYTES,
+};
 
 /// Git hooks and helpers inherit a subprocess environment. The marker key and
 /// resolved URL fallbacks are intentionally removed from every git invocation:
@@ -171,10 +203,54 @@ fn is_non_fast_forward_rejection(raw: &[u8]) -> bool {
     })
 }
 
-fn run_git_output(mut command: Command) -> Result<std::process::Output> {
+fn run_git_output(command: Command, limits: OutputLimits) -> Result<std::process::Output> {
+    run_git_output_with_timeout(command, limits, configured_git_timeout()?)
+}
+
+fn configured_git_timeout() -> Result<Duration> {
+    let Some(raw) = env::var_os("GITPRISM_GIT_TIMEOUT_SECONDS") else {
+        return Ok(Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS));
+    };
+    let raw = raw
+        .to_str()
+        .context("GITPRISM_GIT_TIMEOUT_SECONDS must be valid UTF-8")?;
+    parse_timeout_seconds(raw)
+}
+
+fn parse_timeout_seconds(raw: &str) -> Result<Duration> {
+    let seconds = raw
+        .parse::<u64>()
+        .with_context(|| "GITPRISM_GIT_TIMEOUT_SECONDS must be an integer number of seconds")?;
+    if !(MIN_GIT_TIMEOUT_SECONDS..=MAX_GIT_TIMEOUT_SECONDS).contains(&seconds) {
+        anyhow::bail!(
+            "GITPRISM_GIT_TIMEOUT_SECONDS must be between {MIN_GIT_TIMEOUT_SECONDS} and {MAX_GIT_TIMEOUT_SECONDS} seconds"
+        );
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+#[derive(Clone, Copy)]
+enum CaptureStream {
+    Stdout,
+    Stderr,
+}
+
+enum CaptureEvent {
+    Chunk(CaptureStream, Vec<u8>),
+    Eof(CaptureStream),
+    Error(CaptureStream, String),
+}
+
+fn run_git_output_with_timeout(
+    mut command: Command,
+    limits: OutputLimits,
+    timeout: Duration,
+) -> Result<std::process::Output> {
     command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0");
     let mut child = command.spawn().context("starting git subprocess")?;
     let stdout = child
         .stdout
@@ -184,41 +260,144 @@ fn run_git_output(mut command: Command) -> Result<std::process::Output> {
         .stderr
         .take()
         .context("capturing git subprocess stderr")?;
-    let stdout_thread = std::thread::spawn(|| read_bounded(stdout));
-    let stderr_thread = std::thread::spawn(|| read_bounded(stderr));
-    let status = child.wait().context("waiting for git subprocess")?;
-    let stdout = stdout_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("reading git subprocess stdout panicked"))??;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("reading git subprocess stderr panicked"))??;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+    let (sender, receiver) = mpsc::sync_channel(CAPTURE_CHANNEL_CAPACITY);
+    spawn_capture(stdout, CaptureStream::Stdout, sender.clone());
+    spawn_capture(stderr, CaptureStream::Stderr, sender);
+
+    let started = Instant::now();
+    let mut status = None;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut total_bytes: usize = 0;
+    let mut drain_deadline = None;
+
+    loop {
+        loop {
+            match receiver.try_recv() {
+                Ok(CaptureEvent::Chunk(stream, bytes)) => {
+                    let (captured, limit) = match stream {
+                        CaptureStream::Stdout => (&mut stdout_bytes, limits.stdout),
+                        CaptureStream::Stderr => (&mut stderr_bytes, limits.stderr),
+                    };
+                    if captured.len().saturating_add(bytes.len()) > limit {
+                        kill_and_reap(&mut child);
+                        anyhow::bail!(
+                            "git subprocess exceeded its {} byte {} output limit",
+                            limit,
+                            stream_label(stream)
+                        );
+                    }
+                    if total_bytes.saturating_add(bytes.len()) > limits.total {
+                        kill_and_reap(&mut child);
+                        anyhow::bail!(
+                            "git subprocess exceeded its {} byte total output limit",
+                            limits.total
+                        );
+                    }
+                    captured.extend_from_slice(&bytes);
+                    total_bytes = total_bytes.saturating_add(bytes.len());
+                }
+                Ok(CaptureEvent::Eof(stream)) => match stream {
+                    CaptureStream::Stdout => stdout_done = true,
+                    CaptureStream::Stderr => stderr_done = true,
+                },
+                Ok(CaptureEvent::Error(stream, error)) => {
+                    kill_and_reap(&mut child);
+                    anyhow::bail!(
+                        "reading git subprocess {} failed: {error}",
+                        stream_label(stream)
+                    );
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if stdout_done && stderr_done {
+                        break;
+                    }
+                    kill_and_reap(&mut child);
+                    anyhow::bail!("git subprocess output capture disconnected unexpectedly");
+                }
+            }
+        }
+
+        if status.is_none() {
+            status = child.try_wait().context("waiting for git subprocess")?;
+            if status.is_some() && !(stdout_done && stderr_done) {
+                drain_deadline = Some(Instant::now() + PIPE_DRAIN_GRACE);
+            }
+        }
+        if stdout_done
+            && stderr_done
+            && let Some(status) = status
+        {
+            return Ok(std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            });
+        }
+
+        let now = Instant::now();
+        if now.duration_since(started) >= timeout {
+            kill_and_reap(&mut child);
+            anyhow::bail!(
+                "git subprocess exceeded its {} second deadline",
+                timeout.as_secs()
+            );
+        }
+        if let Some(deadline) = drain_deadline
+            && now >= deadline
+        {
+            kill_and_reap(&mut child);
+            anyhow::bail!(
+                "git subprocess exited but its output pipes did not close; refusing to continue with incomplete output"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
-fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
-    let mut retained = Vec::with_capacity(MAX_DIAGNOSTIC_BYTES + 1);
-    let mut buffer = [0; 4096];
-    let mut total: usize = 0;
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .context("reading git diagnostics")?;
-        if count == 0 {
-            break;
+fn spawn_capture(
+    mut reader: impl Read + Send + 'static,
+    stream: CaptureStream,
+    sender: SyncSender<CaptureEvent>,
+) {
+    thread::spawn(move || {
+        let mut buffer = vec![0; CAPTURE_CHUNK_BYTES];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = sender.send(CaptureEvent::Eof(stream));
+                    return;
+                }
+                Ok(count) => {
+                    if sender
+                        .send(CaptureEvent::Chunk(stream, buffer[..count].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(CaptureEvent::Error(stream, error.to_string()));
+                    return;
+                }
+            }
         }
-        let remaining = MAX_DIAGNOSTIC_BYTES + 1 - retained.len();
-        retained.extend_from_slice(&buffer[..count.min(remaining)]);
-        total = total.saturating_add(count);
-        if total > MAX_DIAGNOSTIC_BYTES + 1 {
-            retained.truncate(MAX_DIAGNOSTIC_BYTES + 1);
-        }
+    });
+}
+
+fn stream_label(stream: CaptureStream) -> &'static str {
+    match stream {
+        CaptureStream::Stdout => "stdout",
+        CaptureStream::Stderr => "stderr",
     }
-    Ok(retained)
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Fetch `branch` from `url` into `repo_dir`'s local object database,
@@ -244,7 +423,8 @@ pub fn fetch(repo_dir: &Path, url: &str, branch: &str) -> Result<()> {
         .arg(url)
         .arg(&source_ref)
         .env("GIT_TERMINAL_PROMPT", "0");
-    let output = run_git_output(command).context("running git fetch from configured remote")?;
+    let output = run_git_output(command, SMALL_OUTPUT)
+        .context("running git fetch from configured remote")?;
 
     if !output.status.success() {
         let diagnostic = git_diagnostic(&output.stderr, Some(url));
@@ -279,8 +459,8 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
         .arg(&refname)
         .stdout(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
-    let output =
-        run_git_output(command).context("running git ls-remote against configured remote")?;
+    let output = run_git_output(command, SMALL_OUTPUT)
+        .context("running git ls-remote against configured remote")?;
 
     match output.status.code() {
         Some(0) => Ok(true),
@@ -332,7 +512,8 @@ pub fn push(
         .arg(url)
         .arg(&refspec)
         .env("GIT_TERMINAL_PROMPT", "0");
-    let output = run_git_output(command).context("running git push to configured remote")?;
+    let output =
+        run_git_output(command, PARSE_OUTPUT).context("running git push to configured remote")?;
 
     if output.status.success() {
         return Ok(PushOutcome::Accepted);
@@ -365,16 +546,16 @@ pub fn push(
 /// deliberately owned by git so its cherry-pick state survives the command
 /// that starts the human resolution.
 pub(crate) fn worktree_add(repo_dir: &Path, worktree: &Path, commit: git2::Oid) -> Result<()> {
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("worktree")
         .arg("add")
         .arg("--detach")
         .arg(worktree)
-        .arg(commit.to_string())
-        .output()
-        .context("running git worktree add")?;
+        .arg(commit.to_string());
+    let output = run_git_output(command, SMALL_OUTPUT).context("running git worktree add")?;
     if !output.status.success() {
         let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!("git worktree add failed ({}): {stderr}", output.status);
@@ -383,15 +564,15 @@ pub(crate) fn worktree_add(repo_dir: &Path, worktree: &Path, commit: git2::Oid) 
 }
 
 pub(crate) fn worktree_remove(repo_dir: &Path, worktree: &Path) -> Result<()> {
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("worktree")
         .arg("remove")
         .arg("--force")
-        .arg(worktree)
-        .output()
-        .context("running git worktree remove")?;
+        .arg(worktree);
+    let output = run_git_output(command, SMALL_OUTPUT).context("running git worktree remove")?;
     if !output.status.success() {
         let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!("git worktree remove failed ({}): {stderr}", output.status);
@@ -461,8 +642,7 @@ pub fn cherry_pick(
     cmd.env("GIT_EDITOR", "true");
     set_committer_identity(&mut cmd, committer_name, committer_email);
 
-    let output = cmd
-        .output()
+    let output = run_git_output(cmd, SMALL_OUTPUT)
         .with_context(|| format!("running git cherry-pick {commit}"))?;
     cherry_pick_outcome(output, || format!("git cherry-pick {commit}"))
 }
@@ -481,8 +661,7 @@ pub(crate) fn cherry_pick_no_commit(
         cmd.arg("-m").arg(mainline.to_string());
     }
     cmd.arg("--no-commit").arg(commit.to_string());
-    let output = cmd
-        .output()
+    let output = run_git_output(cmd, SMALL_OUTPUT)
         .with_context(|| format!("running git cherry-pick --no-commit {commit}"))?;
     cherry_pick_outcome(output, || format!("git cherry-pick --no-commit {commit}"))
 }
@@ -507,14 +686,14 @@ pub fn cherry_pick_continue(
 ) -> Result<CherryPickOutcome> {
     let mut command = git_command();
     set_committer_identity(&mut command, committer_name, committer_email);
-    let output = command
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("cherry-pick")
         .arg("--continue")
-        .env("GIT_EDITOR", "true")
-        .output()
-        .context("running git cherry-pick --continue")?;
+        .env("GIT_EDITOR", "true");
+    let output =
+        run_git_output(command, SMALL_OUTPUT).context("running git cherry-pick --continue")?;
 
     match output.status.code() {
         Some(0) => Ok(CherryPickOutcome::Clean),
@@ -537,13 +716,13 @@ pub fn cherry_pick_continue(
 /// tell `cherry_pick_continue`'s two exit-`1` cases apart (a real remaining
 /// conflict vs. a fully-resolved-but-empty result).
 fn has_unmerged_paths(repo_dir: &Path) -> Result<bool> {
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("ls-files")
-        .arg("--unmerged")
-        .output()
-        .context("checking for unmerged paths")?;
+        .arg("--unmerged");
+    let output = run_git_output(command, PARSE_OUTPUT).context("checking for unmerged paths")?;
     if !output.status.success() {
         let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!(
@@ -569,13 +748,13 @@ fn finish_empty_continue(
 ) -> Result<()> {
     let mut command = git_command();
     set_committer_identity(&mut command, committer_name, committer_email);
-    let output = command
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("commit")
         .arg("--allow-empty")
-        .arg("--no-edit")
-        .output()
+        .arg("--no-edit");
+    let output = run_git_output(command, SMALL_OUTPUT)
         .context("running git commit --allow-empty to finish an empty cherry-pick resolution")?;
     if !output.status.success() {
         let stderr = git_diagnostic(&output.stderr, None);
@@ -655,7 +834,8 @@ pub fn merge_tree(
     theirs: git2::Oid,
 ) -> Result<MergeTreeOutcome> {
     let merge_base_arg = format!("--merge-base={base}");
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("merge-tree")
@@ -665,11 +845,10 @@ pub fn merge_tree(
         .arg("--no-messages")
         .arg(&merge_base_arg)
         .arg(ours.to_string())
-        .arg(theirs.to_string())
-        .output()
-        .with_context(|| {
-            format!("running git merge-tree --write-tree --merge-base={base} {ours} {theirs}")
-        })?;
+        .arg(theirs.to_string());
+    let output = run_git_output(command, PARSE_OUTPUT).with_context(|| {
+        format!("running git merge-tree --write-tree --merge-base={base} {ours} {theirs}")
+    })?;
 
     let mut records = output
         .stdout
@@ -744,10 +923,9 @@ fn parse_git_version(raw: &str) -> Option<(u32, u32)> {
 /// time `merge_tree` itself runs. Deliberately no `-C repo_dir`: this is a
 /// property of the `git` binary, not of any particular repository.
 pub fn ensure_merge_tree_supported() -> Result<()> {
-    let output = git_command()
-        .arg("--version")
-        .output()
-        .context("running git --version")?;
+    let mut command = git_command();
+    command.arg("--version");
+    let output = run_git_output(command, SMALL_OUTPUT).context("running git --version")?;
     if !output.status.success() {
         let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!("git --version failed ({}): {stderr}", output.status);
@@ -783,12 +961,184 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::env;
+    use std::io::{Read as _, Write};
+    use std::time::Duration;
 
     use git2::Repository;
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn subprocess_runner_child() {
+        match env::var("GITPRISM_TEST_RUNNER_MODE").as_deref() {
+            Ok("sleep") => thread::sleep(Duration::from_secs(60)),
+            Ok("stdout") => {
+                print!("{}", "x".repeat(4096));
+                std::io::stdout().flush().unwrap();
+            }
+            Ok("stderr") => {
+                std::io::stderr().write_all(&vec![b'x'; 4096]).unwrap();
+                std::io::stderr().flush().unwrap();
+            }
+            Ok("normal") => {
+                print!("normal stdout");
+                std::io::stdout().flush().unwrap();
+                eprint!("normal stderr");
+                std::io::stderr().flush().unwrap();
+            }
+            Ok("large") => {
+                print!("{}", "o".repeat(128 * 1024));
+                std::io::stdout().flush().unwrap();
+                std::io::stderr()
+                    .write_all(&vec![b'e'; 128 * 1024])
+                    .unwrap();
+                std::io::stderr().flush().unwrap();
+            }
+            Ok("env") => {
+                let prompt = env::var("GIT_TERMINAL_PROMPT").unwrap_or_default();
+                print!("prompt={prompt}");
+                std::io::stdout().flush().unwrap();
+            }
+            Ok("stdin") => {
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).unwrap();
+                print!("stdin-bytes={}", input.len());
+                std::io::stdout().flush().unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    fn runner_child(mode: &str) -> Command {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("git::tests::subprocess_runner_child")
+            .arg("--nocapture")
+            .env("GITPRISM_TEST_RUNNER_MODE", mode);
+        command
+    }
+
+    #[test]
+    fn subprocess_runner_captures_both_streams_and_disables_prompting() {
+        let output = run_git_output_with_timeout(
+            runner_child("normal"),
+            OutputLimits {
+                stdout: 1024,
+                stderr: 1024,
+                total: 2048,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(b"normal stdout".len())
+                .any(|window| { window == b"normal stdout" })
+        );
+        assert!(
+            output
+                .stderr
+                .windows(b"normal stderr".len())
+                .any(|window| { window == b"normal stderr" })
+        );
+
+        let output =
+            run_git_output_with_timeout(runner_child("env"), SMALL_OUTPUT, Duration::from_secs(5))
+                .unwrap();
+        assert!(
+            output
+                .stdout
+                .windows(b"prompt=0".len())
+                .any(|window| { window == b"prompt=0" })
+        );
+
+        let output = run_git_output_with_timeout(
+            runner_child("stdin"),
+            SMALL_OUTPUT,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(
+            output
+                .stdout
+                .windows(b"stdin-bytes=0".len())
+                .any(|window| { window == b"stdin-bytes=0" })
+        );
+    }
+
+    #[test]
+    fn subprocess_runner_times_out_and_reaps_direct_child() {
+        let error = run_git_output_with_timeout(
+            runner_child("sleep"),
+            SMALL_OUTPUT,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[test]
+    fn subprocess_runner_captures_large_concurrent_streams() {
+        let output = run_git_output_with_timeout(
+            runner_child("large"),
+            OutputLimits {
+                stdout: 256 * 1024,
+                stderr: 256 * 1024,
+                total: 512 * 1024,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 128 * 1024);
+        assert!(output.stderr.len() >= 128 * 1024);
+    }
+
+    #[test]
+    fn subprocess_runner_rejects_stdout_overflow_without_truncating_parse_output() {
+        let error = run_git_output_with_timeout(
+            runner_child("stdout"),
+            OutputLimits {
+                stdout: 1024,
+                stderr: 1024,
+                total: 2048,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stdout output limit"));
+    }
+
+    #[test]
+    fn subprocess_runner_rejects_stderr_overflow_without_truncating_diagnostics() {
+        let error = run_git_output_with_timeout(
+            runner_child("stderr"),
+            OutputLimits {
+                stdout: 1024,
+                stderr: 1024,
+                total: 2048,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stderr output limit"));
+    }
+
+    #[test]
+    fn git_timeout_override_is_strictly_parsed_and_bounded() {
+        assert_eq!(
+            parse_timeout_seconds("17").unwrap(),
+            Duration::from_secs(17)
+        );
+        assert!(parse_timeout_seconds("0").is_err());
+        assert!(parse_timeout_seconds("3601").is_err());
+        assert!(parse_timeout_seconds("not-a-number").is_err());
+    }
 
     /// A repo with one commit (an empty tree) on `branch`, suitable as a
     /// fetch source in tests — no working directory needed.

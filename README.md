@@ -29,7 +29,7 @@ compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (171 tests
+helper described below are implemented and covered by `cargo test` (178 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -67,6 +67,16 @@ and rejected — is recorded as individual decisions in
 Requires Rust 1.89 or newer (2024 edition) and a `git` binary on `PATH` — gitprism calls
 out to real `git` for push/fetch/cherry-pick rather than reimplementing
 network or working-tree operations.
+
+Git subprocesses are noninteractive (`stdin` is closed and
+`GIT_TERMINAL_PROMPT=0`) and have a 300-second deadline. Operators running
+slow, trusted Git transports may set `GITPRISM_GIT_TIMEOUT_SECONDS` to an
+integer from 1 through 3600; this is process configuration, not repository
+policy. Output is captured concurrently with hard limits: parse-capable output
+has a 64 MiB limit, small commands have a 64 KiB stdout limit, and diagnostics
+have a 1 MiB capture limit before their terminal-safe 8 KiB presentation
+frame. Exceeding a limit or deadline fails the operation rather than parsing
+truncated Git data.
 
 ```sh
 cargo build --release

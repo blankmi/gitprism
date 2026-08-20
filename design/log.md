@@ -1085,3 +1085,12 @@ non-UTF-8 commit messages, tree names, and refs fail explicitly before any
 commit or ref mutation. Added coverage for malformed merge-tree/index paths,
 Unicode commit messages, raw remote redaction, and component-aware checkout
 collision checks.
+
+## 2026-08-20 — centralized Git process runner
+
+**Update**: Decided [0031](decisions/0031-centralized-git-process-runner.md)
+— all production Git children now use one standard-library runner with null
+stdin, `GIT_TERMINAL_PROMPT=0`, concurrent bounded stdout/stderr capture, a
+300-second default deadline, and a strictly bounded operator override. Timeout
+or output overflow kills and reaps the direct child; incomplete output is
+never parsed as if it were complete.
