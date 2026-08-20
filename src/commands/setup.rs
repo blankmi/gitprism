@@ -963,7 +963,7 @@ mod tests {
             email = "gitprism@example.com"
 
             [dest]
-            url = "{dest_url}"
+            url = '{dest_url}'
             "#,
         )
         .unwrap();
@@ -1076,7 +1076,7 @@ mod tests {
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
         let config_toml = format!(
-            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n",
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = '{}'\n",
             dest_dir.path().display()
         );
         fs::write(source_dir.path().join(crate::config::FILENAME), config_toml).unwrap();
@@ -1142,7 +1142,7 @@ mod tests {
         )
         .unwrap();
         let config_toml = format!(
-            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n",
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = '{}'\n",
             dest_dir.path().display()
         );
         fs::write(

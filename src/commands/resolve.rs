@@ -1354,10 +1354,10 @@ mod tests {
             email = "gitprism@example.com"
 
             [source]
-            url = "{source_url}"
+            url = '{source_url}'
 
             [dest]
-            url = "{dest_url}"
+            url = '{dest_url}'
             "#,
         )
         .unwrap();
