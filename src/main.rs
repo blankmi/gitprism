@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod exclude;
 mod git;
+mod marker;
 mod progress;
 
 use std::path::Path;

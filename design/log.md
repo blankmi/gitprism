@@ -1023,3 +1023,10 @@ they begin with `-` and Git's `--` terminator is used. Pushes use
 and disable interactive prompting. Git diagnostics are bounded, credential
 redacted, and control-character escaped. Updated decisions 0002, 0009, and
 0013 with implementation-hardening addenda.
+
+**Update**: Decided [0025](decisions/0025-authenticated-mapping-markers.md) —
+mapping trailers remain readable but are untrusted unless accompanied by a
+canonical HMAC-SHA256 state block keyed by `GITPRISM_STATE_KEY`. The key is
+validated before network or mutation work and removed from every Git
+subprocess environment; reserved marker-looking message lines are stripped
+before gitprism generates its authenticated block.

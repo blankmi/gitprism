@@ -68,3 +68,12 @@ output and skipped; symmetrically for source commits carrying
   the next run's history scan simply re-examines those already-empty source commits
   and finds them still empty. Correctness holds; the only cost is a bit of redundant
   re-checking, bounded by how often sync runs.
+
+## Security addendum (2026-08-20)
+
+[Decision 0025](0025-authenticated-mapping-markers.md) strengthens what it
+means for a commit to "carry" a mapping marker. The readable source/dest
+trailer remains, but it advances resume or loop-prevention state only when a
+canonical final state block has a valid HMAC for the commit's actual shape.
+An unauthenticated trailer authored by a repository contributor is ordinary
+message text.

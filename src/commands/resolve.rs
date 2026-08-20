@@ -33,8 +33,11 @@ use git2::{Oid, Repository};
 use crate::commands::sync::{build_source_commit, pending_dest_commits};
 use crate::config::Config;
 use crate::git::{self, CherryPickOutcome};
+use crate::marker;
 
 pub fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Result<()> {
+    // Validate before fetching or changing the working tree.
+    let state_key = marker::load_key()?;
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism resolve must be run inside an existing git repository (none found at or above {}) — has `gitprism setup` been run?",
@@ -64,9 +67,23 @@ pub fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Re
     let cherry_pick_head = repo.path().join("CHERRY_PICK_HEAD");
 
     if r#continue {
-        resolve_continue(&repo, &source_root, &config, branch, &cherry_pick_head)
+        resolve_continue(
+            &repo,
+            &source_root,
+            &config,
+            branch,
+            &cherry_pick_head,
+            &state_key,
+        )
     } else {
-        resolve_start(&repo, &source_root, &config, branch, &cherry_pick_head)
+        resolve_start(
+            &repo,
+            &source_root,
+            &config,
+            branch,
+            &cherry_pick_head,
+            &state_key,
+        )
     }
 }
 
@@ -96,6 +113,7 @@ fn resolve_start(
     config: &Config,
     branch: &str,
     cherry_pick_head: &Path,
+    state_key: &marker::StateKey,
 ) -> Result<()> {
     if cherry_pick_head.exists() {
         anyhow::bail!(
@@ -121,9 +139,10 @@ fn resolve_start(
         .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
         .id();
 
-    let pending = pending_dest_commits(repo, source_tip, dest_tip).with_context(|| {
-        format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
-    })?;
+    let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
+        .with_context(|| {
+            format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
+        })?;
     let Some(&dest_oid) = pending.first() else {
         anyhow::bail!(
             "gitprism resolve: {branch:?} <- {branch:?} has nothing pending from dest — nothing to resolve"
@@ -139,7 +158,7 @@ fn resolve_start(
         .with_context(|| format!("cherry-picking dest commit {dest_oid} onto source"))?
     {
         CherryPickOutcome::Clean => {
-            finish(repo, source_root, config, branch, dest_oid)?;
+            finish(repo, source_root, config, branch, dest_oid, state_key)?;
             Ok(())
         }
         CherryPickOutcome::Conflict => {
@@ -157,6 +176,7 @@ fn resolve_continue(
     config: &Config,
     branch: &str,
     cherry_pick_head: &Path,
+    state_key: &marker::StateKey,
 ) -> Result<()> {
     if !cherry_pick_head.exists() {
         anyhow::bail!(
@@ -198,9 +218,10 @@ fn resolve_continue(
         .peel_to_commit()
         .context("resolving fetched dest branch to a commit")?
         .id();
-    let pending = pending_dest_commits(repo, source_tip, dest_tip).with_context(|| {
-        format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
-    })?;
+    let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
+        .with_context(|| {
+            format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
+        })?;
     if pending.first() != Some(&dest_oid) {
         anyhow::bail!(
             "gitprism resolve: the in-progress cherry-pick (CHERRY_PICK_HEAD names {dest_oid}) doesn't match {branch:?}'s expected next pending dest commit ({:?}) — this doesn't look like a cherry-pick `gitprism resolve` itself started; finish or abort it manually with plain `git cherry-pick --continue`/`--abort` instead of through gitprism",
@@ -220,7 +241,7 @@ fn resolve_continue(
     }
 
     match git::cherry_pick_continue(source_root).context("finishing the cherry-pick")? {
-        CherryPickOutcome::Clean => finish(repo, source_root, config, branch, dest_oid),
+        CherryPickOutcome::Clean => finish(repo, source_root, config, branch, dest_oid, state_key),
         CherryPickOutcome::Conflict => {
             let conflicted_paths = conflicted_paths(repo)?;
             anyhow::bail!(
@@ -265,6 +286,7 @@ fn finish(
     config: &Config,
     branch: &str,
     dest_oid: Oid,
+    state_key: &marker::StateKey,
 ) -> Result<()> {
     let dest_commit = repo
         .find_commit(dest_oid)
@@ -279,7 +301,15 @@ fn finish(
         .context("resolving the cherry-pick's parent commit")?;
     let tree_oid = head_commit.tree_id();
 
-    let new_oid = build_source_commit(repo, config, parent, &dest_commit, tree_oid)?;
+    let new_oid = build_source_commit(
+        repo,
+        config,
+        parent,
+        &dest_commit,
+        tree_oid,
+        branch,
+        state_key,
+    )?;
 
     // An atomic compare-and-swap, not a blind force-write: the commit being
     // replaced is this very operation's own just-created artifact (git's
@@ -399,16 +429,25 @@ mod tests {
         {
             let fetched_tip = repo.find_commit(fetched_tip_id).unwrap();
             let signature = git2::Signature::now("gitprism", "gitprism@example.com").unwrap();
+            let tree = fetched_tip.tree().unwrap();
+            let message = marker::build_message(
+                &format!("gitprism setup: graft ({})", source_dir.display()),
+                marker::Direction::Setup,
+                branch,
+                dest_tip_commit.id(),
+                "Gitprism-Dest-Commit",
+                &[fetched_tip.id()],
+                tree.id(),
+                &signature,
+                &signature,
+                &marker::load_key().unwrap(),
+            );
             repo.commit(
                 Some(&format!("refs/heads/{branch}")),
                 &signature,
                 &signature,
-                &format!(
-                    "gitprism setup: graft ({})\n\nGitprism-Dest-Commit: {}\n",
-                    source_dir.display(),
-                    dest_tip_commit.id()
-                ),
-                &fetched_tip.tree().unwrap(),
+                &message,
+                &tree,
                 &[&fetched_tip],
             )
             .unwrap();

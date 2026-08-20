@@ -12,6 +12,15 @@ use anyhow::{Context, Result};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
+/// Git hooks and helpers inherit a subprocess environment.  The state key is
+/// intentionally removed from every git invocation so repository-controlled
+/// hooks cannot read the secret used to authenticate mapping markers.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command.env_remove("GITPRISM_STATE_KEY");
+    command
+}
+
 fn validate_remote(url: &str) -> Result<()> {
     if url.is_empty() {
         anyhow::bail!("configured remote is empty");
@@ -132,7 +141,7 @@ pub fn fetch(repo_dir: &Path, url: &str, branch: &str) -> Result<()> {
     validate_remote(url)?;
     validate_branch_name(branch)?;
     let source_ref = format!("refs/heads/{branch}");
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .arg("-C")
         .arg(repo_dir)
@@ -166,7 +175,7 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
     validate_remote(url)?;
     validate_branch_name(branch)?;
     let refname = format!("refs/heads/{branch}");
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .arg("-C")
         .arg(repo_dir)
@@ -220,7 +229,7 @@ pub fn push(
     validate_remote(url)?;
     validate_branch_name(dest_branch)?;
     let refspec = format!("{commit}:refs/heads/{dest_branch}");
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .arg("-C")
         .arg(repo_dir)
@@ -303,7 +312,7 @@ pub fn cherry_pick(
     commit: git2::Oid,
     mainline: Option<u32>,
 ) -> Result<CherryPickOutcome> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C").arg(repo_dir).arg("cherry-pick");
     if let Some(mainline) = mainline {
         cmd.arg("-m").arg(mainline.to_string());
@@ -332,7 +341,7 @@ pub fn cherry_pick(
 /// none left means finish it by hand with `git commit --allow-empty`, which
 /// clears the sequencer state exactly like a normal `--continue` would.
 pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_dir)
         .arg("cherry-pick")
@@ -362,7 +371,7 @@ pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
 /// tell `cherry_pick_continue`'s two exit-`1` cases apart (a real remaining
 /// conflict vs. a fully-resolved-but-empty result).
 fn has_unmerged_paths(repo_dir: &Path) -> Result<bool> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_dir)
         .arg("ls-files")
@@ -387,7 +396,7 @@ fn has_unmerged_paths(repo_dir: &Path) -> Result<bool> {
 /// with its own properly-stamped one, so this commit's own message/identity
 /// are never user-visible.
 fn finish_empty_continue(repo_dir: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_dir)
         .arg("commit")
@@ -467,7 +476,7 @@ pub fn merge_tree(
     theirs: git2::Oid,
 ) -> Result<MergeTreeOutcome> {
     let merge_base_arg = format!("--merge-base={base}");
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_dir)
         .arg("merge-tree")
@@ -547,7 +556,7 @@ fn parse_git_version(raw: &str) -> Option<(u32, u32)> {
 /// time `merge_tree` itself runs. Deliberately no `-C repo_dir`: this is a
 /// property of the `git` binary, not of any particular repository.
 pub fn ensure_merge_tree_supported() -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("--version")
         .output()
         .context("running git --version")?;

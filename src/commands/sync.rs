@@ -69,6 +69,7 @@ use git2::{Oid, Repository, Signature};
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git;
+use crate::marker::{self, Direction as MarkerDirection};
 use crate::progress::{Direction, Outcome, Reporter};
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
@@ -77,6 +78,8 @@ use crate::progress::{Direction, Outcome, Reporter};
 const MAX_RACE_RETRIES: u32 = 3;
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+    // Validate the pair secret before fetching or constructing any commits.
+    let state_key = marker::load_key()?;
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism sync must be run inside an existing git repository (none found at or above {}) — has `gitprism setup` been run?",
@@ -127,7 +130,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // per branch, since discovery above only runs once, before either phase
     // (decisions/0017, decisions/0020).
     for branch in &config.branches {
-        sync_pair_from_dest(&repo, &source_root, &config, branch, &reporter)
+        sync_pair_from_dest_with_key(&repo, &source_root, &config, branch, &reporter, &state_key)
             .with_context(|| format!("syncing {branch:?} dest -> source"))?;
     }
 
@@ -137,7 +140,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // already listed (and sorted) above, before the dest→source loop, so
     // there's nothing left to (re-)discover here.
     for branch in &source_branches {
-        sync_pair_to_dest(&repo, &source_root, &config, branch, &reporter)
+        sync_pair_to_dest_with_key(&repo, &source_root, &config, branch, &reporter, &state_key)
             .with_context(|| format!("syncing {branch:?} source -> dest"))?;
     }
 
@@ -181,12 +184,25 @@ fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
 /// run time by [`run`], not read from config (decisions/0017). Recomputes
 /// from scratch (refetch, rebuild, retry) on a lost fast-forward race rather
 /// than rebasing what it already built (decisions/0009).
+#[cfg(test)]
 fn sync_pair_to_dest(
     repo: &Repository,
     source_root: &Path,
     config: &Config,
     branch: &str,
     reporter: &Reporter,
+) -> Result<()> {
+    let key = marker::load_key()?;
+    sync_pair_to_dest_with_key(repo, source_root, config, branch, reporter, &key)
+}
+
+fn sync_pair_to_dest_with_key(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    branch: &str,
+    reporter: &Reporter,
+    state_key: &marker::StateKey,
 ) -> Result<()> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating source branch {branch:?}"))?;
@@ -294,7 +310,14 @@ fn sync_pair_to_dest(
             // for this branch). Either way, proceeding could silently drop
             // content some other commit already contributed, even though the
             // ref update itself would be a legitimate fast-forward.
-            let boundary = dest_resume_point(repo, source_tip, dest_tip)?.with_context(|| {
+            let boundary = dest_resume_point_for_branch(
+                repo,
+                source_tip,
+                dest_tip,
+                branch,
+                state_key,
+            )?
+                .with_context(|| {
                 format!(
                     "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)"
                 )
@@ -320,7 +343,9 @@ fn sync_pair_to_dest(
             // shape: an operator never asked gitprism to manage a branch
             // decisions/0017 merely discovered, so one such branch warns and
             // the run moves on rather than stopping every other branch too.
-            let Some((boundary, dest_tip)) = newest_dest_marker_opt(repo, source_tip)? else {
+            let Some((boundary, dest_tip)) =
+                newest_dest_marker_opt_for_branch(repo, source_tip, branch, state_key)?
+            else {
                 // decisions/0024: a genuinely pre-existing, unrelated local
                 // branch (e.g. decisions/0021's `ai-setup` example) has no
                 // `Gitprism-Dest-Commit` trailer anywhere in its first-parent
@@ -352,6 +377,8 @@ fn sync_pair_to_dest(
             dest_tip,
             source_tip,
             source_root,
+            branch,
+            state_key,
         )?;
 
         // `build.new_tip` is `None` both when the branch has nothing new to
@@ -457,6 +484,7 @@ struct PendingDestBuild {
 /// the duplication and mid-chain-stranding bugs that motivated decisions/0016
 /// stop being possible. Stops at the first commit that doesn't merge cleanly
 /// (decisions/0007). `dest_tip` seeds the chain's first parent.
+#[allow(clippy::too_many_arguments)]
 fn build_pending_dest_tip(
     repo: &Repository,
     config: &Config,
@@ -465,6 +493,8 @@ fn build_pending_dest_tip(
     dest_tip: Oid,
     source_tip: Oid,
     source_root: &Path,
+    branch: &str,
+    key: &marker::StateKey,
 ) -> Result<PendingDestBuild> {
     let pending = pending_commits(repo, boundary, source_tip)?;
 
@@ -479,9 +509,12 @@ fn build_pending_dest_tip(
         // from dest (dest→source sync) already exists on dest — pushing it
         // back would loop. First thing in the loop now that there's no
         // cursor left to advance before it.
-        if trailer_value(
-            source_commit.message().unwrap_or(""),
-            "Gitprism-Dest-Commit",
+        if marker::verify(
+            &source_commit,
+            branch,
+            &[MarkerDirection::Setup, MarkerDirection::DestToSource],
+            None,
+            key,
         )
         .is_some()
         {
@@ -526,7 +559,8 @@ fn build_pending_dest_tip(
                     continue;
                 }
 
-                parent = build_dest_commit(repo, config, parent, &source_commit, merged)?;
+                parent =
+                    build_dest_commit(repo, config, parent, &source_commit, merged, branch, key)?;
                 built_any = true;
             }
         }
@@ -679,15 +713,24 @@ fn graft_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Oid>
 /// would find scanning forward from it, so [`dest_resume_point`] still
 /// applies the identical two ancestry guards to the identical oid and
 /// refuses in exactly the same situations as today.
-fn dest_tip_is_accounted_for(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<bool> {
+fn dest_tip_is_accounted_for(
+    repo: &Repository,
+    source_tip: Oid,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<bool> {
     let dest_commit = repo
         .find_commit(dest_tip)
         .context("resolving dest's tip commit")?;
 
     // Case 1.
-    if trailer_value(
-        dest_commit.message().unwrap_or(""),
-        "Gitprism-Source-Commit",
+    if marker::verify(
+        &dest_commit,
+        branch,
+        &[MarkerDirection::SourceToDest],
+        None,
+        key,
     )
     .is_some()
     {
@@ -704,7 +747,7 @@ fn dest_tip_is_accounted_for(repo: &Repository, source_tip: Oid, dest_tip: Oid) 
     // dest→source has already reflected dest_tip into source, i.e. source's
     // own history carries a Gitprism-Dest-Commit trailer naming it exactly
     // (this same run, since it's ordered first — see `run`'s doc comment).
-    let (_, marker_names) = newest_dest_marker(repo, source_tip)?;
+    let (_, marker_names) = newest_dest_marker(repo, source_tip, branch, key)?;
     Ok(marker_names == dest_tip)
 }
 
@@ -734,12 +777,18 @@ fn dest_tip_is_accounted_for(repo: &Repository, source_tip: Oid, dest_tip: Oid) 
 /// or to the graft: an older boundary would make [`pending_commits`]
 /// re-yield everything between the two markers, the same bug with a wider
 /// blast radius.
-fn dest_resume_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Option<Oid>> {
-    if !dest_tip_is_accounted_for(repo, source_tip, dest_tip)? {
+fn dest_resume_point_for_branch(
+    repo: &Repository,
+    source_tip: Oid,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Option<Oid>> {
+    if !dest_tip_is_accounted_for(repo, source_tip, dest_tip, branch, key)? {
         return Ok(None);
     }
 
-    let Some(boundary) = newest_source_marker(repo, dest_tip)? else {
+    let Some(boundary) = newest_source_marker(repo, dest_tip, branch, key)? else {
         // dest legitimately has no gitprism-written commit anywhere in its
         // history (first sync ever for this pair) — the only boundary that
         // can mean is the original graft point. Computing it again here
@@ -773,6 +822,12 @@ fn dest_resume_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Resul
     Ok(descends.then_some(boundary))
 }
 
+#[cfg(test)]
+fn dest_resume_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Option<Oid>> {
+    let key = marker::load_key()?;
+    dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)
+}
+
 /// Every commit strictly after `boundary` up to and including `tip`, oldest
 /// first — the order later commits may depend on must be preserved
 /// (decisions/0007's "Consequences"). Used for both directions: `tip` is
@@ -795,21 +850,6 @@ fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Result<Vec<Oid
     revwalk
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("walking pending commits")
-}
-
-/// Extracts `key`'s value from a `Key: value` line anywhere in `message` —
-/// the same trailer shape `setup` already writes
-/// (`Gitprism-Dest-Commit: <oid>`), read back here for
-/// `Gitprism-Source-Commit` (and, for loop prevention,
-/// `Gitprism-Dest-Commit`). `pub(crate)` so `setup` can reuse it too
-/// (decisions/0023's re-run guard: recognizing a pre-existing branch as
-/// setup's own prior output).
-pub(crate) fn trailer_value<'a>(message: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}: ");
-    message
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix.as_str()))
-        .map(str::trim)
 }
 
 /// Loads the exclude-list *current* as of `source_tip` — the version this
@@ -922,6 +962,8 @@ fn build_dest_commit(
     parent: Oid,
     source_commit: &git2::Commit,
     filtered_tree_oid: Oid,
+    branch: &str,
+    key: &marker::StateKey,
 ) -> Result<Oid> {
     let parent_commit = repo
         .find_commit(parent)
@@ -931,10 +973,17 @@ fn build_dest_commit(
         .context("reading the filtered tree")?;
     let committer = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
-    let message = format!(
-        "{}\n\nGitprism-Source-Commit: {}\n",
-        source_commit.message().unwrap_or("").trim_end(),
-        source_commit.id()
+    let message = marker::build_message(
+        source_commit.message().unwrap_or(""),
+        MarkerDirection::SourceToDest,
+        branch,
+        source_commit.id(),
+        "Gitprism-Source-Commit",
+        &[parent],
+        tree.id(),
+        &source_commit.author(),
+        &committer,
+        key,
     );
 
     repo.commit(
@@ -962,12 +1011,25 @@ fn build_dest_commit(
 /// reported with enough detail for `gitprism resolve` (decisions/0008) to act
 /// on later — no trailer is written for the unresolved commit, so the next
 /// run's resume-scan naturally retries it once it's resolved.
+#[cfg(test)]
 fn sync_pair_from_dest(
     repo: &Repository,
     source_root: &Path,
     config: &Config,
     branch: &str,
     reporter: &Reporter,
+) -> Result<()> {
+    let key = marker::load_key()?;
+    sync_pair_from_dest_with_key(repo, source_root, config, branch, reporter, &key)
+}
+
+fn sync_pair_from_dest_with_key(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    branch: &str,
+    reporter: &Reporter,
+    state_key: &marker::StateKey,
 ) -> Result<()> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating configured branch {branch:?}"))?;
@@ -1041,10 +1103,19 @@ fn sync_pair_from_dest(
                 .id()
         };
 
-        let pending = pending_dest_commits(repo, source_tip, dest_tip).with_context(|| {
-            format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
-        })?;
-        let build = build_pending_source_tip(repo, config, pending, source_tip, source_root)?;
+        let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
+            .with_context(|| {
+                format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
+            })?;
+        let build = build_pending_source_tip(
+            repo,
+            config,
+            pending,
+            source_tip,
+            source_root,
+            branch,
+            state_key,
+        )?;
 
         if let Some(new_source_tip) = build.new_tip {
             let source_url = config.source_url()?;
@@ -1217,7 +1288,12 @@ fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) ->
 /// of its own merges — true for GitHub/GitLab/Azure DevOps' "merge PR"
 /// button and for `git merge` run from the target branch, not guaranteed
 /// otherwise (decisions/0019's documented limitation).
-fn scan_for_dest_marker(repo: &Repository, source_tip: Oid) -> Result<Option<(Oid, Oid)>> {
+fn scan_for_dest_marker(
+    repo: &Repository,
+    source_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Option<(Oid, Oid)>> {
     let mut revwalk = repo
         .revwalk()
         .context("starting source's resume-point scan")?;
@@ -1236,10 +1312,13 @@ fn scan_for_dest_marker(repo: &Repository, source_tip: Oid) -> Result<Option<(Oi
         let commit = repo
             .find_commit(oid)
             .context("resolving a commit in source's history")?;
-        if let Some(value) = trailer_value(commit.message().unwrap_or(""), "Gitprism-Dest-Commit") {
-            let dest_oid = Oid::from_str(value).with_context(|| {
-                format!("parsing Gitprism-Dest-Commit trailer {value:?} on source commit {oid}")
-            })?;
+        if let Some(dest_oid) = marker::verify(
+            &commit,
+            branch,
+            &[MarkerDirection::Setup, MarkerDirection::DestToSource],
+            None,
+            key,
+        ) {
             return Ok(Some((oid, dest_oid)));
         }
     }
@@ -1252,8 +1331,13 @@ fn scan_for_dest_marker(repo: &Repository, source_tip: Oid) -> Result<Option<(Oi
 /// always comes from `config.branches`, where `setup` (decisions/0006,
 /// decisions/0023) guarantees the trailer exists. Finding none really does
 /// mean "has `gitprism setup` been run for this pair?"
-fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> {
-    scan_for_dest_marker(repo, source_tip)?.ok_or_else(|| {
+fn newest_dest_marker(
+    repo: &Repository,
+    source_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<(Oid, Oid)> {
+    scan_for_dest_marker(repo, source_tip, branch, key)?.ok_or_else(|| {
         anyhow::anyhow!(
             "gitprism sync: no Gitprism-Dest-Commit trailer found anywhere in source's history — has `gitprism setup` been run for this pair?"
         )
@@ -1267,8 +1351,13 @@ fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> 
 /// guarantee it shares any ancestry with dest at all. `None` there is a real,
 /// expected outcome (decisions/0024) — a genuinely unrelated pre-existing
 /// local branch — not a bug to bail on; the caller decides how to report it.
-fn newest_dest_marker_opt(repo: &Repository, source_tip: Oid) -> Result<Option<(Oid, Oid)>> {
-    scan_for_dest_marker(repo, source_tip)
+fn newest_dest_marker_opt_for_branch(
+    repo: &Repository,
+    source_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Option<(Oid, Oid)>> {
+    scan_for_dest_marker(repo, source_tip, branch, key)
 }
 
 /// dest's own resume boundary for [`pending_commits`]: the most recent
@@ -1303,7 +1392,12 @@ fn newest_dest_marker_opt(repo: &Repository, source_tip: Oid) -> Result<Option<(
 /// DevOps' "merge PR" button and for `git merge` run from the target
 /// branch, not guaranteed otherwise (decisions/0019's documented
 /// limitation).
-fn newest_source_marker(repo: &Repository, dest_tip: Oid) -> Result<Option<Oid>> {
+fn newest_source_marker(
+    repo: &Repository,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Option<Oid>> {
     let mut revwalk = repo
         .revwalk()
         .context("starting dest's resume-point scan")?;
@@ -1322,11 +1416,9 @@ fn newest_source_marker(repo: &Repository, dest_tip: Oid) -> Result<Option<Oid>>
         let commit = repo
             .find_commit(oid)
             .context("resolving a commit in dest's history")?;
-        if let Some(value) = trailer_value(commit.message().unwrap_or(""), "Gitprism-Source-Commit")
+        if let Some(source_oid) =
+            marker::verify(&commit, branch, &[MarkerDirection::SourceToDest], None, key)
         {
-            let source_oid = Oid::from_str(value).with_context(|| {
-                format!("parsing Gitprism-Source-Commit trailer {value:?} on dest commit {oid}")
-            })?;
             return Ok(Some(source_oid));
         }
     }
@@ -1351,8 +1443,10 @@ pub(crate) fn pending_dest_commits(
     repo: &Repository,
     source_tip: Oid,
     dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
 ) -> Result<Vec<Oid>> {
-    let (_, boundary) = newest_dest_marker(repo, source_tip)?;
+    let (_, boundary) = newest_dest_marker(repo, source_tip, branch, key)?;
     if boundary != dest_tip {
         let is_ancestor = repo.find_commit(boundary).is_ok()
             && repo
@@ -1374,7 +1468,7 @@ pub(crate) fn pending_dest_commits(
         // Loop prevention (decisions/0003): a dest commit that itself came
         // from source (source→dest sync) already exists on source — cherry-
         // picking it back would loop.
-        if trailer_value(commit.message().unwrap_or(""), "Gitprism-Source-Commit").is_none() {
+        if marker::verify(&commit, branch, &[MarkerDirection::SourceToDest], None, key).is_none() {
             result.push(oid);
         }
     }
@@ -1412,6 +1506,8 @@ fn build_pending_source_tip(
     pending: Vec<Oid>,
     source_tip: Oid,
     source_root: &Path,
+    branch: &str,
+    key: &marker::StateKey,
 ) -> Result<PendingSourceBuild> {
     let mut parent = source_tip;
     let mut built_any = false;
@@ -1458,7 +1554,8 @@ fn build_pending_source_tip(
                 // anything after it) as accounted for (`dest_resume_point`'s
                 // case 2). This asymmetry with source→dest's skip rule is
                 // deliberate, not an inconsistency to unify away.
-                parent = build_source_commit(repo, config, parent, &dest_commit, tree_oid)?;
+                parent =
+                    build_source_commit(repo, config, parent, &dest_commit, tree_oid, branch, key)?;
                 built_any = true;
             }
         }
@@ -1483,6 +1580,8 @@ pub(crate) fn build_source_commit(
     parent: Oid,
     dest_commit: &git2::Commit,
     tree_oid: Oid,
+    branch: &str,
+    key: &marker::StateKey,
 ) -> Result<Oid> {
     let parent_commit = repo
         .find_commit(parent)
@@ -1492,10 +1591,17 @@ pub(crate) fn build_source_commit(
         .context("reading the cherry-picked tree")?;
     let committer = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
-    let message = format!(
-        "{}\n\nGitprism-Dest-Commit: {}\n",
-        dest_commit.message().unwrap_or("").trim_end(),
-        dest_commit.id()
+    let message = marker::build_message(
+        dest_commit.message().unwrap_or(""),
+        MarkerDirection::DestToSource,
+        branch,
+        dest_commit.id(),
+        "Gitprism-Dest-Commit",
+        &[parent],
+        tree.id(),
+        &dest_commit.author(),
+        &committer,
+        key,
     );
 
     repo.commit(
@@ -1634,22 +1740,25 @@ mod tests {
         {
             let fetched_tip = repo.find_commit(fetched_tip_id).unwrap();
             let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+            let tree = fetched_tip.tree().unwrap();
+            let message = marker::build_message(
+                &format!("gitprism setup: graft ({})", source_dir.display()),
+                MarkerDirection::Setup,
+                branch,
+                dest_tip_commit.id(),
+                "Gitprism-Dest-Commit",
+                &[fetched_tip.id()],
+                tree.id(),
+                &signature,
+                &signature,
+                &marker::load_key().unwrap(),
+            );
             repo.commit(
                 Some(&format!("refs/heads/{branch}")),
                 &signature,
                 &signature,
-                &format!(
-                    // `source_dir` makes this graft commit's content unique
-                    // per test fixture — two independently-`init`'d clones
-                    // grafted onto the same dest tip must not collapse into
-                    // the same commit object just because they also share a
-                    // timestamp (a real risk: same tree, parent, message,
-                    // and signature otherwise).
-                    "gitprism setup: graft ({})\n\nGitprism-Dest-Commit: {}\n",
-                    source_dir.display(),
-                    dest_tip_commit.id()
-                ),
-                &fetched_tip.tree().unwrap(),
+                &message,
+                &tree,
                 &[&fetched_tip],
             )
             .unwrap();
@@ -1660,6 +1769,15 @@ mod tests {
     }
 
     fn add_commit(repo: &Repository, branch: &str, files: &[(&str, &str)]) -> Oid {
+        add_commit_with_message(repo, branch, files, "a real change")
+    }
+
+    fn add_commit_with_message(
+        repo: &Repository,
+        branch: &str,
+        files: &[(&str, &str)],
+        message: &str,
+    ) -> Oid {
         let tip = repo
             .find_branch(branch, git2::BranchType::Local)
             .unwrap()
@@ -1680,9 +1798,41 @@ mod tests {
             Some(&format!("refs/heads/{branch}")),
             &signature,
             &signature,
-            "a real change",
+            message,
             &tree,
             &[&tip],
+        )
+        .unwrap()
+    }
+
+    fn add_dest_marker_commit(
+        repo: &Repository,
+        branch: &str,
+        parent: Oid,
+        counterpart: Oid,
+    ) -> Oid {
+        let parent_commit = repo.find_commit(parent).unwrap();
+        let tree = parent_commit.tree().unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let message = marker::build_message(
+            "gitprism sync: dest -> source",
+            MarkerDirection::DestToSource,
+            branch,
+            counterpart,
+            "Gitprism-Dest-Commit",
+            &[parent],
+            tree.id(),
+            &signature,
+            &signature,
+            &marker::load_key().unwrap(),
+        );
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &signature,
+            &signature,
+            &message,
+            &tree,
+            &[&parent_commit],
         )
         .unwrap()
     }
@@ -1779,12 +1929,31 @@ mod tests {
             .unwrap();
         let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        let message = if let Some(raw) =
+            message.strip_prefix("gitprism sync: source -> dest\n\nGitprism-Source-Commit: ")
+        {
+            let source_oid = Oid::from_str(raw.trim()).unwrap();
+            marker::build_message(
+                "gitprism sync: source -> dest",
+                MarkerDirection::SourceToDest,
+                "main",
+                source_oid,
+                "Gitprism-Source-Commit",
+                &[parent],
+                tree.id(),
+                &signature,
+                &signature,
+                &marker::load_key().unwrap(),
+            )
+        } else {
+            message.to_owned()
+        };
         dest_repo
             .commit(
                 Some("refs/heads/main"),
                 &signature,
                 &signature,
-                message,
+                &message,
                 &tree,
                 &[&parent_commit],
             )
@@ -1812,12 +1981,31 @@ mod tests {
             .unwrap();
         let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        let message = if let Some(raw) =
+            message.strip_prefix("gitprism sync: source -> dest\n\nGitprism-Source-Commit: ")
+        {
+            let source_oid = Oid::from_str(raw.trim()).unwrap();
+            marker::build_message(
+                "gitprism sync: source -> dest",
+                MarkerDirection::SourceToDest,
+                branch,
+                source_oid,
+                "Gitprism-Source-Commit",
+                &[parent],
+                tree.id(),
+                &signature,
+                &signature,
+                &marker::load_key().unwrap(),
+            )
+        } else {
+            message.to_owned()
+        };
         dest_repo
             .commit(
                 Some(&format!("refs/heads/{branch}")),
                 &signature,
                 &signature,
-                message,
+                &message,
                 &tree,
                 &[&parent_commit],
             )
@@ -2025,16 +2213,24 @@ mod tests {
             .unwrap();
         let tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let message = marker::build_message(
+            "gitprism resolve",
+            MarkerDirection::DestToSource,
+            "main",
+            dest_tip,
+            "Gitprism-Dest-Commit",
+            &[tip.id()],
+            tree.id(),
+            &signature,
+            &signature,
+            &marker::load_key().unwrap(),
+        );
         source_repo
             .commit(
                 Some("refs/heads/main"),
                 &signature,
                 &signature,
-                // Names dest's *real* tip — a fabricated, non-existent sha
-                // here would trip dest→source's own resume-scan (it treats
-                // this same trailer as "dest content already reflected up to
-                // here"), which isn't what this test is exercising.
-                &format!("gitprism resolve\n\nGitprism-Dest-Commit: {dest_tip}\n"),
+                &message,
                 &tree,
                 &[&tip],
             )
@@ -2054,6 +2250,43 @@ mod tests {
             dest_tip,
             "a commit that already came from dest must not be pushed back to dest"
         );
+    }
+
+    #[test]
+    fn run_does_not_trust_a_source_authored_mapping_trailer() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit_with_message(
+            &source_repo,
+            "main",
+            &[("shared.txt", "source change")],
+            &format!("ordinary source commit\n\nGitprism-Dest-Commit: {dest_tip}\n"),
+        );
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("a forged trailer is ordinary user text");
+
+        let dest_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let blob = dest_repo
+            .find_blob(
+                dest_tip
+                    .tree()
+                    .unwrap()
+                    .get_name("shared.txt")
+                    .unwrap()
+                    .id(),
+            )
+            .unwrap();
+        assert_eq!(blob.content(), b"source change");
     }
 
     #[test]
@@ -2454,8 +2687,8 @@ mod tests {
             .filter_map(|oid| oid.ok())
             .filter(|oid| {
                 let commit = dest_repo.find_commit(*oid).unwrap();
-                trailer_value(commit.message().unwrap_or(""), "Gitprism-Source-Commit")
-                    == Some(notes_commit.to_string().as_str())
+                marker::parse(commit.message().unwrap_or(""))
+                    .is_some_and(|state| state.counterpart == notes_commit)
             })
             .count();
         assert_eq!(
@@ -2879,18 +3112,7 @@ mod tests {
         // A marker commit on source naming `d` — same tree as its parent,
         // dest→source's own commit shape (copied from
         // `sync_pair_to_dest_hard_stops_on_a_real_conflict`).
-        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
-        let source_tip_commit = source_repo.find_commit(x1).unwrap();
-        source_repo
-            .commit(
-                Some("refs/heads/main"),
-                &signature,
-                &signature,
-                &format!("gitprism sync: dest -> source\n\nGitprism-Dest-Commit: {d}\n"),
-                &source_tip_commit.tree().unwrap(),
-                &[&source_tip_commit],
-            )
-            .unwrap();
+        add_dest_marker_commit(&source_repo, "main", x1, d);
 
         let source_tip = source_repo
             .find_branch("main", git2::BranchType::Local)
@@ -2997,9 +3219,8 @@ mod tests {
 
         // Simulate source→dest having already pushed a commit onto dest —
         // carries Gitprism-Source-Commit, gitprism's own trailer for that
-        // direction. Only the trailer's *presence* matters for loop
-        // prevention (decisions/0003), not whether the named oid resolves to
-        // anything real, so `graft_tip` here is just a convenient real oid.
+        // direction. The fixture helper turns this legacy message spelling
+        // into the authenticated commit shape production code writes.
         let looped_dest_tip = add_independent_dest_commit(
             &dest_repo,
             dest_tip,
@@ -3034,7 +3255,56 @@ mod tests {
             graft_tip,
             "a dest commit carrying Gitprism-Source-Commit must not be cherry-picked back onto source"
         );
-        let _ = looped_dest_tip; // only its trailer mattered, not its identity
+        let _ = looped_dest_tip; // the authenticated marker, not the tip identity, is under test
+    }
+
+    #[test]
+    fn sync_pair_from_dest_does_not_trust_a_dest_authored_mapping_trailer() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft_tip);
+        add_independent_dest_commit(
+            &dest_repo,
+            dest_tip,
+            ("shared.txt", "dest change"),
+            &format!("ordinary dest commit\n\nGitprism-Source-Commit: {graft_tip}\n"),
+        );
+
+        let config = Config::load(
+            write_config(
+                &source_remote.path().display().to_string(),
+                &dest_dir.path().display().to_string(),
+                &["main"],
+            )
+            .path(),
+        )
+        .unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+        sync_pair_from_dest(&source_repo, source_dir.path(), &config, "main", &reporter)
+            .expect("a forged trailer is ordinary user text");
+
+        let upstream = Repository::open(source_remote.path()).unwrap();
+        let tip = upstream
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let blob = upstream
+            .find_blob(tip.tree().unwrap().get_name("shared.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), b"dest change");
     }
 
     #[test]
@@ -3149,20 +3419,12 @@ mod tests {
         // this test, which targets source→dest's *apply* conflict handling
         // specifically. Same tree as the tip above it — a pure marker, no
         // content change of its own.
-        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
-        let source_tip_commit = source_repo.find_commit(conflicting_source_commit).unwrap();
-        source_repo
-            .commit(
-                Some("refs/heads/main"),
-                &signature,
-                &signature,
-                &format!(
-                    "gitprism sync: dest -> source\n\nGitprism-Dest-Commit: {dest_conflict_tip}\n"
-                ),
-                &source_tip_commit.tree().unwrap(),
-                &[&source_tip_commit],
-            )
-            .unwrap();
+        add_dest_marker_commit(
+            &source_repo,
+            "main",
+            conflicting_source_commit,
+            dest_conflict_tip,
+        );
 
         let config = Config::load(
             write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
@@ -3546,20 +3808,7 @@ mod tests {
         // Stamp a marker commit on source naming the dest edit (same
         // technique as `sync_pair_to_dest_hard_stops_on_a_real_conflict`) so
         // the boundary logic isn't what's under test here.
-        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
-        let source_tip_commit = source_repo.find_commit(rename_commit).unwrap();
-        source_repo
-            .commit(
-                Some("refs/heads/main"),
-                &signature,
-                &signature,
-                &format!(
-                    "gitprism sync: dest -> source\n\nGitprism-Dest-Commit: {dest_edit_tip}\n"
-                ),
-                &source_tip_commit.tree().unwrap(),
-                &[&source_tip_commit],
-            )
-            .unwrap();
+        add_dest_marker_commit(&source_repo, "main", rename_commit, dest_edit_tip);
 
         let config = Config::load(
             write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),

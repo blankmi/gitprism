@@ -41,8 +41,13 @@ use git2::{Repository, Signature};
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git;
+use crate::marker::{self, Direction as MarkerDirection};
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+    // Validate the pair secret before discovery, fetching, or any ref/tree
+    // mutation. A missing or malformed key must fail as a configuration
+    // error, never halfway through setup.
+    let state_key = marker::load_key()?;
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism setup must be run inside an existing git repository (none found at or above {}) — run `git init` first, same as any other git command",
@@ -199,9 +204,12 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
                 // re-running against it. `gitprism sync` is the tool for
                 // picking up dest's newer commits afterward, not a second
                 // `setup`.
-                if super::sync::trailer_value(
-                    existing_commit.message().unwrap_or(""),
-                    "Gitprism-Dest-Commit",
+                if marker::verify(
+                    &existing_commit,
+                    branch,
+                    &[MarkerDirection::Setup, MarkerDirection::DestToSource],
+                    None,
+                    &state_key,
                 )
                 .is_some()
                 {
@@ -256,9 +264,14 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let mut touched_branches: Vec<TouchedBranch> = Vec::with_capacity(config.branches.len());
     for (branch, (plan, original_oid)) in config.branches.iter().zip(&branch_plans) {
         let result = match plan {
-            BranchPlan::Graft { dest_tip } => {
-                graft_branch(&repo, &config, &control_files, branch, *dest_tip)
-            }
+            BranchPlan::Graft { dest_tip } => graft_branch(
+                &repo,
+                &config,
+                &control_files,
+                branch,
+                *dest_tip,
+                &state_key,
+            ),
             BranchPlan::Merge {
                 local_tip,
                 dest_tip,
@@ -271,6 +284,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
                 *local_tip,
                 *dest_tip,
                 *merged_tree,
+                &state_key,
             ),
         };
         match result {
@@ -492,6 +506,7 @@ fn graft_branch(
     control_files: &ControlFiles,
     branch: &str,
     dest_tip: git2::Oid,
+    key: &marker::StateKey,
 ) -> Result<()> {
     let dest_tip = repo
         .find_commit(dest_tip)
@@ -506,10 +521,20 @@ fn graft_branch(
 
     let signature = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
-    let message = format!(
-        "gitprism setup: graft {branch:?} onto dest's tip {}\n\nGitprism-Dest-Commit: {}\n",
+    let message = marker::build_message(
+        &format!(
+            "gitprism setup: graft {branch:?} onto dest's tip {}",
+            dest_tip.id()
+        ),
+        MarkerDirection::Setup,
+        branch,
         dest_tip.id(),
-        dest_tip.id()
+        "Gitprism-Dest-Commit",
+        &[dest_tip.id()],
+        tree.id(),
+        &signature,
+        &signature,
+        key,
     );
 
     repo.commit(
@@ -538,6 +563,7 @@ fn graft_branch(
 /// not at `dest_tip`. This also keeps decisions/0019's first-parent-only
 /// marker scans treating this branch's own history as primary going
 /// forward.
+#[allow(clippy::too_many_arguments)]
 fn merge_branch(
     repo: &Repository,
     config: &Config,
@@ -546,6 +572,7 @@ fn merge_branch(
     local_tip: git2::Oid,
     dest_tip: git2::Oid,
     merged_tree: git2::Oid,
+    key: &marker::StateKey,
 ) -> Result<()> {
     let local_commit = repo
         .find_commit(local_tip)
@@ -562,10 +589,20 @@ fn merge_branch(
 
     let signature = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
-    let message = format!(
-        "gitprism setup: merge dest's tip {} into {branch:?}'s existing history\n\nGitprism-Dest-Commit: {}\n",
+    let message = marker::build_message(
+        &format!(
+            "gitprism setup: merge dest's tip {} into {branch:?}'s existing history",
+            dest_commit.id()
+        ),
+        MarkerDirection::Setup,
+        branch,
         dest_commit.id(),
-        dest_commit.id()
+        "Gitprism-Dest-Commit",
+        &[local_commit.id(), dest_commit.id()],
+        tree.id(),
+        &signature,
+        &signature,
+        key,
     );
 
     repo.commit(

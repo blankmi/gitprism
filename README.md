@@ -102,6 +102,19 @@ url = "git@example.com:group/dest.git"
   credential-bearing or per-environment URLs you don't want committed into
   source's history.
 
+### Mapping state key
+
+Set `GITPRISM_STATE_KEY` for every `setup`, `sync`, and `resolve` invocation.
+It must be a unique key for this source/dest pair, encoded as exactly 64
+hexadecimal characters (32 bytes); generate one with `openssl rand -hex 32`
+and store it in your CI secret manager. Gitprism keeps the
+normal `Gitprism-Source-Commit` / `Gitprism-Dest-Commit` trailers readable, but
+trusts them only when the commit also has a final authenticated state block.
+The key is never committed and is removed from Git subprocess environments so
+repository hooks and helpers cannot read it. User-supplied `Gitprism-*` lines
+are stripped from generated messages to prevent a second trusted marker; use
+ordinary prose for literal documentation of those names.
+
 ## Excluding paths: `.gitprismignore`
 
 Files and folders that must stay in source and never reach dest go in
