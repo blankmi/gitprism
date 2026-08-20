@@ -11,8 +11,8 @@ hybrid `git2`/Git CLI approach remains reasonable for this tool.
 The original review's confirmed critical/high implementation findings have
 been remediated. The project is still **not ready for production distribution**:
 it has not run against a real production repository pair, cross-platform CI has
-not yet executed in this environment, and license, repository identity,
-release-tag, artifact-signing and packaging decisions remain intentionally open.
+not yet executed in this environment, and release-tag, artifact-signing and
+packaging decisions remain intentionally open.
 
 | Area | Score | Rationale |
 |---|---:|---|
@@ -24,12 +24,12 @@ release-tag, artifact-signing and packaging decisions remain intentionally open.
 | Testing | 8/10 | 186 tests cover hostile inputs and rollback/concurrency cases; real-pair and cross-platform execution remain pending. |
 | Cross-Platform Robustness | 7/10 | Unix byte paths are preserved, unsupported Windows bytes fail clearly, and CI covers three OSes; CI has not run here yet. |
 | Maintainability | 6/10 | Rationale is strong, but the two command modules and inline tests remain oversized. |
-| Production Readiness | 6/10 | CI, dependency policy and metadata are present; legal release metadata, packaging, signing and real deployment validation remain open. |
+| Production Readiness | 6/10 | CI, dependency policy, MIT licensing and repository metadata are present; tagging, packaging, signing and real deployment validation remain open. |
 
 Release recommendation: **Conditional no-go for public production distribution.**
 No confirmed CRITICAL or HIGH implementation finding remains in the reviewed
-paths, but distribution should wait for owner decisions, a license and release
-process, executed Linux/macOS/Windows CI, and a real repository-pair pilot.
+paths, but distribution should wait for the remaining release-process
+decisions, executed Linux/macOS/Windows CI, and a real repository-pair pilot.
 
 Verification performed:
 
@@ -405,23 +405,25 @@ This is argument injection into Git, not shell interpolation by `Command::arg()`
 - Category: Distribution
 - Severity: **MEDIUM**
 - Confidence: High
-- Status: **Partially fixed** in `d512c91` plus the current Cargo/README
-  updates.
-- Files: `Cargo.toml`, `README.md`, `.github/workflows/ci.yml`,
+- Status: **Partially fixed** in `d512c91` plus the owner-approved metadata
+  update.
+- Files: `Cargo.toml`, `LICENSE`, `README.md`, `.github/workflows/ci.yml`,
   `.github/dependabot.yml`, `deny.toml`
 - Evidence:
   - Pinned-SHA CI now runs Rust 1.89 formatting, Clippy, locked tests and a
     locked release build, plus Linux/macOS/Windows tests.
   - Dependabot, `deny.toml`, `cargo audit` and `cargo deny` checks are present.
-  - Cargo now has an inferred description/categories/keywords and
-    `publish = false`; README documents Rust 1.89 and Git >=2.45.
-  - There is still no license, repository URL, release-tag policy, signed
-    artifact workflow, installer or package-manager integration by design.
-- Impact: Engineering validation is substantially improved, but public
-  distribution is not yet legally or operationally complete.
-- Recommended remediation: Owner must select a license, repository identity,
-  version/tag policy and signing policy before adding release packaging and
-  artifacts. Keep `publish = false` until that decision is made.
+  - The owner-approved MIT `LICENSE`, canonical repository URL, Cargo
+    `license = "MIT"`, `repository` metadata and `publish = false` are now
+    present. README documents source installation and the no-crates.io status.
+  - Release-tag/version policy, signed artifact workflow, release archives,
+    installer and package-manager integration remain intentionally open.
+- Impact: Licensing and project identity are now explicit, but public
+  distribution is not yet operationally complete.
+- Recommended remediation: Decide the release tag/version and signing
+  policies, then add reproducible release archives/checksums and installation
+  channels. Retain `publish = false` unless the owner explicitly changes the
+  no-crates.io decision.
 
 ## 6. Low and Informational Findings
 
@@ -567,7 +569,7 @@ Still-open tests and validation:
 5. Add large-history benchmarks and verify practical behavior at each static
    resource limit.
 6. Decide and test a release artifact smoke-test/install workflow after the
-   owner selects license, tags and distribution channels.
+   owner selects tags, signing and distribution channels.
 
 The current suite is strongest around merge correctness, filtering, races at remote push, branch deletion policy, setup rollback under ref locking, rename behavior and conflict detection.
 
@@ -622,8 +624,7 @@ branch-advancement logic from `sync.rs`.
 |---|---|---|
 | Execute and require the pinned Linux/macOS/Windows Rust 1.89 CI matrix, including `cargo audit` and `cargo deny`. | High | Small |
 | Add worktree, submodule, malformed-object and empty-repository integration coverage. | Medium | Medium |
-| Choose and document the project license, canonical repository URL, release tag/version policy and signing policy. | High | Medium |
-| Replace `publish = false` with the owner-approved publication setting only after legal/distribution decisions are settled. | Medium | Small |
+| Choose and document the release tag/version policy and signing policy. | High | Medium |
 
 ### P2 - Near Term
 
@@ -648,9 +649,9 @@ branch-advancement logic from `sync.rs`.
 2. Run a real source/destination pilot with documented rollback and recovery.
 3. Execute and require the pinned Linux/macOS/Windows Rust 1.89 workflow.
 4. Add worktree, submodule, malformed-object and empty-repository integration tests.
-5. Choose the license, canonical repository identity and release version/tag policy.
+5. Decide and document the release version/tag policy.
 6. Decide whether and how release artifacts are signed and verified.
 7. Add reproducible platform archives and SHA-256 checksums after those decisions.
-8. Keep `publish = false` until the legal and distribution review is complete.
+8. Add a dedicated test for the trusted Git hook/helper boundary.
 9. Extract state/ref-update/validated-input components from the large command modules.
 10. Benchmark real large repositories and tune the documented resource budgets.

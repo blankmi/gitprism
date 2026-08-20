@@ -91,6 +91,11 @@ cargo build --release
 # binary at target/release/gitprism
 ```
 
+gitprism is distributed from source and is not published to crates.io;
+clone the canonical repository at
+[`https://github.com/blankmi/gitprism`](https://github.com/blankmi/gitprism)
+and build it locally. It is available under the [MIT License](LICENSE).
+
 ### Byte and platform compatibility
 
 Git paths are handled as bytes for comparisons and diagnostics where the
