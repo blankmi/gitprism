@@ -24,3 +24,6 @@ toml = "1.1.4"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Only for a test asserting the umask actually constrains a restored file's
+# creation mode (RestoreMode::SubjectToUmask) — std has no umask API.
+libc = "0.2.169"

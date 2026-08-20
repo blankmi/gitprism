@@ -1500,6 +1500,7 @@ fn advance_local_source_branch(
         // overwritten just because dest→source advanced the branch.
         repo.checkout_tree(new_commit.as_object(), None)
             .context("checking out what dest→source just pushed into the working tree")?;
+        crate::policy::restore_control_files_exact(repo, &new_commit.tree()?)?;
     }
 
     repo.reference_matching(
@@ -1932,15 +1933,22 @@ mod tests {
         let tree = repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("Dest Author", "author@example.com").unwrap();
 
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap()
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                "initial",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        // `Repository::init_bare` points HEAD at libgit2's environment
+        // default branch, which need not be `branch` (e.g. it's "master"
+        // in CI). Repoint it so push_head() in tests resolves correctly
+        // regardless of that default.
+        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+        oid
     }
 
     /// `source_url` only actually gets dereferenced (fetched from or pushed
@@ -1965,10 +1973,10 @@ mod tests {
             email = "gitprism@example.com"
 
             [source]
-            url = "{source_url}"
+            url = '{source_url}'
 
             [dest]
-            url = "{dest_url}"
+            url = '{dest_url}'
             "#,
         )
         .unwrap();
@@ -4296,7 +4304,7 @@ mod tests {
             email = "gitprism@example.com"
 
             [dest]
-            url = "{}"
+            url = '{}'
             "#,
             dest_dir.path().display()
         )

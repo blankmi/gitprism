@@ -1125,3 +1125,97 @@ every archive, intentionally unsigned artifacts, and no crates.io publication.
 tags, builds/tests/smoke-checks the four approved targets, uploads the archives,
 generates `SHA256SUMS`, and draft-gates GitHub publication. Artifacts remain
 intentionally unsigned.
+
+## 2026-08-20 — control files stay byte-exact through checkout
+
+**Update**: Decided [0034](decisions/0034-control-files-stay-byte-exact-through-checkout.md)
+— Windows CI surfaced that libgit2's checkout applies ordinary `core.autocrlf`/
+`.gitattributes` text filtering to `.gitprism.toml`/`.gitprismignore` like any
+other tracked file, silently invalidating decision 0026's pinned digest on a
+machine where `core.autocrlf=true` even though nothing in the repository
+changed. `policy::restore_control_files_exact` now re-writes both straight
+from their blob bytes after every checkout that might place them; every other
+file keeps its ordinary checkout attributes, and disabling filters for the
+whole tree was rejected as overreach.
+
+**Update**: Windows CI also exposed a `git worktree add`/`remove` failure
+underneath [0033](decisions/0033-authenticated-resolution-worktree-and-safe-file-recovery.md):
+`fs::canonicalize`'s Windows result is an extended-length (`\\?\`-prefixed)
+path, which Git for Windows' MSYS-based git does not reliably accept as a
+`worktree add`/`remove` argument. The authenticated worktree path itself
+still keeps `fs::canonicalize`'s exact output everywhere — 0033's
+symlink-substitution check depends on that canonical form matching itself —
+`git::worktree_add`/`worktree_remove` now strip the verbatim prefix only for
+the literal subprocess argument they pass to `git`.
+
+**Update**: Code review on the PR caught two more bugs in
+`policy::restore_control_files_exact` itself. Re-staging via
+`Index::add_path` hashes through the working-tree filter's clean side, so a
+control file whose own committed blob already contains CRLF got
+re-normalized to LF before hashing — the index diverged from HEAD despite
+nothing having changed; fixed by pointing the index entry straight at the
+tree's own oid/mode instead of hashing anything. The raw restore write also
+followed whatever already occupied the path, including a symlink or
+hardlink planted there between checkout and restore — inconsistent with
+0033's no-follow stance; fixed by reusing `setup`'s own remove-then-
+`create_new` recovery pattern, now shared as
+`policy::write_regular_file_no_follow`. See 0034's Consequences section for
+detail.
+
+**Update**: A second review round on the same PR caught two more bugs, both
+about file mode rather than content, both on Unix only. (1)
+`write_regular_file_no_follow` chmod'd the new file by path after closing
+it — the same race its own no-follow write exists to close, since whatever
+occupies the path by the time the chmod runs gets its permissions changed,
+not necessarily the file just created. Fixed by applying the mode to the
+still-open `File` handle before dropping it. (2)
+`restore_control_files_exact`'s raw write carried over content but not
+mode, so an executable control file (`100755`) silently became `100644` on
+disk while the index still pointed at the executable blob — dirty under
+`core.filemode=true`. Fixed by passing the tree entry's mode into the same
+helper. A new Unix test commits a control file as
+`FileMode::BlobExecutable`, calls the restore directly, and asserts both the
+on-disk permission bits and `status_file`'s cleanliness. See 0034's
+Consequences section for detail. `cargo test`: 189 passed, 0 failed.
+`cargo clippy --all-targets`: clean. `cargo fmt --check`: clean.
+
+**Update**: A third review round caught a bug in fix (2) above: applying a
+git-tracked mode to the handle verbatim (the same way a *captured* mode is
+restored exactly) bypasses the umask, so a restrictive umask (e.g. `077`)
+that an ordinary checkout would have honored gets silently widened back to
+the git mode's raw bits (`0644`/`0755`) instead of the umask-constrained
+result (`0600`/`0700`) a real checkout would produce — git tracks only the
+executable bit, never group/world permissions, so those bits were never
+git's to dictate in the first place. Fixed by splitting
+`write_regular_file_no_follow`'s single `mode: Option<u32>` into a
+`RestoreMode` enum: `SubjectToUmask` passes the mode as the `open()`
+creation mode (umask-constrained, what `restore_control_files_exact`
+wants — mirroring a real checkout), `Exact` still applies to the open
+handle after creation (umask-bypassing, what `setup`'s own recovery
+wants — reproducing a previously captured mode byte-for-byte). Added
+`libc` as a dev-dependency (std has no umask API) for a new Unix test that
+sets `umask 077` under a mutex — following `config::ENV_VAR_LOCK`'s
+precedent, since the umask is one process-global a test can't mutate
+unguarded — and confirms a `100755`/`100644` control file restores to
+`0700`/`0600`. See 0034's Consequences section for detail. `cargo test`:
+190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
+--check`: clean.
+
+**Update**: A fourth review round caught a real gap in that umask test
+itself: its mutex only synchronizes against other tests that also take it,
+and no other test in the suite has any reason to expect the process umask
+to change, so none of them do — meaning every other test that creates a
+file (including this file's own executable-bit test) could observe
+whatever umask this test happened to have set while running concurrently,
+and a panic between setting it and restoring it would have left the wrong
+umask in place for the rest of the run, with no `Drop` to catch that.
+Fixed by re-executing this one test alone, filtered by its own
+libtest-assigned thread name (`std::thread::current().name()`), in a
+freshly spawned subprocess (`std::env::current_exe()` plus `--exact
+--nocapture`) — the umask change and any panic are now contained to a
+process nothing else in the suite ever runs in; the parent test only
+checks the subprocess's exit status, surfacing its captured stdout/stderr
+on failure. The mutex is gone; no test anywhere else needed to change to
+stay correct. See 0034's Consequences section for detail. `cargo test`:
+190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
+--check`: clean.

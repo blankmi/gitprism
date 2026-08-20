@@ -443,24 +443,19 @@ impl ControlFileSnapshot {
 }
 
 fn restore_regular_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => fs::remove_file(path)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-    }
-    use std::io::Write as _;
-    file.write_all(bytes)?;
-    Ok(())
+    // `mode` here is a *captured* mode from before setup touched this file —
+    // recovering it exactly is the point, not creating a new file the
+    // umask should have a say in — so this applies it through the handle
+    // `write_regular_file_no_follow` still holds open (`RestoreMode::Exact`),
+    // never by a follow-up path-based `set_permissions`: the latter reopens
+    // the exact race 0033 already rejects, chmod'ing whatever occupies
+    // `path` by the time it runs, symlink or not.
+    use crate::policy::RestoreMode;
+    let mode = match mode {
+        Some(mode) => RestoreMode::Exact(mode),
+        None => RestoreMode::None,
+    };
+    crate::policy::write_regular_file_no_follow(path, bytes, mode)
 }
 
 impl ControlFileState {
@@ -713,6 +708,7 @@ fn checkout_branch(repo: &Repository, branch: &str, original_oid: Option<git2::O
     // as a checkout conflict, not get silently overwritten.
     repo.checkout_tree(commit.as_object(), None)
         .with_context(|| format!("checking out {refname} into the working directory"))?;
+    crate::policy::restore_control_files_exact(repo, &commit.tree()?)?;
     repo.set_head(&refname)
         .with_context(|| format!("setting HEAD to {refname}"))?;
     Ok(())
@@ -963,7 +959,7 @@ mod tests {
             email = "gitprism@example.com"
 
             [dest]
-            url = "{dest_url}"
+            url = '{dest_url}'
             "#,
         )
         .unwrap();
@@ -1069,6 +1065,139 @@ mod tests {
     }
 
     #[test]
+    fn run_keeps_control_files_byte_exact_when_source_repo_has_autocrlf_enabled() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(
+            dest_dir.path(),
+            "main",
+            &[("a.txt", "line one\nline two\n")],
+        );
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        // Reproduces a real Windows machine's ambient Git for Windows
+        // default on the repo under test, without touching this test
+        // process's own global git config.
+        repo.config()
+            .unwrap()
+            .set_bool("core.autocrlf", true)
+            .unwrap();
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+        let config_raw = fs::read(config.path()).unwrap();
+
+        run(source_dir.path(), config.path()).expect("setup should succeed");
+
+        // decisions/0026 and 0034: the checked-out control file must stay
+        // byte-for-byte what was written to its blob, regardless of the
+        // repo's own autocrlf setting.
+        let config_path = source_dir.path().join(crate::config::FILENAME);
+        let on_disk_config = fs::read(&config_path).unwrap();
+        assert_eq!(
+            on_disk_config, config_raw,
+            "'.gitprism.toml' must stay byte-exact even when the source repo has core.autocrlf enabled"
+        );
+        let ignore_path = source_dir.path().join(exclude::FILENAME);
+        let on_disk_ignore = fs::read(&ignore_path).unwrap();
+        assert_eq!(
+            crate::policy::hash_files(&config_path, &ignore_path).unwrap(),
+            crate::policy::digest_bytes(&on_disk_config, &on_disk_ignore),
+            "policy-hash must see exactly the bytes setup committed, unaffected by checkout filtering"
+        );
+
+        // Restoring the exact bytes must not leave the repo permanently
+        // dirty: the index has to be re-staged to match, or every later
+        // dirty-working-tree guard sync/setup rely on would misfire forever.
+        assert!(
+            repo.status_file(Path::new(crate::config::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "'.gitprism.toml' must be clean in HEAD/index/working-tree after the byte-exact restore"
+        );
+        assert!(
+            repo.status_file(Path::new(exclude::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "'.gitprismignore' must be clean in HEAD/index/working-tree after the byte-exact restore"
+        );
+
+        // An ordinary tracked file is not special-cased — it must still
+        // receive git's normal autocrlf checkout conversion, proving the fix
+        // is scoped to the two control files rather than disabling checkout
+        // filtering altogether.
+        assert_eq!(
+            fs::read(source_dir.path().join("a.txt")).unwrap(),
+            b"line one\r\nline two\r\n",
+            "an ordinary text file must still receive autocrlf checkout conversion"
+        );
+    }
+
+    #[test]
+    fn run_keeps_the_index_matching_head_when_the_control_files_own_blob_has_crlf_bytes() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("core.autocrlf", true)
+            .unwrap();
+
+        // A `--config` file authored with CRLF line endings (e.g. on
+        // Windows). gitprism commits an external config's bytes verbatim
+        // (decisions/0026), so the committed blob itself ends up containing
+        // CRLF — not just the checkout of it.
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "branches = [\"main\"]\r\n\r\n[committer]\r\nname = \"gitprism\"\r\nemail = \"gitprism@example.com\"\r\n\r\n[dest]\r\nurl = '{}'\r\n",
+            dest_dir.path().display()
+        )
+        .unwrap();
+        let config_raw = fs::read(file.path()).unwrap();
+        assert!(
+            config_raw.windows(2).any(|pair| pair == b"\r\n"),
+            "test setup bug: the fixture config must actually contain CRLF"
+        );
+
+        run(source_dir.path(), file.path()).expect("setup should succeed");
+
+        let head_tree = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let head_config_id = head_tree.get_name(crate::config::FILENAME).unwrap().id();
+
+        let config_path = source_dir.path().join(crate::config::FILENAME);
+        assert_eq!(
+            fs::read(&config_path).unwrap(),
+            config_raw,
+            "the on-disk file must stay byte-exact even though its own blob has CRLF bytes"
+        );
+
+        let index = repo.index().unwrap();
+        let index_entry = index
+            .get_path(Path::new(crate::config::FILENAME), 0)
+            .expect("the control file must be staged");
+        assert_eq!(
+            index_entry.id, head_config_id,
+            "the index must reference HEAD's actual CRLF blob, not one clean-filtered back to LF"
+        );
+
+        assert!(
+            repo.status_file(Path::new(crate::config::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "'.gitprism.toml' must be clean even though its committed blob itself contains CRLF bytes"
+        );
+    }
+
+    #[test]
     fn run_resolves_a_relative_default_config_against_source_root_not_cwd() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
@@ -1076,7 +1205,7 @@ mod tests {
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
         let config_toml = format!(
-            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n",
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = '{}'\n",
             dest_dir.path().display()
         );
         fs::write(source_dir.path().join(crate::config::FILENAME), config_toml).unwrap();
@@ -1142,7 +1271,7 @@ mod tests {
         )
         .unwrap();
         let config_toml = format!(
-            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"{}\"\n",
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = '{}'\n",
             dest_dir.path().display()
         );
         fs::write(

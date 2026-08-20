@@ -1318,6 +1318,7 @@ fn finish(
         .with_context(|| format!("pointing HEAD back at {refname:?}"))?;
     repo.checkout_tree(new_commit.as_object(), None)
         .context("checking out gitprism's replacement commit")?;
+    crate::policy::restore_control_files_exact(repo, &new_commit.tree()?)?;
 
     let source_url = config.source_url()?;
     match git::push(source_root, &source_url, new_oid, branch)? {
@@ -1354,10 +1355,10 @@ mod tests {
             email = "gitprism@example.com"
 
             [source]
-            url = "{source_url}"
+            url = '{source_url}'
 
             [dest]
-            url = "{dest_url}"
+            url = '{dest_url}'
             "#,
         )
         .unwrap();
@@ -1630,11 +1631,15 @@ mod tests {
         )
         .expect_err("configured branches must not gate source mirror-only resolution");
         let message = format!("{error:#}");
-        assert!(message.contains("source-to-dest"));
-        assert!(message.contains("--continue"));
+        assert!(message.contains("source-to-dest"), "message was: {message}");
+        assert!(message.contains("--continue"), "message was: {message}");
         let operation =
             find_source_to_dest_operation(&source_repo, "feature", &marker::load_key().unwrap())
-                .unwrap();
+                .unwrap_or_else(|lookup_error| {
+                    panic!(
+                        "run_with_direction's error was: {message}\nlooking up its operation ref failed: {lookup_error:#}"
+                    )
+                });
         git::worktree_remove(source_dir.path(), &operation.worktree).unwrap();
         source_repo
             .find_reference(&operation.refname)
@@ -1681,7 +1686,7 @@ mod tests {
             .unwrap();
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
-        run_with_direction(
+        let first_error = run_with_direction(
             source_dir.path(),
             config.path(),
             "main",
@@ -1689,9 +1694,14 @@ mod tests {
             Direction::SourceToDest,
         )
         .expect_err("the independent same-file changes must conflict");
+        let first_message = format!("{first_error:#}");
         let operation =
             find_source_to_dest_operation(&source_repo, "main", &marker::load_key().unwrap())
-                .unwrap();
+                .unwrap_or_else(|lookup_error| {
+                    panic!(
+                        "run_with_direction's error was: {first_message}\nlooking up its operation ref failed: {lookup_error:#}"
+                    )
+                });
         let worktree_repo = Repository::open(&operation.worktree).unwrap();
         fs::write(operation.worktree.join("f.txt"), "human resolution").unwrap();
         let mut index = worktree_repo.index().unwrap();
@@ -2160,8 +2170,8 @@ mod tests {
         )
         .expect_err("the independent same-file changes must conflict");
         let message = format!("{error:#}");
-        assert!(message.contains("source-to-dest"));
-        assert!(message.contains("--continue"));
+        assert!(message.contains("source-to-dest"), "message was: {message}");
+        assert!(message.contains("--continue"), "message was: {message}");
 
         let worktree = fs::read_dir(source_dir.path().join(".git/worktrees"))
             .unwrap()
