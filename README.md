@@ -20,10 +20,16 @@ No history rewriting, no force-pushing. See
 for why that's a hard constraint this tool is built around, not just a
 preference.
 
+Mutating commands serialize through a non-blocking lock in Git's common
+directory, so linked worktrees share the same operation boundary. Dest-to-source
+local branch advancement is checked against a safe checkout (rejecting local
+working-tree conflicts while preserving unrelated untracked files) and uses a
+compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
+
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (144 tests
+helper described below are implemented and covered by `cargo test` (154 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -58,7 +64,7 @@ and rejected — is recorded as individual decisions in
 
 ## Installing / building
 
-Requires Rust (2024 edition) and a `git` binary on `PATH` — gitprism calls
+Requires Rust 1.89 or newer (2024 edition) and a `git` binary on `PATH` — gitprism calls
 out to real `git` for push/fetch/cherry-pick rather than reimplementing
 network or working-tree operations.
 

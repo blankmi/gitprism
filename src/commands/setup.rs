@@ -82,6 +82,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // Validate the pair secret after the immutable policy pin has passed, and
     // before any fetch or ref/tree mutation.
     let state_key = marker::load_key()?;
+    let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
     // decisions/0021 needs config.branches available before the precondition
     // check below runs (to know which existing local branch names are
     // expected), so parsing config has to move ahead of that check —

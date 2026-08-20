@@ -1044,3 +1044,9 @@ synthetic patch, and a unique linked worktree. The source checkout remains
 untouched; continuation validates source, policy, patch, and worktree state,
 rejects excluded-path edits, and applies the allowed resolution delta back onto
 the original destination tree before an ff-only push.
+
+**Update**: Decided [0028](decisions/0028-operation-lock-and-local-advance-cas.md) —
+mutating commands take a non-blocking lock in Git's common directory, and
+dest-to-source local advancement is preflighted against a safe checkout and
+finished with a compare-and-swap ref update. A concurrent external Git move is
+never overwritten after a successful remote push.

@@ -110,6 +110,8 @@ pub fn run_with_direction(
         }
     };
 
+    let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
+
     let cherry_pick_head = repo.path().join("CHERRY_PICK_HEAD");
 
     match direction {

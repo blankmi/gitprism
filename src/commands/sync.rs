@@ -100,6 +100,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let verified_policy = load_run_policy(&config_path, &source_root)?;
     let config = verified_policy.config;
     let exclude_list = verified_policy.exclude_list;
+    let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
 
     // Checked once per run, not once per merge (decisions/0016) — an
     // operator on a too-old git gets one clear version message up front
@@ -1143,10 +1144,26 @@ fn sync_pair_from_dest_with_key(
         )?;
 
         if let Some(new_source_tip) = build.new_tip {
+            let expected_local_tip = preflight_local_source_branch(repo, branch, new_source_tip)
+                .with_context(|| {
+                    format!(
+                        "checking whether local source branch {branch:?} can be advanced before pushing"
+                    )
+                })?;
             let source_url = config.source_url()?;
             match git::push(source_root, &source_url, new_source_tip, branch)? {
                 git::PushOutcome::Accepted => {
-                    advance_local_source_branch(repo, branch, new_source_tip)?;
+                    advance_local_source_branch(
+                        repo,
+                        branch,
+                        new_source_tip,
+                        expected_local_tip,
+                    )
+                    .with_context(|| {
+                        format!(
+                                "source remote accepted {branch:?}, but the local source branch could not be advanced safely; the remote push succeeded. Preserve local changes, fetch the configured source remote, and fast-forward or reconcile the local branch with ordinary Git before rerunning"
+                        )
+                    })?;
                 }
                 git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
                     attempt += 1;
@@ -1225,16 +1242,23 @@ fn sync_pair_from_dest_with_key(
 ///   newly cherry-picked file shows as staged-for-deletion) relative to a
 ///   ref that just silently moved out from under it, and a genuine local
 ///   modification gets silently discarded instead of surfaced as a conflict.
-fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) -> Result<()> {
+fn local_source_branch_tip(repo: &Repository, branch: &str) -> Result<Oid> {
     let refname = format!("refs/heads/{branch}");
-    let previous_tip = repo
-        .find_reference(&refname)
-        .ok()
-        .and_then(|r| r.peel_to_commit().ok())
-        .map(|c| c.id());
+    repo.find_reference(&refname)
+        .with_context(|| format!("resolving local source branch {branch:?}"))?
+        .peel_to_commit()
+        .with_context(|| format!("resolving local source branch {branch:?} to a commit"))
+        .map(|commit| commit.id())
+}
 
-    if let Some(previous_tip) = previous_tip
-        && previous_tip != new_tip
+/// Performs all checks that can be made without changing the local checkout.
+/// The returned OID is the exact value later used by the compare-and-swap
+/// update, so a concurrent ref move cannot be mistaken for the state checked
+/// here.
+fn preflight_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) -> Result<Oid> {
+    let previous_tip = local_source_branch_tip(repo, branch)?;
+
+    if previous_tip != new_tip
         && !repo.graph_descendant_of(new_tip, previous_tip).with_context(|| {
             format!(
                 "checking whether {new_tip} is a fast-forward of local branch {branch:?}'s current tip {previous_tip}"
@@ -1242,7 +1266,125 @@ fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) ->
         })?
     {
         anyhow::bail!(
-            "gitprism sync: local branch {branch:?} (currently {previous_tip}) has diverged from what dest→source just pushed to source's remote ({new_tip}) — refusing to force it forward and silently discard that local work; reconcile it manually before syncing again"
+            "gitprism sync: local branch {branch:?} (currently {previous_tip}) has diverged from what dest→source would push to source's remote ({new_tip}) — refusing to force it forward and silently discard that local work; reconcile it manually before syncing again"
+        );
+    }
+
+    let refname = format!("refs/heads/{branch}");
+    let head_points_here = repo
+        .head()
+        .ok()
+        .and_then(|head_ref| head_ref.name().ok().map(str::to_owned))
+        .is_some_and(|name| name == refname);
+
+    if head_points_here {
+        // A symbolic HEAD can temporarily name a branch whose ref was moved
+        // by another local Git operation; in that case Git's status is still
+        // relative to the old HEAD commit and reports the expected ref move
+        // as staged changes. Only reject tracked dirt when HEAD is the exact
+        // branch tip we just observed.
+        let head_tip = repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .map(|commit| commit.id());
+        if head_tip == Some(previous_tip) {
+            let mut status_options = git2::StatusOptions::new();
+            status_options
+                .include_untracked(false)
+                .include_ignored(false);
+            let statuses = repo.statuses(Some(&mut status_options))?;
+            if !statuses.is_empty() {
+                anyhow::bail!(
+                    "gitprism sync: checked-out source branch {branch:?} has local working-tree or index changes; refusing to push before a safe local advancement"
+                );
+            }
+        }
+        reject_colliding_untracked_paths(repo, branch, new_tip)?;
+        let new_commit = repo
+            .find_commit(new_tip)
+            .context("resolving the newly pushed local commit")?;
+        // Dry-run the same safe checkout used after the push. A dirty or
+        // conflicting checkout must stop before the remote is changed.
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.dry_run();
+        repo.checkout_tree(new_commit.as_object(), Some(&mut checkout))
+            .context("preflighting the checkout of what dest→source would push")?;
+    }
+
+    Ok(previous_tip)
+}
+
+/// A safe libgit2 checkout does not report every untracked-file collision in
+/// dry-run mode. Compare the current HEAD tree with the target and reject an
+/// untracked or ignored path only when the target would write beneath it;
+/// unrelated local files remain untouched and are allowed.
+fn reject_colliding_untracked_paths(repo: &Repository, branch: &str, new_tip: Oid) -> Result<()> {
+    let head_tree = repo
+        .head()
+        .context("resolving HEAD while checking untracked checkout collisions")?
+        .peel_to_tree()
+        .context("resolving HEAD tree while checking untracked checkout collisions")?;
+    let target_tree = repo
+        .find_commit(new_tip)
+        .context("resolving target tree while checking untracked checkout collisions")?
+        .tree()
+        .context("reading target tree while checking untracked checkout collisions")?;
+    let diff = repo
+        .diff_tree_to_tree(Some(&head_tree), Some(&target_tree), None)
+        .context("comparing local and target trees while checking checkout collisions")?;
+    let target_paths: Vec<&Path> = diff
+        .deltas()
+        .filter_map(|delta| delta.new_file().path())
+        .collect();
+    if target_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut status_options = git2::StatusOptions::new();
+    status_options
+        .include_untracked(true)
+        .include_ignored(true)
+        .recurse_untracked_dirs(true)
+        .recurse_ignored_dirs(true);
+    let statuses = repo
+        .statuses(Some(&mut status_options))
+        .context("checking untracked checkout collisions")?;
+    for entry in statuses.iter() {
+        if !(entry.status().is_wt_new() || entry.status().is_ignored()) {
+            continue;
+        }
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        if target_paths
+            .iter()
+            .any(|target| target == &path || target.starts_with(path))
+        {
+            anyhow::bail!(
+                "gitprism sync: checked-out source branch {branch:?} has an untracked or ignored path that the pushed tree would overwrite; refusing to push before a safe local advancement"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Materializes the pushed commit and advances the local ref with a
+/// compare-and-swap against the exact OID returned by preflight. The checkout
+/// intentionally remains before the ref update: libgit2 needs the current
+/// HEAD/tree relationship to materialize the new tree safely. If the CAS
+/// loses to an external Git process, no force/reset is attempted.
+fn advance_local_source_branch(
+    repo: &Repository,
+    branch: &str,
+    new_tip: Oid,
+    expected_tip: Oid,
+) -> Result<()> {
+    let refname = format!("refs/heads/{branch}");
+    let current_tip = local_source_branch_tip(repo, branch)?;
+    if current_tip != expected_tip {
+        anyhow::bail!(
+            "local source branch {branch:?} moved from expected {expected_tip} to {current_tip} after the remote push; refusing to overwrite it"
         );
     }
 
@@ -1256,18 +1398,31 @@ fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) ->
         let new_commit = repo
             .find_commit(new_tip)
             .context("resolving the newly pushed local commit")?;
-        // Deliberately not forced (`None` options default to a safe
-        // checkout, same as `setup`'s own `checkout_head(None)`) — a real
-        // local modification must surface as a conflict, not be silently
+        // Deliberately not forced (`None` options default to a safe checkout,
+        // same as `setup`'s own `checkout_head(None)`) — a real local
+        // modification must surface as a conflict, not be silently
         // overwritten just because dest→source advanced the branch.
         repo.checkout_tree(new_commit.as_object(), None)
             .context("checking out what dest→source just pushed into the working tree")?;
     }
 
-    repo.reference(&refname, new_tip, true, "gitprism sync: dest -> source")
-        .with_context(|| {
-            format!("advancing local branch {branch:?} to match what was just pushed")
-        })?;
+    repo.reference_matching(
+        &refname,
+        new_tip,
+        true,
+        expected_tip,
+        "gitprism sync: dest -> source",
+    )
+    .map_err(|error| {
+        if error.code() == git2::ErrorCode::Modified {
+            anyhow::anyhow!(
+                "local source branch {branch:?} moved while the pushed tree was being checked out; refusing to overwrite the concurrent ref"
+            )
+        } else {
+            anyhow::Error::new(error)
+        }
+    })
+    .with_context(|| format!("advancing local branch {branch:?} after the remote push"))?;
 
     Ok(())
 }
@@ -1826,15 +1981,43 @@ mod tests {
         let tree = repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("A Developer", "dev@example.com").unwrap();
 
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &[&tip],
-        )
-        .unwrap()
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&tip],
+            )
+            .unwrap();
+        refresh_checked_out_branch(repo, branch);
+        oid
+    }
+
+    fn refresh_checked_out_branch(repo: &Repository, branch: &str) {
+        let refname = format!("refs/heads/{branch}");
+        let checked_out = repo
+            .head()
+            .ok()
+            .and_then(|head| head.name().ok().map(str::to_owned))
+            .is_some_and(|name| name == refname);
+        if checked_out {
+            let commit = repo
+                .find_branch(branch, git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap();
+            repo.checkout_tree(
+                commit.as_object(),
+                Some(git2::build::CheckoutBuilder::new().force()),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.read_tree(&commit.tree().unwrap()).unwrap();
+            index.write().unwrap();
+        }
     }
 
     fn add_dest_marker_commit(
@@ -1858,15 +2041,18 @@ mod tests {
             &signature,
             &marker::load_key().unwrap(),
         );
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            &message,
-            &tree,
-            &[&parent_commit],
-        )
-        .unwrap()
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap();
+        refresh_checked_out_branch(repo, branch);
+        oid
     }
 
     /// Same shape as `add_commit`, for content that isn't valid UTF-8 (e.g. a
@@ -1891,15 +2077,18 @@ mod tests {
         let tree = repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("A Developer", "dev@example.com").unwrap();
 
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            "a binary change",
-            &tree,
-            &[&tip],
-        )
-        .unwrap()
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                "a binary change",
+                &tree,
+                &[&tip],
+            )
+            .unwrap();
+        refresh_checked_out_branch(repo, branch);
+        oid
     }
 
     /// Same shape as `add_commit`, for a commit that also *removes* paths — a
@@ -1930,15 +2119,18 @@ mod tests {
         let tree = repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("A Developer", "dev@example.com").unwrap();
 
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            "a rename",
-            &tree,
-            &[&tip],
-        )
-        .unwrap()
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                "a rename",
+                &tree,
+                &[&tip],
+            )
+            .unwrap();
+        refresh_checked_out_branch(repo, branch);
+        oid
     }
 
     /// An independent change landing directly on dest — e.g. a PR merged
@@ -3222,6 +3414,223 @@ mod tests {
         assert_eq!(
             tip_after_second, tip_after_first,
             "the no-op run must not add another commit to source"
+        );
+    }
+
+    fn repository_with_commits() -> (tempfile::TempDir, Repository, Oid, Oid) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let first = repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "base",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        drop(tree);
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        std::fs::write(dir.path().join("tracked.txt"), "target\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let first_commit = repo.find_commit(first).unwrap();
+        let second = repo
+            .commit(
+                Some("refs/heads/target"),
+                &signature,
+                &signature,
+                "target",
+                &tree,
+                &[&first_commit],
+            )
+            .unwrap();
+        drop(first_commit);
+        drop(tree);
+        (dir, repo, first, second)
+    }
+
+    #[test]
+    fn dirty_checked_out_branch_fails_preflight_before_push() {
+        let (dir, repo, first, second) = repository_with_commits();
+        repo.reference("refs/heads/main", first, true, "restore test branch")
+            .unwrap();
+        repo.checkout_tree(
+            repo.find_commit(first).unwrap().as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "local work\n").unwrap();
+
+        let error = preflight_local_source_branch(&repo, "main", second).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local working-tree or index changes")
+        );
+    }
+
+    #[test]
+    fn staged_checked_out_branch_fails_preflight_before_push() {
+        let (dir, repo, first, second) = repository_with_commits();
+        repo.reference("refs/heads/main", first, true, "restore test branch")
+            .unwrap();
+        repo.checkout_tree(
+            repo.find_commit(first).unwrap().as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "staged work\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+
+        let error = preflight_local_source_branch(&repo, "main", second).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local working-tree or index changes")
+        );
+    }
+
+    #[test]
+    fn unrelated_untracked_file_is_allowed_by_preflight() {
+        let (dir, repo, first, second) = repository_with_commits();
+        repo.reference("refs/heads/main", first, true, "restore test branch")
+            .unwrap();
+        repo.checkout_tree(
+            repo.find_commit(first).unwrap().as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("unrelated.txt"), "keep me\n").unwrap();
+
+        assert_eq!(
+            preflight_local_source_branch(&repo, "main", second).unwrap(),
+            first
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("unrelated.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn colliding_untracked_file_fails_preflight() {
+        let (dir, repo, first, second) = repository_with_commits();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let second_commit = repo.find_commit(second).unwrap();
+        let blob = repo.blob(b"new file\n").unwrap();
+        let mut tree_builder = repo
+            .treebuilder(Some(&second_commit.tree().unwrap()))
+            .unwrap();
+        tree_builder.insert("new.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+        let third = repo
+            .commit(
+                Some("refs/heads/target"),
+                &signature,
+                &signature,
+                "add new file",
+                &tree,
+                &[&second_commit],
+            )
+            .unwrap();
+        drop(tree);
+        drop(second_commit);
+        repo.reference("refs/heads/main", first, true, "restore test branch")
+            .unwrap();
+        repo.checkout_tree(
+            repo.find_commit(first).unwrap().as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("new.txt"), "untracked collision\n").unwrap();
+
+        let error = preflight_local_source_branch(&repo, "main", third).unwrap_err();
+        assert!(error.to_string().contains("untracked or ignored path"));
+    }
+
+    #[test]
+    fn colliding_ignored_file_fails_preflight() {
+        let (dir, repo, first, second) = repository_with_commits();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let second_commit = repo.find_commit(second).unwrap();
+        let blob = repo.blob(b"ignored target\n").unwrap();
+        let mut tree_builder = repo
+            .treebuilder(Some(&second_commit.tree().unwrap()))
+            .unwrap();
+        tree_builder.insert("ignored.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+        let third = repo
+            .commit(
+                Some("refs/heads/target"),
+                &signature,
+                &signature,
+                "add ignored target",
+                &tree,
+                &[&second_commit],
+            )
+            .unwrap();
+        drop(tree);
+        drop(second_commit);
+        repo.reference("refs/heads/main", first, true, "restore test branch")
+            .unwrap();
+        repo.checkout_tree(
+            repo.find_commit(first).unwrap().as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".git/info/exclude"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "local ignored file\n").unwrap();
+
+        let error = preflight_local_source_branch(&repo, "main", third).unwrap_err();
+        assert!(error.to_string().contains("untracked or ignored path"));
+    }
+
+    #[test]
+    fn compare_and_swap_does_not_overwrite_a_concurrent_ref_move() {
+        let (dir, repo, first, second) = repository_with_commits();
+        let signature = Signature::now("concurrent", "concurrent@example.com").unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "concurrent\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let first_commit = repo.find_commit(first).unwrap();
+        let third = repo
+            .commit(
+                Some("refs/heads/concurrent"),
+                &signature,
+                &signature,
+                "concurrent move",
+                &tree,
+                &[&first_commit],
+            )
+            .unwrap();
+        drop(tree);
+        drop(first_commit);
+        repo.set_head_detached(first).unwrap();
+        repo.reference("refs/heads/main", third, true, "concurrent Git move")
+            .unwrap();
+
+        let error = advance_local_source_branch(&repo, "main", second, first).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            repo.find_reference("refs/heads/main")
+                .unwrap()
+                .target()
+                .unwrap(),
+            third
         );
     }
 
@@ -4751,6 +5160,7 @@ mod tests {
                 .is_none(),
             "secret.txt must never reach dest"
         );
+        refresh_checked_out_branch(&source_repo, "main");
 
         // Simulate a real PR: feature-x is merged into dest's main via a
         // genuine new commit made directly on dest — single-parent, same
