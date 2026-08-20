@@ -305,8 +305,37 @@ fn sync_pair_to_dest(
             // the source-space boundary `pending_commits` should resume
             // from — the same graft-derived ancestry decisions/0006
             // established, just read directly off source's own history
-            // instead of off a dest ref that doesn't exist.
-            let (boundary, dest_tip) = newest_dest_marker(repo, source_tip)?;
+            // instead of off a dest ref that doesn't exist. But unlike a
+            // `config.branches` entry, nothing guarantees this discovered
+            // branch (decisions/0017) shares any ancestry with dest at all —
+            // handled below (decisions/0024) the same way
+            // `already_merged_into_a_landing_branch`'s skip just above
+            // handles decisions/0018's Case 2, not decisions/0023's setup-time
+            // hard-fail for the superficially similar "no merge-base"
+            // shape: an operator never asked gitprism to manage a branch
+            // decisions/0017 merely discovered, so one such branch warns and
+            // the run moves on rather than stopping every other branch too.
+            let Some((boundary, dest_tip)) = newest_dest_marker_opt(repo, source_tip)? else {
+                // decisions/0024: a genuinely pre-existing, unrelated local
+                // branch (e.g. decisions/0021's `ai-setup` example) has no
+                // `Gitprism-Dest-Commit` trailer anywhere in its first-parent
+                // history — gitprism still won't guess at joining unrelated
+                // histories (decisions/0007), but reports it as a warning and
+                // continues rather than aborting the whole run. Distinct from
+                // `Outcome::Skipped` above: this branch will keep reappearing
+                // every run until an operator acts on it, unlike that genuinely
+                // benign, one-time no-op.
+                reporter.complete(
+                    Outcome::Warning,
+                    branch,
+                    Direction::SourceToDest,
+                    round_tripped,
+                    Some(&format!(
+                        "{branch:?} has no shared history with anything `gitprism setup` or a prior sync ever produced — combining unrelated histories is a manual `git merge --allow-unrelated-histories` job, not something gitprism will do"
+                    )),
+                );
+                return Ok(());
+            };
             (dest_tip, boundary)
         };
 
@@ -1161,9 +1190,13 @@ fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) ->
 /// there ([`dest_tip_is_accounted_for`]) answers a *safety* question, not a
 /// resume question.
 ///
-/// Always finds something for a properly set-up branch: setup's own graft
-/// commit (decisions/0006) carries this trailer too, and is always a
-/// first-parent ancestor of every branch it grafts.
+/// `Ok(None)` means no `Gitprism-Dest-Commit` trailer is reachable at all —
+/// for a properly set-up branch this never happens (setup's own graft commit,
+/// decisions/0006, always carries one and is always a first-parent ancestor),
+/// but a branch discovered on source with no ancestry to any grafted branch
+/// (decisions/0017, decisions/0024) genuinely has none. Which of those two
+/// meanings applies is the caller's call — see [`newest_dest_marker`] and
+/// [`newest_dest_marker_opt`] below.
 ///
 /// The walk is first-parent-only (decisions/0019,
 /// `Revwalk::simplify_first_parent()`) — full ancestry used to mean a
@@ -1177,7 +1210,7 @@ fn advance_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) ->
 /// of its own merges — true for GitHub/GitLab/Azure DevOps' "merge PR"
 /// button and for `git merge` run from the target branch, not guaranteed
 /// otherwise (decisions/0019's documented limitation).
-fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> {
+fn scan_for_dest_marker(repo: &Repository, source_tip: Oid) -> Result<Option<(Oid, Oid)>> {
     let mut revwalk = repo
         .revwalk()
         .context("starting source's resume-point scan")?;
@@ -1200,13 +1233,35 @@ fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> 
             let dest_oid = Oid::from_str(value).with_context(|| {
                 format!("parsing Gitprism-Dest-Commit trailer {value:?} on source commit {oid}")
             })?;
-            return Ok((oid, dest_oid));
+            return Ok(Some((oid, dest_oid)));
         }
     }
 
-    anyhow::bail!(
-        "gitprism sync: no Gitprism-Dest-Commit trailer found anywhere in source's history — has `gitprism setup` been run for this pair?"
-    )
+    Ok(None)
+}
+
+/// [`scan_for_dest_marker`], bailing when nothing is found — used only by
+/// [`dest_tip_is_accounted_for`] and [`pending_dest_commits`], whose branch
+/// always comes from `config.branches`, where `setup` (decisions/0006,
+/// decisions/0023) guarantees the trailer exists. Finding none really does
+/// mean "has `gitprism setup` been run for this pair?"
+fn newest_dest_marker(repo: &Repository, source_tip: Oid) -> Result<(Oid, Oid)> {
+    scan_for_dest_marker(repo, source_tip)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "gitprism sync: no Gitprism-Dest-Commit trailer found anywhere in source's history — has `gitprism setup` been run for this pair?"
+        )
+    })
+}
+
+/// [`scan_for_dest_marker`], `Option`-returning (mirrors
+/// [`newest_source_marker`]'s shape) — used only by `sync_pair_to_dest`'s
+/// no-dest-ref case (decisions/0017), where the branch was discovered on
+/// source rather than read from `config.branches`, so `setup` gives no
+/// guarantee it shares any ancestry with dest at all. `None` there is a real,
+/// expected outcome (decisions/0024) — a genuinely unrelated pre-existing
+/// local branch — not a bug to bail on; the caller decides how to report it.
+fn newest_dest_marker_opt(repo: &Repository, source_tip: Oid) -> Result<Option<(Oid, Oid)>> {
+    scan_for_dest_marker(repo, source_tip)
 }
 
 /// dest's own resume boundary for [`pending_commits`]: the most recent
@@ -3134,6 +3189,60 @@ mod tests {
     }
 
     #[test]
+    fn sync_pair_to_dest_warns_about_a_mirror_only_branch_with_no_shared_history() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "line one\n")]);
+        let dest_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        // `ai-setup`: a genuinely unrelated local branch, a root commit with
+        // no parents and no shared history with `main` at all — decisions
+        // /0021's own example of a stray, untouched branch never touched by
+        // `gitprism setup`.
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let tree = source_repo
+            .find_tree(empty_tree(&source_repo).unwrap())
+            .unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/ai-setup"),
+                &signature,
+                &signature,
+                "a stray pre-existing branch",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "ai-setup", &reporter)
+            .expect("a mirror-only branch with no shared history must warn, not hard-stop the run");
+
+        // Nothing must have been pushed to dest for this branch at all.
+        assert!(
+            dest_repo
+                .find_branch("ai-setup", git2::BranchType::Local)
+                .is_err(),
+            "a branch with no shared history must never be pushed to dest"
+        );
+    }
+
+    #[test]
     fn sync_pair_from_dest_still_marks_a_dest_commit_that_cherry_picks_to_a_no_op() {
         let dest_dir = tempdir().unwrap();
         let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
@@ -4209,6 +4318,67 @@ mod tests {
                 .is_err(),
             "a mirror-only branch already merged into a round-tripped branch, then \
              deleted on dest, must not be resurrected"
+        );
+    }
+
+    #[test]
+    fn run_warns_about_and_skips_a_mirror_only_branch_with_no_shared_history() {
+        // decisions/0024's own Consequences: a properly round-tripped branch
+        // and a genuinely unrelated mirror-only branch coexist in one run —
+        // the whole run still succeeds, the round-tripped branch's own sync
+        // proceeds normally, and the unrelated branch is never created on
+        // dest.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        // `ai-setup`: a genuinely unrelated local branch, a root commit with
+        // no shared history with `main` at all — decisions/0021's own
+        // example of a stray, untouched branch never touched by `gitprism
+        // setup`.
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let tree = source_repo
+            .find_tree(empty_tree(&source_repo).unwrap())
+            .unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/ai-setup"),
+                &signature,
+                &signature,
+                "a stray pre-existing branch",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path())
+            .expect("an unrelated mirror-only branch must be skipped, not abort the whole run");
+
+        // `main` — the round-tripped branch — is unaffected: still at its
+        // already-synced tip.
+        let dest_main_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip, dest_tip,
+            "main's own sync must proceed normally alongside the skipped branch"
+        );
+
+        // `ai-setup` is never created on dest.
+        assert!(
+            dest_repo
+                .find_branch("ai-setup", git2::BranchType::Local)
+                .is_err(),
+            "a mirror-only branch with no shared history must never be pushed to dest"
         );
     }
 

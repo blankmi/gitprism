@@ -112,10 +112,22 @@ reordering it ahead of where it sits in `setup.rs` today):
   `dest_tip` — a fast-forward from the ref's current target — so amending a
   pre-existing, verified-matching branch needs no new commit logic, only the relaxed
   precondition around it.
-* **Materializing the first configured branch's checkout is unaffected**: a clone
-  already has that branch's working tree populated matching dest's content, and the
-  existing "delete on-disk control files before checkout" step already handles the
-  only new file content (`.gitprism.toml`/`.gitprismignore`) checkout needs to write.
+* **Materializing the first configured branch's checkout was, in fact, broken by
+  this decision** — corrected as a bug fix, not a follow-up decision, once found: a
+  clone's working tree matches dest's content going in, but by the time
+  `checkout_branch` runs, the branch's ref has already been force-moved onto the
+  graft/merge commit (via `graft_branch`/`merge_branch`'s plumbing `repo.commit`,
+  bypassing the index), so HEAD already resolves to that same commit before checkout
+  starts. libgit2's checkout defaults its conflict/dirty baseline to HEAD's *current*
+  tree, so baseline and target were the same tree object — read as "nothing changed,"
+  it silently skipped writing anything genuinely new (`.gitprism.toml`,
+  `.gitprismignore`, and, for decisions/0023's reconciliation, any path dest
+  introduced that the pre-existing branch never had) into the index or working tree,
+  while HEAD's tree still had them — `git status` reported all of them staged for
+  deletion. Fixed by having `checkout_branch` detach HEAD to the branch's real
+  pre-run tip (or an unborn scratch ref, for a branch setup just created) before
+  checking out, so checkout's baseline reflects what was genuinely on disk instead of
+  degenerately matching the target.
 * **A repo that already had `gitprism setup` run against it once still hard-fails**,
   since its branches sit one graft commit ahead of dest's raw tip — indistinguishable,
   under this decision's check, from any other real independent history. Re-running

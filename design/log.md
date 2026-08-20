@@ -891,3 +891,123 @@ rule, not just a code-level patch.
 Final state: 114 tests passing (up from 113 pre-0023), `cargo clippy
 --all-targets` clean, `cargo fmt --check` clean. Not yet committed — pending
 the project owner's review of the working tree.
+
+## 2026-08-18 (again)
+
+**Fixed a bug**, not a new decision: right after `gitprism setup`, `git status`
+showed `.gitprism.toml` and `.gitprismignore` staged for deletion whenever the
+first configured branch was a pre-existing branch (decisions/0021's clean-clone
+case, or decisions/0023's merge-reconciliation case) rather than one setup
+created fresh. Root cause: `graft_branch`/`merge_branch` force-move the branch's
+ref straight to the new commit via a plumbing `repo.commit`, bypassing the
+index entirely; by the time `checkout_branch` ran, HEAD already resolved to
+that same commit, so libgit2's checkout — which defaults its conflict/dirty
+baseline to HEAD's current tree — saw baseline and target as literally the same
+tree object and concluded nothing needed writing. Any path the graft/merge
+added that wasn't already on disk (the control files always; for a real
+decisions/0023 reconciliation, potentially any dest-only file too) landed in
+HEAD's tree but never in the index or working tree.
+
+Wrote a failing test first
+(`run_leaves_the_index_in_sync_with_head_for_a_pre_existing_first_branch`),
+confirmed it reproduced only with a *real* prior checkout in place (a bare ref
+move isn't enough — `run_succeeds_against_a_pre_existing_branch_matching_dests_tip`
+never caught this because it never checks out anything first). Fixed
+`checkout_branch` to detach HEAD to the branch's actual pre-run tip (or an
+unborn scratch ref, reusing `rollback_branches`'s existing trick, for a branch
+setup just created) before calling `checkout_tree`, so checkout's baseline
+reflects what was really on disk instead of degenerately matching the target;
+HEAD lands back on the branch afterward. Ruled out `.force()` first — git2's own
+bundled examples hit this same "force is required to make the working
+directory actually get updated" quirk after moving a ref directly — but it
+silently overwrote the untracked-file-collision case
+(`run_fails_loudly_instead_of_overwriting_a_conflicting_untracked_file`), which
+must stay a hard error.
+
+Added a second test
+(`run_checks_out_a_dest_only_file_from_a_real_reconciliation_not_just_the_control_files`)
+proving the fix isn't control-file-specific: a genuinely new dest-only file
+introduced by a decisions/0023 merge reconciliation is now correctly
+materialized too. Corrected decisions/0021's Consequences section, which had
+asserted (incorrectly) that this case was already handled.
+
+Final state: 116 tests passing (up from 114), `cargo clippy --all-targets`
+clean, `cargo fmt --check` clean.
+
+## 2026-08-18 (a third time)
+
+Real-world bug report against a build of `52fe184` (decisions/0023): running
+`gitprism sync` on a repo `gitprism setup` had just grafted failed with "no
+Gitprism-Dest-Commit trailer found anywhere in source's history — has
+`gitprism setup` been run for this pair?" while syncing a branch named
+`ai-setup` — coincidentally the exact stray-branch name `setup.rs`'s own
+doc-comment uses as an example of a branch `config.branches` never mentions.
+
+Traced to decisions/0017's own flagged-but-unverified assumption: source→dest
+discovers and mirrors every local branch on source, and for one with no dest
+ref yet, reads its boundary off the nearest `Gitprism-Dest-Commit` trailer in
+its own first-parent history (`newest_dest_marker`) rather than fetching
+anything to check against. That trailer only exists if the branch descends
+from something `gitprism setup` grafted or merged. `ai-setup` predated
+`setup` and was never named in `config.branches`, so it never got one —
+genuinely unrelated history, not a broken setup. The bail aborted `sync`
+entirely, including every other branch's own dest→source/source→dest work.
+
+Drafted decisions/0024: initially proposed skipping the branch with a warning
+(decisions/0018-style), but reconsidered — decisions/0023 already treats the
+identical shape of problem ("no merge-base with dest at all") as a permanent
+hard-fail during `setup`, not a silent no-op, and `sync` discovering the same
+thing later shouldn't reach a different answer. Revised to a hard stop
+(decisions/0007) reported through the `Reporter` machinery decisions/0020
+built for every other outcome, mirroring the existing real-conflict code
+path: `reporter.complete(Outcome::Error, ...)`, `reporter.finish()`, then
+`anyhow::bail!`.
+
+Implemented and then re-reconsidered against real output. Two problems
+surfaced: `run()` wraps every `sync_pair_to_dest` call in
+`.with_context(|| format!("syncing {branch:?} source -> dest"))?`, so the
+hard-fail's `anyhow::bail!` propagated straight through it — `main`'s default
+`Result` printing then showed the identical detail text twice (once as the
+`Reporter`'s own line, once as a bare `Error: syncing "ai-setup" source ->
+dest` / `Caused by:` chain whose wrapped continuation lost its indent in a
+real terminal), and the hard stop aborted every other branch too, including
+every properly round-tripped one, over a branch nobody had ever named in
+`config.branches` in the first place.
+
+Revised decisions/0024 a second time: matches decisions/0018's own Case 2
+precedent instead of decisions/0023's — a mirror-only branch surprise gets a
+skip-with-note (yellow, reusing the existing `Outcome::Skipped` rather than
+adding a fourth variant), not a hard stop; decisions/0023's precedent is
+about a branch `config.branches` itself names, not one decisions/0017 merely
+discovered. `sync_pair_to_dest`'s `!dest_ref_exists` branch now calls
+`reporter.complete(Outcome::Skipped, ...)` then `return Ok(());` on finding
+no marker — no `Err`, so nothing for `run()`'s `.with_context` or `main`'s
+printer to duplicate, and the run continues past it. `config.branches`' own
+two call sites into the same marker scan (`dest_tip_is_accounted_for`,
+`pending_dest_commits`) keep their hard-fail, unaffected. Renamed the
+decision file from "...hard-fails-a-mirror-only-branch-with-no-dest-ancestry"
+to "...warns-and-continues-past-a-mirror-only-branch-with-no-shared-history"
+to match. Code fix delegated to a sub-agent, reviewed directly afterward —
+not yet marked stable, pending the user's final confirmation.
+
+Rebuilt and ran the real binary: the reused `Outcome::Skipped` printed the
+literal word "skipped", indistinguishable on a fast scan from decisions/0018's
+genuinely benign "already merged, cleaned up" skip sitting in the same run.
+Those aren't the same thing — one is a one-time no-op, the other recurs every
+run until an operator acts on it. Revised decisions/0024 a third time: added
+a new `Outcome::Warning` (yellow, same color as `Skipped` — decisions/0020
+has no fourth color to spend — but its own `"warning"` label) instead of
+reusing `Skipped`, which decisions/0024's second draft had explicitly
+deferred until "a real case shows `Skipped`'s existing meaning is actually
+inadequate" — this was that case. `sync_pair_to_dest`'s no-marker branch now
+reports `Outcome::Warning` instead of `Outcome::Skipped`; every existing
+`Skipped` call site is unchanged. Code change delegated to a sub-agent again,
+reviewed directly afterward — still not marked stable, pending the user's
+final confirmation.
+
+Revised decisions/0024 a fourth time: `Outcome::Warning` renders magenta
+instead of reusing `Skipped`'s yellow — the user asked for the two to be
+visually distinct, not just distinct in label. Extends decisions/0020's
+green/yellow/red/cyan palette with a fourth color rather than spending yellow
+on two different meanings. `progress.rs`'s `color()` match arm and its unit
+test updated accordingly; still not marked stable.

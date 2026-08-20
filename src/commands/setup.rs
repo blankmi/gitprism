@@ -307,7 +307,11 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // back every branch this run created rather than leaving grafted
     // branches behind that HEAD never actually landed on.
     if let Some(first) = config.branches.first()
-        && let Err(err) = checkout_branch(&repo, first)
+        && let Err(err) = checkout_branch(
+            &repo,
+            first,
+            touched_branches.first().and_then(|b| b.original_oid),
+        )
     {
         // The control files were just deleted above to let checkout land
         // them cleanly; a failed checkout must not leave the user without
@@ -391,16 +395,56 @@ fn rollback_branches(repo: &Repository, touched: &[TouchedBranch], original_head
     }
 }
 
-fn checkout_branch(repo: &Repository, branch: &str) -> Result<()> {
+/// `original_oid` is `branch`'s tip *before* this run touched it — `Some`
+/// for a pre-existing branch (decisions/0021, decisions/0023), `None` for
+/// one setup just created fresh. See the comment inside for why checkout
+/// needs it.
+fn checkout_branch(repo: &Repository, branch: &str, original_oid: Option<git2::Oid>) -> Result<()> {
     let refname = format!("refs/heads/{branch}");
-    repo.set_head(&refname)
-        .with_context(|| format!("setting HEAD to {refname}"))?;
+    // libgit2 checkout's conflict/dirty detection defaults its "baseline" —
+    // what it believes is already on disk — to HEAD's *current* tree. By
+    // this point `branch`'s ref already points at the graft/merge commit
+    // (the commit phase above moved it directly, bypassing the index), and
+    // HEAD already symbolically resolves to that same ref — so HEAD's tree
+    // and the checkout target are literally the same tree object. libgit2
+    // reads that as "nothing changed," so it silently skips materializing
+    // every path the graft/merge actually *added* (`.gitprism.toml`,
+    // `.gitprismignore`, and — for a real decisions/0023 reconciliation —
+    // any path dest introduced that the pre-existing local branch never
+    // had): the working tree and index never get them, while HEAD's tree
+    // does, which every subsequent `git status` reports as those paths
+    // staged for deletion.
+    //
+    // Detaching HEAD to `branch`'s own *pre-run* tip first (or, if it didn't
+    // exist before this run, to a nonexistent scratch ref — the same "make
+    // HEAD unborn" trick `rollback_branches` uses below — so checkout sees
+    // no baseline at all) gives checkout a real, non-degenerate baseline to
+    // diff the target against, so it genuinely creates what's missing
+    // instead of assuming there's nothing to do. `set_head` lands HEAD back
+    // on `branch` itself afterward, once checkout has actually run against
+    // the right comparison.
+    match original_oid {
+        Some(oid) => repo
+            .set_head_detached(oid)
+            .with_context(|| format!("detaching HEAD to {branch}'s pre-setup tip {oid}"))?,
+        None => repo
+            .set_head("refs/heads/gitprism-setup-checkout-scratch")
+            .context("detaching HEAD to an unborn scratch ref before checkout")?,
+    }
+    let commit = repo
+        .find_branch(branch, git2::BranchType::Local)
+        .with_context(|| format!("resolving branch {branch:?} to check it out"))?
+        .get()
+        .peel_to_commit()
+        .with_context(|| format!("resolving {refname}'s commit to check it out"))?;
     // Deliberately not forced: source's repo is required to be empty of
     // history above, but its working directory isn't guarded the same way,
     // so a stray local file that collides with dest's content should surface
     // as a checkout conflict, not get silently overwritten.
-    repo.checkout_head(None)
+    repo.checkout_tree(commit.as_object(), None)
         .with_context(|| format!("checking out {refname} into the working directory"))?;
+    repo.set_head(&refname)
+        .with_context(|| format!("setting HEAD to {refname}"))?;
     Ok(())
 }
 
@@ -980,6 +1024,64 @@ mod tests {
     }
 
     #[test]
+    fn run_leaves_the_index_in_sync_with_head_for_a_pre_existing_first_branch() {
+        // Reproduces the case a plain `git clone <dest-url> source` leaves
+        // behind, same setup as
+        // run_succeeds_against_a_pre_existing_branch_matching_dests_tip: HEAD
+        // is already attached to "main" before setup runs, so `checkout_branch`'s
+        // `set_head` is a no-op and only `checkout_head(None)`'s *safe*
+        // checkout (diffed against the stale pre-graft index) used to run —
+        // which silently skipped materializing the two new control-file
+        // paths into the index at all, leaving them staged as deleted
+        // relative to HEAD's tree even though both exist on disk and in HEAD.
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        git::fetch(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+        )
+        .unwrap();
+        let fetched_tip = repo
+            .find_reference("FETCH_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference("refs/heads/main", fetched_tip, true, "simulate git clone")
+            .unwrap();
+        // A real `git clone` doesn't just create the branch ref — it checks
+        // it out, populating both the index and the working directory with
+        // dest's tree (`a.txt` here). Without this step the index stays
+        // completely empty, which doesn't reproduce the bug: `checkout_branch`
+        // needs an index that already matches the *old* tree so the graft's
+        // added paths (the control files) are genuinely new relative to it.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path())
+            .expect("setup should accept a clean, unmodified clone of dest");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        for filename in [crate::config::FILENAME, exclude::FILENAME] {
+            let status = repo.status_file(Path::new(filename)).unwrap();
+            assert!(
+                !status.is_index_deleted(),
+                "{filename} must not show as staged for deletion after setup"
+            );
+            assert!(
+                status.is_empty(),
+                "{filename} must be fully in sync between HEAD, the index, and the working tree, got {status:?}"
+            );
+        }
+    }
+
+    #[test]
     fn run_fails_loudly_when_a_pre_existing_branch_has_no_history_in_common_with_dest() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
@@ -1126,6 +1228,91 @@ mod tests {
         assert!(tree.get_name("dest_only.txt").is_some());
         assert!(tree.get_name(crate::config::FILENAME).is_some());
         assert!(tree.get_name(exclude::FILENAME).is_some());
+    }
+
+    #[test]
+    fn run_checks_out_a_dest_only_file_from_a_real_reconciliation_not_just_the_control_files() {
+        // Same reconciliation as
+        // run_reconciles_a_pre_existing_branch_with_real_shared_history_into_a_merge_commit,
+        // but this time the pre-existing branch is also the *first* configured
+        // one — so it's the one checkout_branch actually materializes. The
+        // bug this guards wasn't specific to `.gitprism.toml`/`.gitprismignore`:
+        // any path the merge commit adds that the pre-existing local checkout
+        // never had (here, `dest_only.txt`, genuinely new from dest's side)
+        // is just as vulnerable to being left out of the index and working
+        // tree while still landing in HEAD's tree.
+        let dest_dir = tempdir().unwrap();
+        let base = repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "base")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        git::fetch(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+        )
+        .unwrap();
+        let fetched_base = repo
+            .find_reference("FETCH_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference("refs/heads/main", fetched_base, true, "seed local main")
+            .unwrap();
+        // Actually check out `base`, same as a real `git clone` would — an
+        // unpopulated index/working tree (just moving the ref) doesn't
+        // reproduce the bug; see
+        // run_leaves_the_index_in_sync_with_head_for_a_pre_existing_first_branch.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        // `commit_on_top` is a plumbing commit — it moves the branch ref but
+        // never touches the index or working tree, unlike a real `git
+        // commit`. Writing and staging the file directly makes "local" look
+        // like a genuine, already-materialized local commit, same as `base`
+        // above (a `checkout_head` here would hit this exact same bug a
+        // second time, for the same reason: the ref it would check out
+        // against just moved directly, underneath it). `local_only.txt`
+        // being correct isn't the bug under test — `dest_only.txt` is.
+        commit_on_top(source_dir.path(), "main", base, &[("local_only.txt", "l")]);
+        fs::write(source_dir.path().join("local_only.txt"), "l").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("local_only.txt")).unwrap();
+        index.write().unwrap();
+        let dest_tip = commit_on_top(dest_dir.path(), "main", base, &[("dest_only.txt", "d")]);
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path())
+            .expect("real, non-conflicting shared history must reconcile cleanly");
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join("dest_only.txt")).unwrap(),
+            "d",
+            "dest's new file must actually be materialized on disk, not just committed into HEAD"
+        );
+        for filename in ["shared.txt", "local_only.txt", "dest_only.txt"] {
+            let status = repo.status_file(Path::new(filename)).unwrap();
+            assert!(
+                status.is_empty(),
+                "{filename} must be fully in sync between HEAD, the index, and the working tree, got {status:?}"
+            );
+        }
+        assert!(
+            repo.status_file(Path::new(crate::config::FILENAME))
+                .unwrap()
+                .is_empty()
+        );
+
+        let main = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(main.parent_id(1).unwrap(), dest_tip);
     }
 
     #[test]

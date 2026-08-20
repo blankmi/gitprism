@@ -49,11 +49,17 @@ impl Direction {
 
 /// How one finished branch-operation turned out (decisions/0020): colored
 /// green/yellow/red respectively — the convention Cargo, Gradle, and GitHub
-/// Actions all already agree on.
+/// Actions all already agree on — plus decisions/0024's `Warning`, magenta so
+/// it never reads as `Skipped`'s yellow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Done,
     Skipped,
+    /// decisions/0024: a branch gitprism refuses to touch and will keep
+    /// re-reporting every run — distinct from `Skipped`'s genuinely benign,
+    /// one-time no-op, rendered in its own color (magenta) so the two never
+    /// read as the same thing on a fast scan.
+    Warning,
     Error,
 }
 
@@ -62,6 +68,7 @@ impl Outcome {
         match self {
             Outcome::Done => "done",
             Outcome::Skipped => "skipped",
+            Outcome::Warning => "warning",
             Outcome::Error => "error",
         }
     }
@@ -70,6 +77,7 @@ impl Outcome {
         match self {
             Outcome::Done => Color::Green,
             Outcome::Skipped => Color::Yellow,
+            Outcome::Warning => Color::Magenta,
             Outcome::Error => Color::Red,
         }
     }
@@ -562,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn plain_complete_line_names_warning_as_its_own_label_not_skipped() {
+        assert_eq!(
+            plain_complete_line(Outcome::Warning, "ai-setup", Direction::SourceToDest, None),
+            "ai-setup: warning (source -> dest)",
+            "decisions/0024: Warning must read as its own word, not reuse Skipped's label"
+        );
+    }
+
+    #[test]
     fn colored_complete_lines_matches_the_sync_x_arrow_y_dash_status_shape() {
         assert_eq!(
             colored_complete_lines(
@@ -708,6 +725,31 @@ mod tests {
             "a mirror-only branch name must not render cyan (decisions/0020 rejects dimming it too): {mirror_only:?}"
         );
         assert!(mirror_only[0].contains(&plain));
+    }
+
+    #[test]
+    fn colored_complete_lines_renders_warning_magenta_distinct_from_skipped_yellow() {
+        let warning = colored_complete_lines(
+            Outcome::Warning,
+            "ai-setup",
+            Direction::SourceToDest,
+            false,
+            None,
+            true,
+            30,
+        );
+        let expected_magenta_warning = style("warning")
+            .fg(Color::Magenta)
+            .force_styling(true)
+            .to_string();
+        assert!(
+            warning[0].contains(&expected_magenta_warning),
+            "decisions/0024: Warning renders magenta, not Skipped's yellow: {warning:?}"
+        );
+        assert!(
+            !warning[0].contains("skipped"),
+            "Warning must not reuse Skipped's label: {warning:?}"
+        );
     }
 
     #[test]
