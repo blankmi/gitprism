@@ -105,3 +105,13 @@ has) exactly once, same precondition any other git command has, and `setup` read
   command run outside a repository, rather than auto-`init`-ing one, and it refuses to
   run against a repo that already has history rather than grafting on top of or
   checking out over whatever's already there.
+
+## Security addendum (decision 0026)
+
+Versioning the configuration does not make it trusted input. Before `setup`,
+`sync`, or `resolve` parses or acts on the file, gitprism authenticates its
+exact bytes together with the root `.gitprismignore` bytes using the externally
+protected `GITPRISM_POLICY_SHA256` digest. A missing, malformed, or mismatched
+digest stops the command before Git subprocesses, ref updates, or working-tree
+changes. Symlinked or non-regular control files are rejected. Environment URL
+fallbacks remain deployment input and are deliberately outside this digest.

@@ -13,6 +13,7 @@
 //! branch needs no config entry to start syncing.
 
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 
@@ -129,6 +130,7 @@ impl Config {
     /// it's checked out from source's tree. The read mechanics don't differ
     /// between those two cases — only what's on the other end of the path
     /// does (decisions/0012).
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Config> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("reading config at {}", path.display()))?;

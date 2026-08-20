@@ -42,3 +42,14 @@ patterns) is the source of truth for what must not reach dest.
   This is simple and consistent with git-notes-free stateless resume
   ([decisions/0003](0003-mapping-state-in-commit-trailers.md)); revisit only if a
   concrete case demands otherwise.
+
+## Security addendum (decision 0026)
+
+The repository-controlled file remains the source of truth, but it is not
+trusted merely because it is versioned. Every mutating command authenticates
+the exact raw bytes of `.gitprismignore` together with `.gitprism.toml` against
+the externally protected `GITPRISM_POLICY_SHA256` value before parsing or
+performing Git work. `sync` loads that verified exclude list once per run and
+uses it for every source-to-dest branch; it never adopts a branch-tip ignore
+file. `gitprism policy-hash` prints the canonical digest for deployment
+configuration.

@@ -56,4 +56,26 @@ pub enum Commands {
         #[arg(long)]
         r#continue: bool,
     },
+
+    /// Print the protected SHA-256 digest for the checked-out policy files.
+    PolicyHash,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn policy_hash_is_a_read_only_subcommand() {
+        let cli = Cli::try_parse_from(["gitprism", "policy-hash"]).unwrap();
+        assert!(matches!(cli.command, Commands::PolicyHash));
+    }
+
+    #[test]
+    fn policy_hash_accepts_the_global_config_path() {
+        let cli =
+            Cli::try_parse_from(["gitprism", "--config", "policy.toml", "policy-hash"]).unwrap();
+        assert_eq!(cli.config, PathBuf::from("policy.toml"));
+    }
 }

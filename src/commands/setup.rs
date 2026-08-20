@@ -39,15 +39,12 @@ use anyhow::{Context, Result};
 use git2::{Repository, Signature};
 
 use crate::config::Config;
-use crate::exclude::{self, ExcludeList};
+use crate::exclude::{self};
 use crate::git;
 use crate::marker::{self, Direction as MarkerDirection};
+use crate::policy;
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
-    // Validate the pair secret before discovery, fetching, or any ref/tree
-    // mutation. A missing or malformed key must fail as a configuration
-    // error, never halfway through setup.
-    let state_key = marker::load_key()?;
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism setup must be run inside an existing git repository (none found at or above {}) — run `git init` first, same as any other git command",
@@ -78,13 +75,17 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     } else {
         source_root.join(config_path)
     };
-    let config_raw = fs::read_to_string(&config_path)
-        .with_context(|| format!("reading config at {}", config_path.display()))?;
+    let policy = policy::load(&config_path, &source_root.join(exclude::FILENAME))?;
+    let config_raw = policy.config_raw;
+    let ignore_raw = policy.ignore_raw;
+    let config = policy.config;
+    // Validate the pair secret after the immutable policy pin has passed, and
+    // before any fetch or ref/tree mutation.
+    let state_key = marker::load_key()?;
     // decisions/0021 needs config.branches available before the precondition
     // check below runs (to know which existing local branch names are
     // expected), so parsing config has to move ahead of that check —
     // reordered from where it originally sat in this function.
-    let config = Config::parse(&config_raw, &config_path)?;
     if config.branches.is_empty() {
         anyhow::bail!(
             "gitprism setup: no branches configured in {} — nothing to graft",
@@ -138,23 +139,6 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             .id();
         pre_existing_branches.insert(name, oid);
     }
-
-    // Mirrors `.gitprism.toml`'s own bootstrap handling (decisions/0012): the
-    // user prepares both control files locally, uncommitted, before running
-    // `setup`. A missing `.gitprismignore` is not an error — it just means
-    // nothing is excluded yet.
-    let ignore_path = source_root.join(exclude::FILENAME);
-    let ignore_raw = match fs::read_to_string(&ignore_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(err).with_context(|| format!("reading {}", ignore_path.display()));
-        }
-    };
-    // Fail loudly now rather than committing an exclude-list that can never
-    // actually be parsed once sync tries to use it.
-    ExcludeList::from_contents(&ignore_raw)
-        .with_context(|| format!("parsing {}", ignore_path.display()))?;
 
     // Fetch every branch's dest tip before writing anything, so a fetch
     // failure partway through never leaves some branches grafted and

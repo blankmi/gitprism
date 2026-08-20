@@ -70,6 +70,7 @@ use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git;
 use crate::marker::{self, Direction as MarkerDirection};
+use crate::policy;
 use crate::progress::{Direction, Outcome, Reporter};
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
@@ -96,7 +97,9 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     } else {
         source_root.join(config_path)
     };
-    let config = Config::load(&config_path)?;
+    let verified_policy = load_run_policy(&config_path, &source_root)?;
+    let config = verified_policy.config;
+    let exclude_list = verified_policy.exclude_list;
 
     // Checked once per run, not once per merge (decisions/0016) — an
     // operator on a too-old git gets one clear version message up front
@@ -140,8 +143,16 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // already listed (and sorted) above, before the dest→source loop, so
     // there's nothing left to (re-)discover here.
     for branch in &source_branches {
-        sync_pair_to_dest_with_key(&repo, &source_root, &config, branch, &reporter, &state_key)
-            .with_context(|| format!("syncing {branch:?} source -> dest"))?;
+        sync_pair_to_dest_with_key(
+            &repo,
+            &source_root,
+            &config,
+            branch,
+            &reporter,
+            &state_key,
+            &exclude_list,
+        )
+        .with_context(|| format!("syncing {branch:?} source -> dest"))?;
     }
 
     // Every branch is accounted for — clear the pinned bar rather than
@@ -152,6 +163,10 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     reporter.finish();
 
     Ok(())
+}
+
+fn load_run_policy(config_path: &Path, source_root: &Path) -> Result<policy::VerifiedPolicy> {
+    policy::load(config_path, &source_root.join(exclude::FILENAME))
 }
 
 /// Every local branch that exists on source right now, sorted for
@@ -193,7 +208,21 @@ fn sync_pair_to_dest(
     reporter: &Reporter,
 ) -> Result<()> {
     let key = marker::load_key()?;
-    sync_pair_to_dest_with_key(repo, source_root, config, branch, reporter, &key)
+    let source_tip = repo
+        .find_branch(branch, git2::BranchType::Local)?
+        .get()
+        .peel_to_commit()?
+        .id();
+    let exclude_list = load_current_exclude_list(repo, source_tip)?;
+    sync_pair_to_dest_with_key(
+        repo,
+        source_root,
+        config,
+        branch,
+        reporter,
+        &key,
+        &exclude_list,
+    )
 }
 
 fn sync_pair_to_dest_with_key(
@@ -203,6 +232,7 @@ fn sync_pair_to_dest_with_key(
     branch: &str,
     reporter: &Reporter,
     state_key: &marker::StateKey,
+    exclude_list: &ExcludeList,
 ) -> Result<()> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating source branch {branch:?}"))?;
@@ -220,12 +250,6 @@ fn sync_pair_to_dest_with_key(
         .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
         .id();
 
-    // The exclude-list *current* as of this sync run, loaded once — not
-    // reloaded per pending commit. Decisions/0004 is explicit that a change
-    // to it applies to whatever's being processed right now, not a
-    // historical reconstruction of what it looked like when each commit was
-    // originally made.
-    let exclude_list = load_current_exclude_list(repo, source_tip)?;
     let dest_url = config.dest_url()?;
 
     let mut attempt = 0;
@@ -254,7 +278,7 @@ fn sync_pair_to_dest_with_key(
                 config,
                 source_tip,
                 source_root,
-                &exclude_list,
+                exclude_list,
             )?
         {
             reporter.complete(
@@ -372,7 +396,7 @@ fn sync_pair_to_dest_with_key(
         let build = build_pending_dest_tip(
             repo,
             config,
-            &exclude_list,
+            exclude_list,
             boundary,
             dest_tip,
             source_tip,
@@ -856,6 +880,7 @@ fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Result<Vec<Oid
 /// whole sync run filters every pending commit with (decisions/0004: the
 /// current list applies to whatever's being processed right now, not a
 /// historical reconstruction of what it looked like at each commit).
+#[cfg(test)]
 fn load_current_exclude_list(repo: &Repository, source_tip: Oid) -> Result<ExcludeList> {
     let tree = repo
         .find_commit(source_tip)
@@ -1778,6 +1803,13 @@ mod tests {
         files: &[(&str, &str)],
         message: &str,
     ) -> Oid {
+        if let Some((_, contents)) = files.iter().find(|(name, _)| *name == exclude::FILENAME) {
+            fs::write(
+                repo.workdir().unwrap().join(exclude::FILENAME),
+                contents.as_bytes(),
+            )
+            .unwrap();
+        }
         let tip = repo
             .find_branch(branch, git2::BranchType::Local)
             .unwrap()
@@ -4179,6 +4211,7 @@ mod tests {
                 &[&graft_tip],
             )
             .unwrap();
+        fs::write(source_dir.path().join(exclude::FILENAME), "secrets/\n").unwrap();
 
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("first sync should succeed");

@@ -17,6 +17,15 @@ anything trigger-specific. So "what triggers a run" is deployment configuration,
 an architectural fork in the tool itself. This page documents the recommended GitLab
 CI setup; it isn't something gitprism's code needs to know about.
 
+# Protected policy variable
+
+Before any job invokes `setup`, `sync`, or `resolve`, check out the approved
+source revision and set the protected CI variable `GITPRISM_POLICY_SHA256` to
+the output of `gitprism policy-hash`. This variable is a deployment approval,
+not a secret. Keep it protected and update it deliberately whenever the
+versioned `.gitprism.toml` or root `.gitprismignore` changes. `policy-hash` is
+read-only and does not require `GITPRISM_STATE_KEY`.
+
 # source → dest
 
 Ordinary push-triggered GitLab CI on source's own repo. No special infrastructure:

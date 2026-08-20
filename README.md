@@ -23,7 +23,7 @@ preference.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (82 tests
+helper described below are implemented and covered by `cargo test` (140 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -101,6 +101,22 @@ url = "git@example.com:group/dest.git"
   / `GITPRISM_DEST_URL` environment variables instead — useful for
   credential-bearing or per-environment URLs you don't want committed into
   source's history.
+
+### Protected policy digest
+
+The versioned `.gitprism.toml` and root `.gitprismignore` are treated as
+untrusted repository input until their exact bytes match the protected
+`GITPRISM_POLICY_SHA256` deployment variable. Compute the value after checking
+out the approved policy:
+
+```sh
+gitprism policy-hash
+```
+
+Set that 64-character lowercase SHA-256 value in CI before `setup`, `sync`, or
+`resolve`. A policy change requires an intentional protected-variable update.
+The URL fallback variables remain deployment input and are not included in the
+policy digest.
 
 ### Mapping state key
 

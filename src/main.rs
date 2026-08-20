@@ -4,6 +4,7 @@ mod config;
 mod exclude;
 mod git;
 mod marker;
+mod policy;
 mod progress;
 
 use std::path::Path;
@@ -21,5 +22,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Resolve { branch, r#continue } => {
             commands::resolve::run(Path::new("."), &cli.config, branch, *r#continue)
         }
+        Commands::PolicyHash => commands::policy_hash::run(Path::new("."), &cli.config),
     }
 }

@@ -1030,3 +1030,10 @@ canonical HMAC-SHA256 state block keyed by `GITPRISM_STATE_KEY`. The key is
 validated before network or mutation work and removed from every Git
 subprocess environment; reserved marker-looking message lines are stripped
 before gitprism generates its authenticated block.
+
+**Update**: Decided [0026](decisions/0026-protected-versioned-policy.md) —
+versioned `.gitprism.toml` and `.gitprismignore` remain reviewable, but
+`setup`, `sync`, and `resolve` require the externally protected
+`GITPRISM_POLICY_SHA256` digest over their exact raw bytes before parsing or
+mutation. `sync` uses one verified exclude list for the entire run, and the
+read-only `gitprism policy-hash` command prints the deployment pin.

@@ -32,8 +32,10 @@ use git2::{Oid, Repository};
 
 use crate::commands::sync::{build_source_commit, pending_dest_commits};
 use crate::config::Config;
+use crate::exclude;
 use crate::git::{self, CherryPickOutcome};
 use crate::marker;
+use crate::policy;
 
 pub fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Result<()> {
     // Validate before fetching or changing the working tree.
@@ -54,7 +56,7 @@ pub fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Re
     } else {
         source_root.join(config_path)
     };
-    let config = Config::load(&config_path)?;
+    let config = policy::load(&config_path, &source_root.join(exclude::FILENAME))?.config;
     git::validate_branch_name(branch)
         .with_context(|| format!("validating requested branch {branch:?}"))?;
 
