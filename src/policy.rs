@@ -131,10 +131,19 @@ pub(crate) fn restore_control_files_exact(
         // dropping an executable control file's `100755` down to `100644`
         // on disk while the index still (correctly) points at the
         // executable blob — dirty under `core.filemode=true` despite the
-        // content being byte-exact.
+        // content being byte-exact. Git only tracks the executable bit, not
+        // group/world permissions, so this has to go in as an ordinary
+        // *creation* mode — subject to the umask, the same as any other
+        // checked-out file — rather than an exact `chmod`; the latter would
+        // widen a file to world-readable/executable under a restrictive
+        // umask (e.g. `077`) that an ordinary checkout would have honored.
         let filemode = (entry.filemode() as u32) & 0o777;
-        write_regular_file_no_follow(&workdir.join(filename), blob.content(), Some(filemode))
-            .with_context(|| format!("restoring {filename} byte-exact after checkout"))?;
+        write_regular_file_no_follow(
+            &workdir.join(filename),
+            blob.content(),
+            RestoreMode::SubjectToUmask(filemode),
+        )
+        .with_context(|| format!("restoring {filename} byte-exact after checkout"))?;
         restored.push((filename, entry.id(), entry.filemode()));
     }
     if restored.is_empty() {
@@ -184,39 +193,65 @@ pub(crate) fn restore_control_files_exact(
     Ok(())
 }
 
+/// How [`write_regular_file_no_follow`] should treat the new file's
+/// permissions — the two existing callers want genuinely different
+/// semantics, not just "with or without a mode":
+///
+/// - [`RestoreMode::SubjectToUmask`] mimics an ordinary file creation (what
+///   a real checkout does): the given mode is passed as the `open()`
+///   creation mode, so the umask constrains it exactly as it would for any
+///   other new file. This is what mirroring a *git* mode calls for — git
+///   only ever tracks the executable bit (`100644`/`100755`), so applying
+///   it verbatim would widen group/world permissions a restrictive umask
+///   (e.g. `077`) was supposed to deny.
+/// - [`RestoreMode::Exact`] applies the given mode to the still-open handle
+///   after creation, bypassing the umask entirely. This is for restoring a
+///   *previously captured* mode byte-for-byte — recovering exactly what was
+///   there before, not creating a new file the umask should have a say in.
+#[derive(Clone, Copy)]
+pub(crate) enum RestoreMode {
+    None,
+    SubjectToUmask(u32),
+    Exact(u32),
+}
+
 /// Write `bytes` to `path`, refusing to follow whatever might already be
-/// there, and — on Unix, when `mode` is given — set the resulting
-/// permissions through the still-open handle rather than by path.
-/// `fs::write` opens the path with ordinary create/truncate semantics, which
-/// follows an existing symlink (or writes through an existing hardlink)
-/// instead of replacing it — decisions/0033's recovery paths already reject
-/// that for exactly this reason. A path-based `fs::set_permissions` call
-/// after the fact reopens that same race, chmod'ing whatever now occupies
-/// `path` rather than what this call just created. Remove whatever occupies
-/// `path` first, create it fresh with `create_new`, and apply `mode` to the
-/// open `File` before dropping it, so both the write and the permission
-/// change can only ever land on the brand-new inode gitprism itself created.
+/// there, and apply `mode` per [`RestoreMode`]'s semantics — on Unix only;
+/// `mode` is ignored on other platforms. `fs::write` opens the path with
+/// ordinary create/truncate semantics, which follows an existing symlink (or
+/// writes through an existing hardlink) instead of replacing it —
+/// decisions/0033's recovery paths already reject that for exactly this
+/// reason. A path-based `fs::set_permissions` call after the fact reopens
+/// that same race, chmod'ing whatever now occupies `path` rather than what
+/// this call just created. Remove whatever occupies `path` first, create it
+/// fresh with `create_new`, and — for `RestoreMode::Exact` — apply the mode
+/// to the open `File` before dropping it, so both the write and any
+/// permission change can only ever land on the brand-new inode gitprism
+/// itself created.
 pub(crate) fn write_regular_file_no_follow(
     path: &Path,
     bytes: &[u8],
-    #[cfg(not(unix))] _mode: Option<u32>,
-    #[cfg(unix)] mode: Option<u32>,
+    mode: RestoreMode,
 ) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => fs::remove_file(path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut open_options = fs::OpenOptions::new();
+    open_options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let RestoreMode::SubjectToUmask(creation_mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(creation_mode);
+    }
+    let file = open_options.open(path)?;
     use std::io::Write as _;
     (&file).write_all(bytes)?;
     #[cfg(unix)]
-    if let Some(mode) = mode {
+    if let RestoreMode::Exact(exact_mode) = mode {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.set_permissions(fs::Permissions::from_mode(exact_mode))?;
     }
     Ok(())
 }
@@ -269,6 +304,74 @@ fn verify_digest(actual: &str, expected: &str) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The process umask is one shared global — a test that changes it to
+    /// observe the effect must hold this for its whole save/mutate/restore
+    /// window, or a concurrently running test's own file creations would see
+    /// the wrong umask too. Mirrors `config::ENV_VAR_LOCK`'s precedent for
+    /// the same problem with env vars.
+    #[cfg(unix)]
+    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_control_files_exact_constrains_the_creation_mode_by_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = UMASK_LOCK.lock().unwrap();
+        // SAFETY: `umask` is a plain libc call with no preconditions; the
+        // lock above is what makes changing this process-global safe
+        // against other tests.
+        let original_umask = unsafe { libc::umask(0o077) };
+
+        let dir = tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        let config_blob = repo
+            .blob(b"branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"unused\"\n")
+            .unwrap();
+        let ignore_blob = repo.blob(b"*.log\n").unwrap();
+        let mut tree_builder = repo.treebuilder(None).unwrap();
+        tree_builder
+            .insert(
+                crate::config::FILENAME,
+                config_blob,
+                git2::FileMode::BlobExecutable.into(),
+            )
+            .unwrap();
+        tree_builder
+            .insert(
+                crate::exclude::FILENAME,
+                ignore_blob,
+                git2::FileMode::Blob.into(),
+            )
+            .unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+
+        let result = restore_control_files_exact(&repo, &tree);
+        unsafe {
+            libc::umask(original_umask);
+        }
+        result.unwrap();
+
+        let mode_of = |filename: &str| {
+            fs::metadata(dir.path().join(filename))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode_of(crate::config::FILENAME),
+            0o700,
+            "git's executable mode (100755) must be constrained by umask 077, not applied verbatim"
+        );
+        assert_eq!(
+            mode_of(crate::exclude::FILENAME),
+            0o600,
+            "git's non-executable mode (100644) must be constrained by umask 077, not applied verbatim"
+        );
+    }
 
     #[test]
     #[cfg(unix)]

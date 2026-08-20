@@ -109,3 +109,23 @@ content:
   helper alongside the bytes. A Unix test commits a control file as
   `FileMode::BlobExecutable`, calls the restore directly, and asserts both
   the on-disk permission bits and `status_file`'s cleanliness.
+
+A third bug followed from fixing the second one naively: git only tracks
+the executable bit (`100644`/`100755`), never group/world permissions, so
+applying that mode to the handle verbatim (the same way `Exact` restores a
+*captured* mode) would widen a file under a restrictive umask (e.g. `077`)
+beyond what an ordinary checkout would have produced — the fix for "mode
+gets lost" became "mode gets too wide." `write_regular_file_no_follow` now
+takes a `RestoreMode` distinguishing the two callers' genuinely different
+intents: `SubjectToUmask` passes the mode as the `open()` creation mode, so
+the umask constrains it exactly as it would for any newly created file —
+what `restore_control_files_exact` wants, since it's mirroring what a real
+checkout produces for a git-tracked mode. `Exact` keeps applying to the
+open handle after creation, bypassing the umask — what `setup`'s own
+control-file recovery wants, since it's reproducing a previously captured
+mode byte-for-byte rather than creating a new file the umask should
+constrain. A Unix test sets `umask 077` (guarded by a mutex, following
+`config::ENV_VAR_LOCK`'s precedent for the same problem with env vars — the
+umask is one process-global, changing it unguarded would race any other
+test's own file creation) and confirms a `100755`/`100644` control file
+restores to `0700`/`0600`, not the git mode's bits verbatim.

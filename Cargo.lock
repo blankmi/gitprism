@@ -331,6 +331,7 @@ dependencies = [
  "hmac",
  "ignore",
  "indicatif",
+ "libc",
  "serde",
  "sha2",
  "tempfile",

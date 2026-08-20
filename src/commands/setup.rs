@@ -443,10 +443,18 @@ impl ControlFileSnapshot {
 }
 
 fn restore_regular_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    // `mode` must be applied through the handle `write_regular_file_no_follow`
-    // still holds open, not by a follow-up path-based `set_permissions` — the
-    // latter reopens the exact race 0033 already rejects: whatever occupies
-    // `path` by the time it runs, symlink or not, is what gets chmod'd.
+    // `mode` here is a *captured* mode from before setup touched this file —
+    // recovering it exactly is the point, not creating a new file the
+    // umask should have a say in — so this applies it through the handle
+    // `write_regular_file_no_follow` still holds open (`RestoreMode::Exact`),
+    // never by a follow-up path-based `set_permissions`: the latter reopens
+    // the exact race 0033 already rejects, chmod'ing whatever occupies
+    // `path` by the time it runs, symlink or not.
+    use crate::policy::RestoreMode;
+    let mode = match mode {
+        Some(mode) => RestoreMode::Exact(mode),
+        None => RestoreMode::None,
+    };
     crate::policy::write_regular_file_no_follow(path, bytes, mode)
 }
 

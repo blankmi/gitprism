@@ -1178,3 +1178,25 @@ helper. A new Unix test commits a control file as
 on-disk permission bits and `status_file`'s cleanliness. See 0034's
 Consequences section for detail. `cargo test`: 189 passed, 0 failed.
 `cargo clippy --all-targets`: clean. `cargo fmt --check`: clean.
+
+**Update**: A third review round caught a bug in fix (2) above: applying a
+git-tracked mode to the handle verbatim (the same way a *captured* mode is
+restored exactly) bypasses the umask, so a restrictive umask (e.g. `077`)
+that an ordinary checkout would have honored gets silently widened back to
+the git mode's raw bits (`0644`/`0755`) instead of the umask-constrained
+result (`0600`/`0700`) a real checkout would produce — git tracks only the
+executable bit, never group/world permissions, so those bits were never
+git's to dictate in the first place. Fixed by splitting
+`write_regular_file_no_follow`'s single `mode: Option<u32>` into a
+`RestoreMode` enum: `SubjectToUmask` passes the mode as the `open()`
+creation mode (umask-constrained, what `restore_control_files_exact`
+wants — mirroring a real checkout), `Exact` still applies to the open
+handle after creation (umask-bypassing, what `setup`'s own recovery
+wants — reproducing a previously captured mode byte-for-byte). Added
+`libc` as a dev-dependency (std has no umask API) for a new Unix test that
+sets `umask 077` under a mutex — following `config::ENV_VAR_LOCK`'s
+precedent, since the umask is one process-global a test can't mutate
+unguarded — and confirms a `100755`/`100644` control file restores to
+`0700`/`0600`. See 0034's Consequences section for detail. `cargo test`:
+190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
+--check`: clean.
