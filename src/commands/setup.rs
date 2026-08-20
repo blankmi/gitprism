@@ -443,23 +443,12 @@ impl ControlFileSnapshot {
 }
 
 fn restore_regular_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => fs::remove_file(path)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    crate::policy::write_regular_file_no_follow(path, bytes)?;
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
-    use std::io::Write as _;
-    file.write_all(bytes)?;
     Ok(())
 }
 
@@ -1134,6 +1123,71 @@ mod tests {
             fs::read(source_dir.path().join("a.txt")).unwrap(),
             b"line one\r\nline two\r\n",
             "an ordinary text file must still receive autocrlf checkout conversion"
+        );
+    }
+
+    #[test]
+    fn run_keeps_the_index_matching_head_when_the_control_files_own_blob_has_crlf_bytes() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("core.autocrlf", true)
+            .unwrap();
+
+        // A `--config` file authored with CRLF line endings (e.g. on
+        // Windows). gitprism commits an external config's bytes verbatim
+        // (decisions/0026), so the committed blob itself ends up containing
+        // CRLF — not just the checkout of it.
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "branches = [\"main\"]\r\n\r\n[committer]\r\nname = \"gitprism\"\r\nemail = \"gitprism@example.com\"\r\n\r\n[dest]\r\nurl = '{}'\r\n",
+            dest_dir.path().display()
+        )
+        .unwrap();
+        let config_raw = fs::read(file.path()).unwrap();
+        assert!(
+            config_raw.windows(2).any(|pair| pair == b"\r\n"),
+            "test setup bug: the fixture config must actually contain CRLF"
+        );
+
+        run(source_dir.path(), file.path()).expect("setup should succeed");
+
+        let head_tree = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let head_config_id = head_tree.get_name(crate::config::FILENAME).unwrap().id();
+
+        let config_path = source_dir.path().join(crate::config::FILENAME);
+        assert_eq!(
+            fs::read(&config_path).unwrap(),
+            config_raw,
+            "the on-disk file must stay byte-exact even though its own blob has CRLF bytes"
+        );
+
+        let index = repo.index().unwrap();
+        let index_entry = index
+            .get_path(Path::new(crate::config::FILENAME), 0)
+            .expect("the control file must be staged");
+        assert_eq!(
+            index_entry.id, head_config_id,
+            "the index must reference HEAD's actual CRLF blob, not one clean-filtered back to LF"
+        );
+
+        assert!(
+            repo.status_file(Path::new(crate::config::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "'.gitprism.toml' must be clean even though its committed blob itself contains CRLF bytes"
         );
     }
 

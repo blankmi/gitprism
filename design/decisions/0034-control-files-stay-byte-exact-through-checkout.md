@@ -67,3 +67,23 @@ the test repository itself (not the process's ambient git config) and prove
 both directions: the two control files stay byte-identical and pass a
 `policy::hash_files` check, while an ordinary tracked text file still
 receives normal CRLF conversion.
+
+The raw filesystem write bypasses git2's index, and both remaining steps
+around it turned out to need the same care 0033 already established for
+control-file recovery, not a shortcut:
+
+- The write itself uses the same no-follow, create-new pattern `setup`'s own
+  control-file recovery uses (remove whatever occupies the path, then
+  `create_new`), not a plain overwrite — a plain write follows an existing
+  symlink or writes through an existing hardlink instead of replacing it,
+  which is exactly what 0033 already rejects for control-file recovery.
+- Re-staging the index after the write must not go through
+  `Index::add_path`: it hashes through the working-tree filter's *clean*
+  side, so a control file whose own committed blob already contains CRLF
+  (a real case — an externally-authored `--config` with CRLF line endings,
+  committed byte-for-byte per 0026) would get re-normalized to LF before
+  hashing, staging a blob that differs from the one `tree`/HEAD actually
+  has. The index entry is instead pointed straight at the tree's own
+  oid/mode, with no hashing involved. A test commits such a CRLF-bearing
+  blob directly and asserts the index entry's id equals HEAD's, not just
+  that the working-tree bytes look right.

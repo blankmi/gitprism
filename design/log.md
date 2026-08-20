@@ -1147,3 +1147,17 @@ still keeps `fs::canonicalize`'s exact output everywhere — 0033's
 symlink-substitution check depends on that canonical form matching itself —
 `git::worktree_add`/`worktree_remove` now strip the verbatim prefix only for
 the literal subprocess argument they pass to `git`.
+
+**Update**: Code review on the PR caught two more bugs in
+`policy::restore_control_files_exact` itself. Re-staging via
+`Index::add_path` hashes through the working-tree filter's clean side, so a
+control file whose own committed blob already contains CRLF got
+re-normalized to LF before hashing — the index diverged from HEAD despite
+nothing having changed; fixed by pointing the index entry straight at the
+tree's own oid/mode instead of hashing anything. The raw restore write also
+followed whatever already occupied the path, including a symlink or
+hardlink planted there between checkout and restore — inconsistent with
+0033's no-follow stance; fixed by reusing `setup`'s own remove-then-
+`create_new` recovery pattern, now shared as
+`policy::write_regular_file_no_follow`. See 0034's Consequences section for
+detail.

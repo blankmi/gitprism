@@ -120,9 +120,15 @@ pub(crate) fn restore_control_files_exact(
         let blob = repo
             .find_blob(entry.id())
             .with_context(|| format!("reading the {filename} blob to restore it exactly"))?;
-        fs::write(workdir.join(filename), blob.content())
+        // decisions/0033's recovery paths never trust a plain overwrite of an
+        // existing path — something racing checkout could have replaced it
+        // with a symlink or hardlink pointing outside the repository between
+        // checkout finishing and this restore running. Remove whatever is
+        // there first and recreate it fresh, the same no-follow pattern
+        // `setup`'s own control-file recovery already uses.
+        write_regular_file_no_follow(&workdir.join(filename), blob.content())
             .with_context(|| format!("restoring {filename} byte-exact after checkout"))?;
-        restored.push(filename);
+        restored.push((filename, entry.id(), entry.filemode()));
     }
     if restored.is_empty() {
         return Ok(());
@@ -130,22 +136,66 @@ pub(crate) fn restore_control_files_exact(
     // The raw write above bypasses git2's index entirely, so without
     // re-staging, the index still carries whatever checkout's own
     // (possibly filtered) write hashed to — leaving these paths reported
-    // dirty (`WT_MODIFIED`) forever after, even though nothing meaningful
-    // changed, tripping every clean-working-tree guard `setup`/`sync` rely
-    // on. `Index::add_path` hashes the file's current on-disk bytes with no
-    // filtering of its own, so re-staging what was just written reproduces
-    // exactly the blob id already in `tree`.
+    // dirty forever after, even though nothing meaningful changed, tripping
+    // every clean-working-tree guard `setup`/`sync` rely on.
+    //
+    // Re-staging via `Index::add_path` would reintroduce the same problem:
+    // libgit2 hashes through the *clean* side of the working-tree filter
+    // pipeline (`GIT_FILTER_TO_ODB`), not a raw hash of the on-disk bytes.
+    // For an ordinary LF-stored control file that's a no-op, but a control
+    // file whose blob itself already contains CRLF (e.g. authored on
+    // Windows and committed byte-for-byte per decisions/0026) would get
+    // clean-filtered back to LF before hashing, staging a *different* blob
+    // than the one just written to disk and than the one `tree` already
+    // has — the index would diverge from HEAD despite nothing having
+    // changed. Bypass hashing entirely and point the index straight at the
+    // oid/mode `tree` already has for this path.
     let mut index = repo
         .index()
         .context("opening the index to re-stage restored control files")?;
-    for filename in restored {
+    for (filename, id, filemode) in restored {
         index
-            .add_path(Path::new(filename))
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: filemode as u32,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id,
+                flags: 0,
+                flags_extended: 0,
+                path: filename.as_bytes().to_vec(),
+            })
             .with_context(|| format!("re-staging {filename} after restoring it exactly"))?;
     }
     index
         .write()
         .context("writing the index after restoring control files exactly")?;
+    Ok(())
+}
+
+/// Write `bytes` to `path`, refusing to follow whatever might already be
+/// there. `fs::write` opens the path with ordinary create/truncate
+/// semantics, which follows an existing symlink (or writes through an
+/// existing hardlink) instead of replacing it — decisions/0033's recovery
+/// paths already reject that for exactly this reason. Remove whatever
+/// occupies `path` first, then create it fresh with `create_new`, so this
+/// write can only ever land on a brand-new inode gitprism itself created.
+pub(crate) fn write_regular_file_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    use std::io::Write as _;
+    file.write_all(bytes)?;
     Ok(())
 }
 
