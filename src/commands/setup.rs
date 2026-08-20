@@ -163,7 +163,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let mut branch_plans = Vec::with_capacity(config.branches.len());
     for branch in &config.branches {
         git::fetch(&source_root, &dest_url, branch)
-            .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
+            .with_context(|| format!("fetching dest branch {branch:?} from configured remote"))?;
         // FETCH_HEAD gets overwritten by the next fetch, so resolve it to a
         // concrete oid right away rather than re-reading it later.
         let dest_tip = repo

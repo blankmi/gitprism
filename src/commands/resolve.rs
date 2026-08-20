@@ -52,6 +52,8 @@ pub fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Re
         source_root.join(config_path)
     };
     let config = Config::load(&config_path)?;
+    git::validate_branch_name(branch)
+        .with_context(|| format!("validating requested branch {branch:?}"))?;
 
     let branch = config
         .branches
@@ -104,7 +106,7 @@ fn resolve_start(
 
     let dest_url = config.dest_url()?;
     git::fetch(source_root, &dest_url, branch)
-        .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
+        .with_context(|| format!("fetching dest branch {branch:?} from configured remote"))?;
     let dest_tip = repo
         .find_reference("FETCH_HEAD")
         .context("reading FETCH_HEAD after fetch")?
@@ -189,7 +191,7 @@ fn resolve_continue(
         .id();
     let dest_url = config.dest_url()?;
     git::fetch(source_root, &dest_url, branch)
-        .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
+        .with_context(|| format!("fetching dest branch {branch:?} from configured remote"))?;
     let dest_tip = repo
         .find_reference("FETCH_HEAD")
         .context("reading FETCH_HEAD after fetch")?
@@ -313,7 +315,7 @@ fn finish(
     match git::push(source_root, &source_url, new_oid, branch)? {
         git::PushOutcome::Accepted => Ok(()),
         git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
-            "gitprism resolve: {branch:?} was resolved and committed locally, but pushing it to source was rejected as a non-fast-forward — fetch/rebase source and push {branch:?} to {source_url:?} manually"
+            "gitprism resolve: {branch:?} was resolved and committed locally, but pushing it to the configured source remote was rejected as a non-fast-forward — fetch/rebase source and push {branch:?} manually"
         ),
     }
 }

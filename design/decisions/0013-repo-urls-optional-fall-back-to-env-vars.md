@@ -67,3 +67,16 @@ to remember instead of two.
 * Local/manual runs outside CI need the env var(s) exported by hand if the committed
   config omits the URL(s) — an ergonomics cost accepted deliberately in exchange for
   not committing secrets.
+
+## Implementation-hardening addendum (2026-08-20)
+
+Resolved remote values are never included in gitprism-authored errors. Git
+diagnostics redact the exact configured remote before bounded terminal-safe
+framing, and network subprocesses set `GIT_TERMINAL_PROMPT=0`; this preserves
+credential-helper behavior without hanging unattended runs or echoing URL
+credentials.
+
+The committed configuration rejects unknown fields, empty committer identity,
+and empty, option-like, or control-bearing explicit URL values. Environment
+URLs remain lazy because they are intentionally resolved only when a direction
+needs its remote.

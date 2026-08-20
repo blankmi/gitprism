@@ -46,3 +46,10 @@ Refetch and recompute from scratch, with a bounded number of retries.
 * A bounded retry count is needed so a pathologically contended dest (constant pushes
   from elsewhere) fails loudly eventually rather than retrying forever — exact bound
   is an implementation detail, not a design fork.
+
+## Implementation-hardening addendum (2026-08-20)
+
+The retryable push outcome is identified from `git push --porcelain`'s stable
+ref-status record (`!` with `[rejected]`), while `[remote rejected]` and other
+statuses remain ordinary failures. Human-readable reason text is never used
+for control flow, so localization cannot change race handling.

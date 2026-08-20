@@ -12,6 +12,7 @@
 //! time and mirrors each one to dest under its own name, so a brand-new
 //! branch needs no config entry to start syncing.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -38,6 +39,7 @@ const SOURCE_URL_ENV: &str = "GITPRISM_SOURCE_URL";
 const DEST_URL_ENV: &str = "GITPRISM_DEST_URL";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub committer: Committer,
     #[serde(default)]
@@ -51,6 +53,7 @@ pub struct Config {
 /// The identity gitprism stamps as committer on every commit it creates,
 /// preserving the original author instead (decisions/0010).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Committer {
     pub name: String,
     pub email: String,
@@ -60,6 +63,7 @@ pub struct Committer {
 /// it's committed *inside* source itself — a credential-bearing or
 /// per-environment URL belongs in `GITPRISM_SOURCE_URL`, not source's history.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     pub url: Option<String>,
 }
@@ -67,6 +71,7 @@ pub struct Source {
 /// Where source→dest pushes to. Optional for the same reason as [`Source`]
 /// (decisions/0013) — falls back to `GITPRISM_DEST_URL`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Dest {
     pub url: Option<String>,
 }
@@ -78,7 +83,43 @@ impl Config {
     /// bytes it read off disk for the graft commit's blob (decisions/0012),
     /// without reading the file a second time.
     pub fn parse(raw: &str, path: &Path) -> Result<Config> {
-        toml::from_str(raw).with_context(|| format!("parsing config at {}", path.display()))
+        let config: Config =
+            toml::from_str(raw).with_context(|| format!("parsing config at {}", path.display()))?;
+        if config.committer.name.is_empty() || config.committer.email.is_empty() {
+            anyhow::bail!(
+                "config at {} requires non-empty committer name and email",
+                path.display()
+            );
+        }
+        for (field, url) in [
+            ("[source].url", config.source.url.as_deref()),
+            ("[dest].url", config.dest.url.as_deref()),
+        ] {
+            if let Some(url) = url
+                && (url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control))
+            {
+                anyhow::bail!("config at {} contains an invalid {field}", path.display());
+            }
+        }
+        let mut seen = HashSet::with_capacity(config.branches.len());
+        for branch in &config.branches {
+            if branch.is_empty() {
+                anyhow::bail!("config at {} contains an empty branch name", path.display());
+            }
+            crate::git::validate_branch_name(branch).with_context(|| {
+                format!(
+                    "validating configured branch {branch:?} in {}",
+                    path.display()
+                )
+            })?;
+            if !seen.insert(branch) {
+                anyhow::bail!(
+                    "config at {} contains duplicate branch name {branch:?}",
+                    path.display()
+                );
+            }
+        }
+        Ok(config)
     }
 
     /// Load from an arbitrary filesystem path.
@@ -190,6 +231,35 @@ mod tests {
         let err = Config::load(file.path()).expect_err("malformed toml must not silently succeed");
 
         assert!(err.to_string().contains("parsing config"));
+    }
+
+    #[test]
+    fn load_rejects_empty_invalid_and_duplicate_branches_before_use() {
+        for branches in [
+            r#"branches = [""]"#,
+            r#"branches = ["-upload-pack=touch /tmp/pwned"]"#,
+            r#"branches = ["main", "main"]"#,
+        ] {
+            let file = write_config(&format!(
+                "{branches}\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\""
+            ));
+            let err = Config::load(file.path()).expect_err("invalid branch config must fail");
+            assert!(err.to_string().contains("branch"));
+        }
+    }
+
+    #[test]
+    fn load_rejects_unknown_fields_empty_identity_and_invalid_configured_remotes() {
+        for raw in [
+            "extra = true\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"",
+            "[committer]\nname = \"\"\nemail = \"gitprism@example.com\"",
+            "[committer]\nname = \"gitprism\"\nemail = \"\"",
+            "[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n[dest]\nurl = \"\"",
+            "[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n[dest]\nurl = \"--upload-pack=printf\"",
+        ] {
+            let file = write_config(raw);
+            Config::load(file.path()).expect_err("invalid semantic config must fail");
+        }
     }
 
     #[test]

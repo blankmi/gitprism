@@ -167,6 +167,8 @@ fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
                 .name()
                 .context("reading a local branch's name")?
                 .context("a local branch has a non-UTF-8 name gitprism can't mirror by")?;
+            crate::git::validate_branch_name(name)
+                .with_context(|| format!("validating local branch {name:?}"))?;
             Ok(name.to_string())
         })
         .collect::<Result<Vec<_>>>()?;
@@ -186,6 +188,8 @@ fn sync_pair_to_dest(
     branch: &str,
     reporter: &Reporter,
 ) -> Result<()> {
+    git::validate_branch_name(branch)
+        .with_context(|| format!("validating source branch {branch:?}"))?;
     // decisions/0020: cyan in a completed line iff round-tripped (named in
     // `config.branches`) — computed once here and reused for every
     // `reporter` call this function makes, rather than re-derived at each
@@ -268,8 +272,9 @@ fn sync_pair_to_dest(
                     "fetching dest (mirror-only branch, not round-tripped)",
                 );
             }
-            git::fetch(source_root, &dest_url, branch)
-                .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
+            git::fetch(source_root, &dest_url, branch).with_context(|| {
+                format!("fetching dest branch {branch:?} from configured remote")
+            })?;
             let dest_tip = repo
                 .find_reference("FETCH_HEAD")
                 .context("reading FETCH_HEAD after fetch")?
@@ -964,6 +969,8 @@ fn sync_pair_from_dest(
     branch: &str,
     reporter: &Reporter,
 ) -> Result<()> {
+    git::validate_branch_name(branch)
+        .with_context(|| format!("validating configured branch {branch:?}"))?;
     let dest_url = config.dest_url()?;
 
     let mut attempt = 0;
@@ -988,7 +995,7 @@ fn sync_pair_from_dest(
             "fetching dest (checking for independent content to reflect into source)",
         );
         git::fetch(source_root, &dest_url, branch)
-            .with_context(|| format!("fetching dest branch {branch:?} from {dest_url:?}"))?;
+            .with_context(|| format!("fetching dest branch {branch:?} from configured remote"))?;
         let dest_tip = repo
             .find_reference("FETCH_HEAD")
             .context("reading FETCH_HEAD after fetch")?
@@ -1025,7 +1032,7 @@ fn sync_pair_from_dest(
                 "refetching source (lost a push race, recomputing)",
             );
             git::fetch(source_root, &source_url, branch).with_context(|| {
-                format!("fetching source branch {branch:?} from {source_url:?}")
+                format!("fetching source branch {branch:?} from configured remote")
             })?;
             repo.find_reference("FETCH_HEAD")
                 .context("reading FETCH_HEAD after fetch")?

@@ -4,12 +4,122 @@
 //! agent/`GIT_ASKPASS` handling a human running `git` would get, rather than
 //! a library reimplementation of it.
 
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
 
-/// Fetch `refspec` from `url` into `repo_dir`'s local object database,
+const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+
+fn validate_remote(url: &str) -> Result<()> {
+    if url.is_empty() {
+        anyhow::bail!("configured remote is empty");
+    }
+    if url.starts_with('-') {
+        anyhow::bail!("configured remote cannot start with '-'");
+    }
+    if url.chars().any(char::is_control) {
+        anyhow::bail!("configured remote contains control characters");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_branch_name(branch: &str) -> Result<()> {
+    if !git2::Branch::name_is_valid(branch)
+        .with_context(|| format!("validating branch {branch:?}"))?
+    {
+        anyhow::bail!("invalid branch name {branch:?}");
+    }
+    Ok(())
+}
+
+fn git_diagnostic(raw: &[u8], remote: Option<&str>) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let redacted = remote.map_or_else(
+        || text.to_string(),
+        |remote| text.replace(remote, "<configured remote>"),
+    );
+    let mut framed = String::new();
+    for character in redacted.chars() {
+        let escaped = if character.is_control() {
+            if (character as u32) <= 0xff {
+                format!("\\x{:02X}", character as u32)
+            } else {
+                format!("\\u{{{:X}}}", character as u32)
+            }
+        } else {
+            character.to_string()
+        };
+        if framed.len() + escaped.len() > MAX_DIAGNOSTIC_BYTES {
+            framed.push('…');
+            break;
+        }
+        framed.push_str(&escaped);
+    }
+    framed
+}
+
+fn is_non_fast_forward_rejection(raw: &[u8]) -> bool {
+    String::from_utf8_lossy(raw).lines().any(|line| {
+        let mut fields = line.split('\t');
+        let status = fields.next();
+        let reason = fields.next_back().unwrap_or_default();
+        status == Some("!") && reason.starts_with("[rejected]")
+    })
+}
+
+fn run_git_output(mut command: Command) -> Result<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().context("starting git subprocess")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capturing git subprocess stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capturing git subprocess stderr")?;
+    let stdout_thread = std::thread::spawn(|| read_bounded(stdout));
+    let stderr_thread = std::thread::spawn(|| read_bounded(stderr));
+    let status = child.wait().context("waiting for git subprocess")?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading git subprocess stdout panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading git subprocess stderr panicked"))??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(MAX_DIAGNOSTIC_BYTES + 1);
+    let mut buffer = [0; 4096];
+    let mut total: usize = 0;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .context("reading git diagnostics")?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_DIAGNOSTIC_BYTES + 1 - retained.len();
+        retained.extend_from_slice(&buffer[..count.min(remaining)]);
+        total = total.saturating_add(count);
+        if total > MAX_DIAGNOSTIC_BYTES + 1 {
+            retained.truncate(MAX_DIAGNOSTIC_BYTES + 1);
+        }
+    }
+    Ok(retained)
+}
+
+/// Fetch `branch` from `url` into `repo_dir`'s local object database,
 /// landing at `FETCH_HEAD` — same as running `git fetch <url> <refspec>` by
 /// hand inside `repo_dir`. Quiet: git's own "From <url> / * branch ... ->
 /// FETCH_HEAD" summary is raw plumbing output with no framing about which
@@ -18,19 +128,28 @@ use anyhow::{Context, Result};
 /// their own labeled progress line instead (see `sync.rs`). Real failures
 /// (bad ref, network, auth) still surface: `-q` only silences the progress
 /// summary, not errors.
-pub fn fetch(repo_dir: &Path, url: &str, refspec: &str) -> Result<()> {
-    let status = Command::new("git")
+pub fn fetch(repo_dir: &Path, url: &str, branch: &str) -> Result<()> {
+    validate_remote(url)?;
+    validate_branch_name(branch)?;
+    let source_ref = format!("refs/heads/{branch}");
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("fetch")
         .arg("-q")
+        .arg("--")
         .arg(url)
-        .arg(refspec)
-        .status()
-        .with_context(|| format!("running git fetch {url} {refspec}"))?;
+        .arg(&source_ref)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_git_output(command).context("running git fetch from configured remote")?;
 
-    if !status.success() {
-        anyhow::bail!("git fetch {url} {refspec} failed ({status})");
+    if !output.status.success() {
+        let diagnostic = git_diagnostic(&output.stderr, Some(url));
+        anyhow::bail!(
+            "git fetch branch {branch:?} from configured remote failed ({}): {diagnostic}",
+            output.status
+        );
     }
 
     Ok(())
@@ -43,26 +162,37 @@ pub fn fetch(repo_dir: &Path, url: &str, refspec: &str) -> Result<()> {
 /// setup` (decisions/0017 — a brand-new feature branch, say) has no
 /// same-named counterpart on dest until this very sync run creates one, and
 /// [`fetch`]'s own "no such ref" failure is the wrong shape for that case.
-pub fn remote_ref_exists(repo_dir: &Path, url: &str, refspec: &str) -> Result<bool> {
-    let refname = format!("refs/heads/{refspec}");
-    let status = Command::new("git")
+pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<bool> {
+    validate_remote(url)?;
+    validate_branch_name(branch)?;
+    let refname = format!("refs/heads/{branch}");
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("ls-remote")
         .arg("--exit-code")
+        .arg("--")
         .arg(url)
         .arg(&refname)
         .stdout(std::process::Stdio::null())
-        .status()
-        .with_context(|| format!("running git ls-remote --exit-code {url} {refname}"))?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output =
+        run_git_output(command).context("running git ls-remote against configured remote")?;
 
-    match status.code() {
+    match output.status.code() {
         Some(0) => Ok(true),
         // git's own convention for `--exit-code`: 2 means the query
         // succeeded but matched nothing, distinct from any other failure
         // (bad URL, network, auth, ...).
         Some(2) => Ok(false),
-        _ => anyhow::bail!("git ls-remote --exit-code {url} {refname} failed ({status})"),
+        _ => {
+            let diagnostic = git_diagnostic(&output.stderr, Some(url));
+            anyhow::bail!(
+                "git ls-remote for branch {branch:?} against configured remote failed ({}): {diagnostic}",
+                output.status
+            )
+        }
     }
 }
 
@@ -87,15 +217,20 @@ pub fn push(
     commit: git2::Oid,
     dest_branch: &str,
 ) -> Result<PushOutcome> {
+    validate_remote(url)?;
+    validate_branch_name(dest_branch)?;
     let refspec = format!("{commit}:refs/heads/{dest_branch}");
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_dir)
         .arg("push")
+        .arg("--porcelain")
+        .arg("--")
         .arg(url)
         .arg(&refspec)
-        .output()
-        .with_context(|| format!("running git push {url} {refspec}"))?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_git_output(command).context("running git push to configured remote")?;
 
     if output.status.success() {
         return Ok(PushOutcome::Accepted);
@@ -105,15 +240,20 @@ pub fn push(
     // case decisions/0009 wants recomputed and retried. Everything else
     // (bad credentials, a rejecting pre-receive hook, a dropped connection,
     // ...) must surface immediately instead of being silently retried.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("[rejected]")
-        && (stderr.contains("fetch first") || stderr.contains("non-fast-forward"))
-    {
+    if is_non_fast_forward_rejection(&output.stdout) {
         return Ok(PushOutcome::RejectedNotFastForward);
     }
 
+    let diagnostic = git_diagnostic(
+        if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        },
+        Some(url),
+    );
     anyhow::bail!(
-        "git push {refspec} to {url} failed ({}): {stderr}",
+        "git push branch {dest_branch:?} to configured remote failed ({}): {diagnostic}",
         output.status
     );
 }
@@ -209,7 +349,7 @@ pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
         }
         Some(1) => Ok(CherryPickOutcome::Conflict),
         _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = git_diagnostic(&output.stderr, None);
             anyhow::bail!(
                 "git cherry-pick --continue failed ({}): {stderr}",
                 output.status
@@ -230,7 +370,7 @@ fn has_unmerged_paths(repo_dir: &Path) -> Result<bool> {
         .output()
         .context("checking for unmerged paths")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!(
             "git ls-files --unmerged failed ({}): {stderr}",
             output.status
@@ -256,7 +396,7 @@ fn finish_empty_continue(repo_dir: &Path) -> Result<()> {
         .output()
         .context("running git commit --allow-empty to finish an empty cherry-pick resolution")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!(
             "git commit --allow-empty failed ({}): {stderr}",
             output.status
@@ -276,7 +416,7 @@ fn cherry_pick_outcome(
         // unexpected code.
         Some(1) => Ok(CherryPickOutcome::Conflict),
         _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = git_diagnostic(&output.stderr, None);
             anyhow::bail!("{} failed ({}): {stderr}", describe(), output.status)
         }
     }
@@ -380,7 +520,7 @@ pub fn merge_tree(
             Ok(MergeTreeOutcome::Conflict { paths })
         }
         _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = git_diagnostic(&output.stderr, None);
             anyhow::bail!(
                 "git merge-tree --write-tree --merge-base={base} {ours} {theirs} failed ({}): {stderr}",
                 output.status
@@ -412,7 +552,7 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
         .output()
         .context("running git --version")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!("git --version failed ({}): {stderr}", output.status);
     }
 
@@ -544,6 +684,33 @@ mod tests {
         assert!(err.to_string().contains("git fetch"));
     }
 
+    #[test]
+    fn fetch_rejects_a_raw_refspec_before_touching_fetch_head() {
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        let err = fetch(
+            source_dir.path(),
+            "/does/not/matter",
+            "refs/heads/main:refs/heads/other",
+        )
+        .expect_err("fetch accepts branch names, not caller-provided refspecs");
+
+        assert!(err.to_string().contains("invalid branch name"));
+        assert!(!source_dir.path().join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn remote_operands_starting_with_a_dash_are_rejected_before_git_runs() {
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        let err = remote_ref_exists(source_dir.path(), "--upload-pack=printf", "main")
+            .expect_err("remote options must not be passed through to git");
+
+        assert!(err.to_string().contains("cannot start with '-'"));
+    }
+
     /// A commit built directly in `repo`'s object database, without updating
     /// any ref — the shape `sync` actually pushes (a bare oid, not a local
     /// branch).
@@ -665,6 +832,35 @@ mod tests {
         .expect_err("an unreachable remote must not silently succeed");
 
         assert!(err.to_string().contains("git push"));
+    }
+
+    #[test]
+    fn push_porcelain_rejection_parser_distinguishes_non_fast_forward() {
+        assert!(is_non_fast_forward_rejection(
+            b"!\tHEAD:refs/heads/main\t[rejected] (fetch first)\nDone\n"
+        ));
+        assert!(is_non_fast_forward_rejection(
+            b"!\tHEAD:refs/heads/main\t[rejected] (non-fast-forward)\n"
+        ));
+        assert!(is_non_fast_forward_rejection(
+            b"!\tHEAD:refs/heads/main\t[rejected] (razlog lokalizovan)\n"
+        ));
+        assert!(!is_non_fast_forward_rejection(
+            b"!\tHEAD:refs/heads/main\t[remote rejected] (hook declined)\n"
+        ));
+    }
+
+    #[test]
+    fn git_diagnostics_are_bounded_redacted_and_terminal_safe() {
+        let raw = b"failed\x1b[31m to push\x1b[0m to 'https://user:secret@example.test/r.git'\n";
+        let diagnostic = git_diagnostic(raw, Some("https://user:secret@example.test/r.git"));
+        assert!(!diagnostic.contains("secret"));
+        assert!(!diagnostic.contains('\x1b'));
+        assert!(diagnostic.contains("\\x1B"));
+
+        let large = vec![b'x'; MAX_DIAGNOSTIC_BYTES + 1];
+        let diagnostic = git_diagnostic(&large, None);
+        assert!(diagnostic.len() <= MAX_DIAGNOSTIC_BYTES + "…".len());
     }
 
     /// A non-bare repo with one commit on `branch` containing `files`,

@@ -1011,3 +1011,15 @@ visually distinct, not just distinct in label. Extends decisions/0020's
 green/yellow/red/cyan palette with a fourth color rather than spending yellow
 on two different meanings. `progress.rs`'s `color()` match arm and its unit
 test updated accordingly; still not marked stable.
+
+## 2026-08-20 — subprocess and configuration boundary hardening
+
+Implemented the review's Git/process hardening: configured branches are
+validated for Git branch syntax and uniqueness before any subprocess or
+mutation; fetch accepts only validated branch names and constructs a fully
+qualified `refs/heads/<branch>` source ref; remote operands are rejected when
+they begin with `-` and Git's `--` terminator is used. Pushes use
+`--porcelain`, parse stable ref-status records for non-fast-forward retries,
+and disable interactive prompting. Git diagnostics are bounded, credential
+redacted, and control-character escaped. Updated decisions 0002, 0009, and
+0013 with implementation-hardening addenda.

@@ -64,3 +64,14 @@ of the "more idiomatic pure-Rust" one.
 * If `git2-rs`'s libgit2 dependency ever becomes a real problem (e.g. the pending
   libgit2 v2.0 ABI break), the local half can be revisited independently of the
   push/fetch half, since they're already separated.
+
+## Implementation-hardening addendum (2026-08-20)
+
+Remote subprocesses keep the hybrid boundary but treat every remote and branch
+as data: branch names are validated before any Git subprocess or repository
+mutation, remote operands beginning with `-` are rejected, and Git's `--`
+terminator is placed before the remote operand. Fetch constructs only the
+fully-qualified `refs/heads/<branch>` source ref; callers cannot supply a raw
+refspec. Network operations disable interactive prompting and frame, redact,
+bound, and escape captured diagnostics. Push retry classification consumes
+Git's `--porcelain` ref-status records rather than localized prose.
