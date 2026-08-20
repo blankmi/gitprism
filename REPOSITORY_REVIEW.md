@@ -4,33 +4,47 @@ Review date: 2026-08-20
 
 ## 1. Executive Summary
 
-gitprism has a coherent core design, strong normal-path tests, idiomatic Rust, and careful fast-forward and conflict handling. The hybrid `git2`/Git CLI approach is reasonable for this tool.
+gitprism has a coherent core design, strong repository-level tests, idiomatic
+Rust, and careful fast-forward and operator-driven conflict handling. The
+hybrid `git2`/Git CLI approach remains reasonable for this tool.
 
-It is **not ready for production distribution**. One confirmed Git option-injection path can execute an attacker-selected command, and several high-severity integrity/confidentiality issues remain around raw refspecs, forgeable state trailers, repository-controlled policy, credential-bearing URL disclosure, and incomplete conflict recovery.
+The original review's confirmed critical/high implementation findings have
+been remediated. The project is still **not ready for production distribution**:
+it has not run against a real production repository pair, cross-platform CI has
+not yet executed in this environment, and license, repository identity,
+release-tag, artifact-signing and packaging decisions remain intentionally open.
 
 | Area | Score | Rationale |
 |---|---:|---|
-| Architecture | 7/10 | Clear decisions and separation, but repository-controlled policy/state needs a stronger trust model. |
-| Rust Code Quality | 8/10 | Idiomatic `Result` use, contextual errors, no production `unsafe`, clean Clippy. |
-| Git Integration | 6/10 | Good merge-tree and fast-forward model; unsafe argument boundaries and textual status parsing remain. |
-| Security | 4/10 | Confirmed command execution through Git option injection; credential and policy risks. |
-| Reliability | 6/10 | Strong happy-path behavior, but partial-failure and concurrency gaps remain. |
-| Testing | 8/10 | 120 passing tests with realistic repositories; hostile-input and failure-injection coverage is missing. |
-| Cross-Platform Robustness | 5/10 | Mostly portable code, but only macOS verified, non-UTF-8 objects fail, and Git >=2.45 is not documented prominently. |
-| Maintainability | 6/10 | Excellent rationale documentation; `sync.rs` and embedded test modules are very large. |
-| Production Readiness | 4/10 | Security blockers plus no CI/release/packaging/license metadata. |
+| Architecture | 8/10 | Decisions, authenticated policy, operation locking and bounded work are explicit; `sync.rs`/`resolve.rs` remain large. |
+| Rust Code Quality | 8/10 | Contextual `Result` propagation, no production `unsafe`, byte-aware boundaries and static limits; final CI still needs to execute. |
+| Git Integration | 8/10 | Git arguments, refs, porcelain push status, Git version checks and subprocess limits are centralized and tested. |
+| Security | 8/10 | Original command-injection, marker-forgery, policy-integrity and credential-disclosure paths are mitigated; Git itself remains trusted. |
+| Reliability | 8/10 | CAS ref updates, common-directory locking, rollback aggregation, deadlines and resource limits cover the major failure paths. |
+| Testing | 8/10 | 186 tests cover hostile inputs and rollback/concurrency cases; real-pair and cross-platform execution remain pending. |
+| Cross-Platform Robustness | 7/10 | Unix byte paths are preserved, unsupported Windows bytes fail clearly, and CI covers three OSes; CI has not run here yet. |
+| Maintainability | 6/10 | Rationale is strong, but the two command modules and inline tests remain oversized. |
+| Production Readiness | 6/10 | CI, dependency policy and metadata are present; legal release metadata, packaging, signing and real deployment validation remain open. |
 
-Release recommendation: **No-go until P0 and P1 findings are resolved.**
+Release recommendation: **Conditional no-go for public production distribution.**
+No confirmed CRITICAL or HIGH implementation finding remains in the reviewed
+paths, but distribution should wait for owner decisions, a license and release
+process, executed Linux/macOS/Windows CI, and a real repository-pair pilot.
 
 Verification performed:
 
-- `cargo fmt --all -- --check`: passed.
-- Strict workspace Clippy with all targets/features: passed.
-- `cargo test --workspace --all-features`: 120 passed.
-- Locked release build: passed.
-- `cargo audit` and `cargo deny`: not installed; no vulnerability-clean claim can be made.
-- Only `aarch64-apple-darwin` is installed, so cross-target compilation was not verified.
-- No tracked files other than this report were modified.
+- `cargo test --workspace --all-features --locked`: 186 passed locally.
+- `cargo build --release --locked`: passed locally.
+- Workflow and Dependabot YAML parsed successfully; `deny.toml` parsed successfully.
+- `cargo tree --duplicates`: no duplicate versions reported.
+- `cargo audit` and `cargo deny` are not installed locally; CI now invokes both,
+  so no local vulnerability-clean claim is made.
+- The local host is `aarch64-apple-darwin`; Linux and Windows CI legs are
+  configured but have not executed in this environment.
+- `cargo fmt --all -- --check`: passed locally after filesystem hardening
+  commit `2202885`.
+- Strict locked Clippy with all workspace targets, features and warnings
+  denied: passed locally after `2202885`.
 
 ## 2. Architecture Overview
 
@@ -38,25 +52,32 @@ The actual execution flow is:
 
 ```text
 Clap CLI
-  -> repository discovery and config loading
+  -> repository discovery and external policy authentication
+  -> mutating-operation lock (setup/sync/resolve)
   -> setup / sync / resolve orchestration
   -> git2 object/ref/tree operations
-  -> centralized Git subprocess helpers
+  -> centralized, bounded Git subprocess runner
   -> libgit2 checkout or terminal reporting
 ```
 
-Primary entry point: `src/main.rs:14`.
+Primary entry point: `src/main.rs` (`main`).
 
 Commands:
 
-- `setup`: discovers a non-bare source repository, loads bootstrap control files, fetches every configured destination branch, plans grafts/merges, creates commits and branch refs, then checks out the first branch. See `src/commands/setup.rs:45`.
-- `sync`: lists source branches, processes configured dest->source branches first, then mirrors every local source branch source->dest. See `src/commands/sync.rs:79`.
-- `resolve`: only resolves dest->source conflicts using real `git cherry-pick`, then replaces Git's temporary commit with a correctly stamped commit and pushes it. See `src/commands/resolve.rs:37`.
+- `setup`: discovers a non-bare source repository, loads bootstrap control files, fetches every configured destination branch, plans grafts/merges, creates commits and branch refs, then checks out the first branch. See `commands::setup::run`.
+- `sync`: lists source branches, processes configured dest->source branches first, then mirrors every local source branch source->dest. See `commands::sync::run`.
+- `resolve`: handles both directions. Dest->source uses a real `git cherry-pick`
+  in the source checkout; source->dest uses an isolated linked worktree and a
+  real no-commit cherry-pick. In both cases the operator edits/stages conflicts
+  and explicitly continues; no conflict is automatically resolved. See
+  `src/commands/resolve.rs`.
 
 Git integration is hybrid:
 
 - `git2`: discovery, commits, refs, trees, revwalks, merge-base, checkout.
-- Real `git`: fetch, ls-remote, push, cherry-pick, commit, ls-files, merge-tree, version checks. These nine process paths are centralized in `src/git.rs`.
+- Real `git`: fetch, ls-remote, push, worktree management, cherry-pick,
+  commit, ls-files, merge-tree and version checks. Production process paths
+  are centralized in `src/git.rs` through a bounded, timed runner.
 - No Rust shell invocation is present.
 - No application database or state file exists. Mapping state is encoded in commit trailers.
 
@@ -69,14 +90,19 @@ Trusted by the current implementation:
 - The `git` executable selected through `PATH`.
 - Process environment and global/system Git configuration.
 - Repository-local `.git/config`, hooks, and repository metadata.
-- `.gitprism.toml` and `.gitprismignore` in the current source checkout.
-- The convention that only gitprism authors `Gitprism-*` trailers.
+- The deployment-controlled `GITPRISM_POLICY_SHA256` and
+  `GITPRISM_STATE_KEY` values, including their secure delivery and approval.
+- Git's own transport/credential boundary and the operator who invokes the
+  tool.
 
 Untrusted or repository-controlled:
 
 - Branches, refs, commit graphs, commit messages, authors and filenames.
 - Git object contents, including malformed or very large trees/histories.
 - Configured URLs and branch strings.
+- `.gitprism.toml` and `.gitprismignore` until their exact bytes match the
+  externally approved policy digest.
+- All `Gitprism-*` marker text until the authenticated state block verifies it.
 - Remote Git stderr and hook/server messages.
 - Working-tree state and symlinks.
 
@@ -88,7 +114,12 @@ Primary boundaries:
 - Checkout/ref updates -> the user's local working tree and history.
 - Configured remote -> source/destination confidentiality boundary.
 
-The implementation does not satisfy a threat model where committed control files or `.git` metadata are fully hostile. In particular, ordinary cloned content can supply a malicious `.gitprism.toml`, while manually supplied/shared `.git` metadata can additionally influence Git transport and hooks.
+The implementation does not sandbox the Git installation or `.git` metadata.
+Ordinary cloned content can supply a malicious policy, but it is rejected
+unless an operator/deployment explicitly approves its digest. A manually
+supplied/shared `.git` directory can still influence Git transport and hooks;
+those remain trusted process boundaries rather than repository-content inputs
+that gitprism attempts to sandbox.
 
 ## 4. Critical and High Findings
 
@@ -97,16 +128,20 @@ The implementation does not satisfy a threat model where committed control files
 - Category: Subprocess security
 - Severity: **CRITICAL**
 - Confidence: High
-- File/symbol: `src/git.rs:46`, `remote_ref_exists`; also `src/git.rs:21`, `fetch`
-- Description: Remote URLs are placed directly where Git still parses options, without `--` or validation.
-- Evidence: `remote_ref_exists` constructs `git ls-remote --exit-code <url> <refname>`. A URL beginning with `--upload-pack=...` is interpreted as a Git option, not a repository. A read-only probe confirmed that Git executed the selected upload-pack command; the resulting output caused Git's expected protocol error.
-- Scenario: A source checkout contains `[dest].url = "--upload-pack=<command>"`, or the corresponding environment variable supplies it. `sync` calls `remote_ref_exists` before fetching and Git executes the supplied command.
-- Impact: Arbitrary command execution with gitprism's privileges.
-- Recommended remediation:
-  - Reject remote values beginning with `-`.
-  - Insert `--`/`--end-of-options` before every remote argument where Git supports it.
-  - Test all remote-taking helpers with leading-dash values.
-  - Consider a typed `RemoteUrl` validated once during config loading.
+- Status: **Fixed** in `b4ff279`.
+- File/symbol: `src/git.rs`, `remote_ref_exists` and `fetch`
+- Description: This was a confirmed Git option-injection path. It is now
+  closed by rejecting empty, control-bearing and leading-dash remotes and by
+  placing `--` before remote operands.
+- Evidence: `src/git.rs::validate_remote` runs before every remote operation;
+  `fetch`, `remote_ref_exists` and `push` use `--`. Regression tests cover a
+  leading-dash remote before Git starts.
+- Residual scenario: Git's executable, transport helpers, configuration and
+  hooks remain an explicit trusted boundary; this finding no longer permits a
+  configured remote value to become a Git option.
+- Impact: The confirmed arbitrary-command path is removed.
+- Recommended remediation: Retain the centralized remote validation,
+  option terminators and leading-dash regression tests.
 
 This is argument injection into Git, not shell interpolation by `Command::arg()`.
 
@@ -115,104 +150,130 @@ This is argument injection into Git, not shell interpolation by `Command::arg()`
 - Category: Git safety
 - Severity: **HIGH**
 - Confidence: High
-- File/symbol: `src/git.rs:21`, `src/commands/setup.rs:164`
-- Description: Config entries described as branch names are passed to `git fetch` as unrestricted refspecs.
-- Evidence: `fetch` passes `refspec` verbatim. Setup calls it before validating that the configured string is a branch name. Git refspecs can include `+<source>:<destination>` and therefore update local refs.
-- Scenario: A malicious configuration uses a forced remote-to-local refspec. During `setup`, fetch can move an unrelated local branch before later libgit2 operations reject the configured "branch" as invalid. Setup rollback does not record or restore fetch-created ref changes.
-- Impact: Local branch overwrite or unexpected ref creation; potentially lost or hidden local work.
-- Recommended remediation:
-  - Validate every configured branch using Git's branch-name rules before any subprocess.
-  - Fetch a constructed source ref, such as `refs/heads/<validated-name>`, with no destination component.
-  - Add `--` before the ref argument.
-  - Test that colon, plus, leading-dash, empty and malformed values cause no repository mutation.
+- Status: **Fixed** in `b4ff279`.
+- File/symbol: `src/git.rs`, `src/commands/setup.rs`
+- Description: Configured branch values are now validated as branch names and
+  converted to `refs/heads/<validated-name>` before fetching.
+- Evidence: `Config::parse` and `git::fetch` both validate branch names; fetch
+  passes a constructed source ref after `--`, never a caller-supplied refspec.
+  Tests reject `+`, `:` and other raw-refspec shapes without touching
+  `FETCH_HEAD`.
+- Residual scenario: A valid branch can still point to repository-controlled
+  Git content, which is expected input rather than refspec injection.
+- Impact: The local-ref overwrite path from a malicious refspec is removed.
+- Recommended remediation: Retain branch validation and constructed source
+  refs; extend the regression matrix when new Git transport commands are added.
 
 ### GPR-003 - Repository authors can forge synchronization state
 
 - Category: Git correctness/security
 - Severity: **HIGH**
 - Confidence: High
-- File/symbol: `src/commands/sync.rs:802`, `src/commands/sync.rs:477`, `src/commands/sync.rs:1363`
-- Description: Any matching line anywhere in any commit message is trusted as authoritative gitprism state.
-- Evidence:
-  - `trailer_value` returns the first matching line anywhere in the message, not a validated trailer block.
-  - Any source commit containing `Gitprism-Dest-Commit` is skipped source->dest.
-  - Any destination commit containing `Gitprism-Source-Commit` is skipped dest->source.
-  - The test fixture explicitly allows independently authored destination commits to carry the marker, reinforcing that provenance is not checked.
-- Scenario: A destination contributor adds `Gitprism-Source-Commit: <oid>` to a commit message. Its content is silently excluded from dest->source reconciliation. A source contributor can similarly suppress export of a source commit. Duplicate forged trailers can also override the genuine trailer gitprism appends later because parsing takes the first occurrence.
-- Impact: Silent divergence and failure of the core bidirectional-sync guarantee.
-- Recommended remediation:
-  - At minimum, parse only a canonical final trailer block and reject duplicate marker keys.
-  - Validate marker OIDs against expected ancestry and commit shape.
-  - Do not use marker presence alone as proof that gitprism authored a commit.
-  - Revisit authenticated or structurally verifiable state, such as a dedicated ref/notes plus commit-shape validation.
+- Status: **Fixed** in `6016c3f`.
+- File/symbol: `src/commands/sync.rs`, marker/state discovery and advancement paths
+- Description: Marker text is now only accepted when accompanied by a final,
+  authenticated state block bound to the branch, direction, counterpart,
+  parent IDs, tree, identities and message body.
+- Evidence: `src/marker.rs` verifies the HMAC state key and canonical marker
+  structure; duplicate or user-supplied marker lines are stripped from
+  generated messages. Sync tests cover forged, duplicate and mismatched state.
+- Residual scenario: Losing the deployment state key makes existing markers
+  unusable and requires operator recovery; that is an intentional trust
+  boundary, not silent acceptance of forged state.
+- Impact: The original silent-divergence path is mitigated by authenticated
+  provenance.
+- Recommended remediation: Protect the external state key, retain authenticated
+  marker tests, and document key-loss recovery for operators.
 
 ### GPR-004 - Versioned config and exclusion policy are consumed from an untrusted checkout
 
 - Category: Architecture/security
 - Severity: **HIGH**
 - Confidence: High
-- File/symbol: `src/config.rs:91`, `src/commands/sync.rs:91`, `src/commands/sync.rs:814`
-- Description: The same repository being processed controls remote destinations and which protected paths may leave source.
-- Evidence:
-  - `sync` loads `.gitprism.toml` from the current working tree.
-  - Each branch's `.gitprismignore` is loaded from that branch's tip.
-  - Source->dest mirrors every local branch.
-  - The deployment playbook recommends running `sync` on every source push.
-- Scenario: A branch modifies `.gitprismignore` to remove protected patterns, or changes `.gitprism.toml` to an attacker-controlled destination. CI checks out that branch and invokes `sync` before the policy change has been reviewed.
-- Impact: Source-only content can be published to the wrong destination or cease being excluded.
-- Recommended remediation:
-  - Define and document who is trusted to modify both control files.
-  - In CI, load remote configuration and exclusion policy from a protected ref or external protected configuration.
-  - Consider rejecting policy changes unless the run is on a configured protected branch.
-  - Test branch-local policy changes explicitly.
-
-If every source writer is fully trusted and CI only runs protected commits, the practical severity falls, but the malicious-repository threat model is not met.
+- Status: **Fixed with an explicit deployment boundary** in `83d66d8`.
+- File/symbol: `src/config.rs`, `src/commands/sync.rs`, configuration loading and mutation paths
+- Description: Repository-controlled policy remains versioned and reviewable,
+  but mutating commands now require an external SHA-256 digest over the exact
+  `.gitprism.toml` and `.gitprismignore` bytes before parsing or mutation.
+- Evidence: `policy::load` authenticates both files before setup/sync/resolve;
+  configuration rejects unknown fields, invalid URLs, duplicate/invalid
+  branches and oversized control files. The deployment playbook documents the
+  protected `GITPRISM_POLICY_SHA256` variable.
+- Residual scenario: A deployment that deliberately approves a malicious
+  policy digest, or trusts an unreviewed source branch, has approved that
+  policy by definition. CI must protect the digest and checkout policy.
+- Impact: Ordinary branch content can no longer silently change the active
+  remotes or exclusion policy during a mutating run.
+- Recommended remediation: Protect `GITPRISM_POLICY_SHA256`, approve it only
+  for reviewed source revisions, and keep policy-change review in deployment
+  controls.
 
 ### GPR-005 - Source->dest conflict recovery directs users to an incompatible command
 
 - Category: Correctness/UX
 - Severity: **HIGH**
 - Confidence: High
-- File/symbol: `src/commands/sync.rs:377`, `src/commands/resolve.rs:1`, `design/decisions/0015-resolve-real-git-cherry-pick-explicit-continue.md:109`
-- Description: Source->dest conflicts tell users to run `gitprism resolve`, but `resolve` only handles dest->source.
-- Evidence: The source->dest error names `gitprism resolve`; the resolve implementation recomputes pending destination commits and pushes to source. Decision 0015 explicitly says source->dest resolution is not implemented.
-- Scenario: A mirror-only destination branch has an independent edit conflicting with an incoming filtered source commit. Sync stops and recommends a command that either rejects the branch as unconfigured or operates on the wrong direction.
-- Impact: A supported sync state has no correct documented recovery path and can block indefinitely.
-- Recommended remediation:
-  - Implement source->dest resolution before release, or emit accurate manual recovery instructions and clearly state that automatic resolution is unavailable.
-  - Add an end-to-end source->dest conflict recovery test.
+- Status: **Fixed** in `25b2250`; conflict policy remains fail-fast and
+  operator-driven.
+- File/symbol: `src/commands/sync.rs`, `src/commands/resolve.rs`, `design/decisions/0015-resolve-real-git-cherry-pick-explicit-continue.md`
+- Description: `resolve --direction source-to-dest` now reproduces the
+  conflict in an isolated linked worktree. The operator edits and stages the
+  result and explicitly continues; `sync` never auto-resolves or chooses a
+  side.
+- Evidence: `src/commands/resolve.rs` authenticates resumable state, checks
+  excluded paths, authenticates the exact registered linked-worktree path,
+  and supports source-to-dest continuation (`2202885`). README and decision
+  0027 document the manual workflow. End-to-end tests cover the linked-worktree
+  path and stale/non-fast-forward recovery.
+- Scenario: A real conflict still stops the branch and requires operator
+  action, as intentionally decided in decisions 0007/0008.
+- Impact: The incorrect recovery command is removed; intentional fail-fast
+  behavior remains.
+- Recommended remediation: Retain the explicit direction and fail-fast/manual
+  operator workflow; do not add automatic conflict selection.
 
 ### GPR-006 - Credential-bearing URLs are copied into errors and CI logs
 
 - Category: Secrets handling
 - Severity: **HIGH**
 - Confidence: High
-- File/symbol: `src/git.rs:30`, `src/git.rs:98`, `src/commands/sync.rs:271`
-- Description: Error contexts interpolate complete source and destination URLs.
-- Evidence: Fetch, ls-remote and push error strings include `{url}`. The design explicitly supports credential-bearing environment URLs such as tokenized HTTPS remotes.
-- Scenario: Authentication, network or hook failure occurs with `https://user:token@host/repo.git`.
-- Impact: Credentials can be written to terminal history or persistent CI logs.
-- Recommended remediation:
-  - Never include raw remote URLs in errors.
-  - Use labels such as "configured source remote" and "configured destination remote."
-  - If a location is necessary, redact userinfo and sensitive query parameters centrally.
-  - Add redaction tests.
+- Status: **Fixed** in `b4ff279`.
+- File/symbol: `src/git.rs`, `src/commands/sync.rs`
+- Description: Remote values are now redacted before byte escaping and bounded
+  terminal presentation; application-authored errors identify configured
+  remotes by role rather than printing the URL.
+- Evidence: `git::git_diagnostic` redacts raw bytes before framing, and tests
+  cover credentials, invalid bytes, controls and URL-like diagnostics.
+- Residual scenario: Git's own trusted helper/hook process may observe the URL
+  through normal Git configuration; gitprism removes its fallback URL
+  variables from child environments.
+- Impact: Credential-bearing URL values are no longer copied into gitprism's
+  error output or CI logs.
+- Recommended remediation: Retain centralized redaction and ensure future Git
+  subprocess paths use the same diagnostic runner.
 
 ### GPR-007 - Local branch advancement is not atomic with its safety check
 
 - Category: Concurrency/data integrity
 - Severity: **HIGH**
 - Confidence: High
-- File/symbol: `src/commands/sync.rs:1125`
-- Description: `advance_local_source_branch` checks the current ref and later force-writes it without compare-and-swap.
-- Evidence: It reads `previous_tip`, verifies ancestry, optionally updates the checkout, then calls `repo.reference(..., force = true, ...)`. Another process can move the branch between those operations. By contrast, `resolve::finish` correctly uses `reference_matching`.
-- Scenario: A concurrent Git operation or second gitprism instance creates a local commit in the check/write window.
-- Impact: The concurrent ref update can be overwritten. Separately, the source remote is pushed before local checkout/ref advancement; a dirty-worktree checkout failure can therefore leave the remote advanced and the local branch stale.
-- Recommended remediation:
-  - Use `reference_matching` with the exact observed OID.
-  - Add a per-repository run lock covering setup/sync/resolve mutations.
-  - Decide and test recovery when remote push succeeds but local advancement fails.
-  - Check working-tree/index suitability before performing a dest->source push when the branch is checked out.
+- Status: **Fixed** in `ba86206`.
+- File/symbol: `src/commands/sync.rs`, local compare-and-swap advancement
+- Description: Local advancement now uses compare-and-swap against the exact
+  observed OID and is serialized by a non-blocking lock in Git's common
+  directory. Preflight rejects tracked/index conflicts before remote push and
+  reports the recovery path if a remote push succeeds but local advancement
+  cannot complete.
+- Evidence: `src/lock.rs`, `sync::preflight_local_source_branch` and
+  `reference_matching` implement the boundary; tests cover concurrent ref
+  movement, dirty worktrees, colliding untracked files and unrelated untracked
+  files.
+- Residual scenario: A process that bypasses Git's ref locking can still race,
+  but CAS refuses to overwrite its move. The remote/local partial-success case
+  requires ordinary Git reconciliation by the operator.
+- Impact: gitprism no longer overwrites a concurrent local ref move.
+- Recommended remediation: Retain CAS, common-directory locking, preflight
+  checks and the documented remote-success recovery procedure.
 
 ## 5. Medium Findings
 
@@ -221,129 +282,215 @@ If every source writer is fully trusted and CI only runs protected commits, the 
 - Category: Reliability/test isolation
 - Severity: **MEDIUM**
 - Confidence: High
-- File/symbol: `src/git.rs:161`, `src/git.rs:194`
-- Description: Real cherry-pick/commit subprocesses are not given the committer identity already present in `.gitprism.toml`.
-- Evidence: Only `GIT_EDITOR=true` is set. A clean cherry-pick or `--continue` needs a Git committer identity before gitprism can replace the temporary commit. The test suite passed because the review machine has a global Git identity.
-- Scenario: A clean CI container has no `user.name`/`user.email`.
-- Impact: Conflict resolution fails despite valid gitprism configuration; tests can fail based on global machine state.
-- Recommended remediation: Supply `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` from `Config`, or use a flow that never requires Git to author the temporary commit.
+- Status: **Fixed** in `b064afa`.
+- File/symbol: `src/git.rs`, cherry-pick and empty-resolution subprocess paths
+- Description: Real cherry-pick and empty-resolution Git subprocesses now
+  receive the verified configured committer identity while preserving the
+  picked commit's author.
+- Evidence: `git::cherry_pick_start`, `cherry_pick_continue` and the empty
+  commit path set `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`; tests exercise
+  identity-independent resolution.
+- Impact: Resolve no longer depends on unrelated global Git identity settings.
+- Recommended remediation: Retain configured identity injection and keep
+  Git hooks/helpers documented as trusted rather than attempting a partial
+  cross-platform sandbox.
 
 ### GPR-009 - Setup rollback and restoration errors are silently discarded
 
 - Category: Error handling/filesystem safety
 - Severity: **MEDIUM**
 - Confidence: High
-- File/symbol: `src/commands/setup.rs:328`, `src/commands/setup.rs:374`
-- Description: Failed control-file restoration, ref reset, branch deletion and HEAD restoration are ignored.
-- Scenario: Setup fails because of permissions, locks or corruption--the same conditions likely to affect rollback.
-- Impact: Partial branch mutations or missing control files can remain while the reported error describes only the original failure.
-- Recommended remediation: Return an aggregated rollback error containing both the primary failure and every rollback failure. Avoid deleting control files until checkout can be made transactional.
+- Status: **Fixed** in `01d647` and `2202885`.
+- File/symbol: `src/commands/setup.rs`, rollback and control-file restoration paths
+- Description: Rollback now attempts every cleanup action and aggregates
+  failures with the primary setup error, including control-file restoration,
+  ref rollback, branch cleanup and HEAD restoration. Control-file restoration
+  uses create-new handles and does not follow replacement symlinks; Unix
+  hard-link reads are rejected (`2202885`).
+- Evidence: `setup::restore_control_files`, `rollback_branches` and the setup
+  recovery path return combined diagnostics; failure-injection tests assert
+  that all cleanup failures remain visible.
+- Impact: Partial setup failures are no longer silently reported as a single
+  unrelated primary error.
+- Recommended remediation: Retain aggregated rollback reporting; add
+  platform-specific permission/crash-recovery tests before distribution.
 
 ### GPR-010 - Push-race classification parses localized human-readable stderr
 
 - Category: Git integration
 - Severity: **MEDIUM**
 - Confidence: High
-- File/symbol: `src/git.rs:104`
-- Description: Non-fast-forward detection searches for English strings.
-- Scenario: Git is localized, wording changes, or a remote hook emits matching text.
-- Impact: Genuine races become fatal, or unrelated failures are retried and misreported.
-- Recommended remediation: Use `git push --porcelain`/`--porcelain=v2` where available and parse ref-status records rather than prose.
+- Status: **Fixed** in `b4ff279`.
+- File/symbol: `src/git.rs`, porcelain push status parser
+- Description: Push uses porcelain output and classifies only the structured
+  `! ... [rejected]` ref-status record as a retryable non-fast-forward race.
+- Evidence: `git::push` passes `--porcelain`; `is_non_fast_forward_rejection`
+  parses tab-separated bytes, with tests distinguishing non-fast-forward and
+  hook rejection statuses.
+- Impact: Localization and arbitrary hook prose no longer control retry
+  classification.
+- Recommended remediation: Retain porcelain parsing and add coverage if the
+  supported Git minimum changes.
 
 ### GPR-011 - Valid non-UTF-8 Git objects stop synchronization
 
 - Category: Git compatibility
 - Severity: **MEDIUM**
 - Confidence: High
-- File/symbol: `src/commands/sync.rs:160`, `src/commands/sync.rs:857`, `src/commands/resolve.rs:233`
-- Description: Non-UTF-8 branch/tree names are rejected, conflict paths are dropped from diagnostics, and non-UTF-8 commit messages are replaced with an empty message before adding the trailer.
-- Scenario: A Unix repository contains a legal byte-oriented filename or legacy-encoded commit message.
-- Impact: Sync aborts or loses metadata.
-- Recommended remediation: Use `TreeEntry::name_bytes` and byte-aware path matching on Unix, preserve `message_bytes`, and escape bytes only for display.
+- Status: **Partially fixed with an explicit compatibility boundary** in
+  `f283455`.
+- File/symbol: `src/commands/sync.rs`, `src/commands/resolve.rs`, byte-path and message handling
+- Description: Raw Git path bytes are now used for comparisons, diagnostics and
+  Unix filesystem conversion; invalid conflict paths are escaped rather than
+  dropped. Non-UTF-8 commit messages, branch names and tree entry names are
+  rejected before a generated commit/ref can be advanced because the current
+  mapping and configuration interfaces require text.
+- Evidence: `git::escape_bytes`, `path_from_git_bytes`, `name_bytes` and
+  `message_bytes` checks are covered by Unix byte-path, invalid-index and
+  non-UTF-8-message tests. README documents the platform boundary.
+- Residual scenario: A Unix repository containing a non-UTF-8 branch/tree name
+  or commit message still fails clearly rather than syncing that object.
+- Impact: Silent metadata loss and unsafe display are fixed; full arbitrary-byte
+  synchronization remains intentionally unsupported.
+- Recommended remediation: Keep the explicit byte-compatibility boundary;
+  only implement arbitrary-byte commit/tree-name support if a real workflow
+  requires it.
 
 ### GPR-012 - Work and subprocess output are unbounded
 
 - Category: Performance/availability
 - Severity: **MEDIUM**
 - Confidence: High
-- File/symbol: `src/commands/sync.rs:778`, `src/commands/sync.rs:847`, `src/git.rs:91`
-- Description:
-  - Entire pending histories are collected into vectors.
-  - A `merge-tree` process is spawned per pending commit.
-  - Source->dest recursively filters overlapping trees repeatedly.
-  - Captured Git stdout/stderr has no size bound.
-  - Network subprocesses have no timeout and inherited Git prompting behavior is inconsistent.
-- Scenario: Large history, huge conflict list, noisy malicious remote, stalled SSH/authentication.
-- Impact: Excessive runtime/memory use or indefinitely hanging CI jobs.
-- Recommended remediation: Stream pending commits, bound captured diagnostic output, introduce configurable network timeouts/non-interactive mode, and benchmark large histories before optimizing tree reuse.
+- Status: **Fixed for the identified resource-exhaustion paths** in `f91c5b4`
+  and `aaf31db`.
+- File/symbol: `src/commands/sync.rs`, `src/git.rs`, bounded traversal and subprocess runner
+- Description: Repository-controlled work and Git subprocesses now have static
+  budgets. Pending histories, marker scans, branch discovery, tree traversal,
+  conflict records, control files and commit messages are bounded. Git children
+  are captured concurrently with per-stream/total output limits, closed stdin,
+  `GIT_TERMINAL_PROMPT=0`, and a configurable 1..3600 second deadline.
+- Evidence: `src/limits.rs`, `git::run_git_output_with_timeout` and the bounded
+  merge-tree/conflict parsers fail rather than truncating data. README records
+  the limits; tests cover timeout, output-limit and resource-limit behavior.
+- Residual scenario: Valid large repositories above the documented budgets are
+  rejected, and filtering still performs real object work per pending commit.
+  These are explicit capacity limits, not unbounded execution.
+- Impact: The original unbounded memory/output/hang paths are mitigated.
+- Recommended remediation: Measure real repositories and tune limits from
+  evidence; do not silently truncate data or remove deadlines.
 
 ### GPR-013 - Some untrusted output reaches terminals unsafely
 
 - Category: Terminal safety
 - Severity: **MEDIUM**
 - Confidence: High
-- File/symbol: `src/git.rs:21`, `src/progress.rs:103`
-- Description: Git fetch/ls-remote stderr is inherited, and raw URLs/stderr are embedded in final errors.
-- Scenario: A remote server, hook, or malicious URL emits ANSI controls or newline-delimited misleading output.
-- Impact: Terminal escape injection or forged-looking CI status lines.
-- Recommended remediation: Keep valid branch names readable, but escape control characters in application-authored diagnostics and consider capturing/framing remote stderr. Conflict paths already use debug formatting in most important messages, which is appropriately conservative.
+- Status: **Fixed** in `b064afa` and `f283455`.
+- File/symbol: `src/git.rs`, `src/progress.rs`
+- Description: Git diagnostics and repository-controlled byte values are now
+  captured, escaped and bounded before application-authored terminal output.
+  Valid branch names remain readable; controls, invalid UTF-8 and backslashes
+  use deterministic escapes.
+- Evidence: `git::escape_bytes`, `git_diagnostic`, bounded subprocess capture
+  and progress rendering tests cover ANSI/control/newline and hostile branch
+  values. Remote stderr is no longer inherited by production Git runners.
+- Residual scenario: Trusted Git hooks and helpers may print directly because
+  they remain part of the explicit Git installation trust boundary.
+- Impact: Repository/remote values no longer provide an application-level
+  terminal escape or forged status line.
+- Recommended remediation: Retain byte escaping/framing for application
+  diagnostics and document the trusted Git hook boundary.
 
 ### GPR-014 - Release engineering is incomplete
 
 - Category: Distribution
 - Severity: **MEDIUM**
 - Confidence: High
-- Files: `Cargo.toml`, `README.md:55`
+- Status: **Partially fixed** in `d512c91` plus the current Cargo/README
+  updates.
+- Files: `Cargo.toml`, `README.md`, `.github/workflows/ci.yml`,
+  `.github/dependabot.yml`, `deny.toml`
 - Evidence:
-  - No CI workflows, release configuration, packaging scripts or install artifacts.
-  - No license file or Cargo `license`/`license-file`.
-  - No `rust-version`, repository, description, keywords or categories metadata.
-  - README does not prominently state the enforced Git >=2.45 requirement.
-  - No Windows/Linux build or test matrix.
-- Impact: Reproducibility, legal distribution and platform support are not release-grade.
-- Recommended remediation: Add release metadata, license, CI matrices, locked release builds, artifact signing/checksums and documented compatibility requirements.
+  - Pinned-SHA CI now runs Rust 1.89 formatting, Clippy, locked tests and a
+    locked release build, plus Linux/macOS/Windows tests.
+  - Dependabot, `deny.toml`, `cargo audit` and `cargo deny` checks are present.
+  - Cargo now has an inferred description/categories/keywords and
+    `publish = false`; README documents Rust 1.89 and Git >=2.45.
+  - There is still no license, repository URL, release-tag policy, signed
+    artifact workflow, installer or package-manager integration by design.
+- Impact: Engineering validation is substantially improved, but public
+  distribution is not yet legally or operationally complete.
+- Recommended remediation: Owner must select a license, repository identity,
+  version/tag policy and signing policy before adding release packaging and
+  artifacts. Keep `publish = false` until that decision is made.
 
 ## 6. Low and Informational Findings
 
-- **LOW - Configuration accepts unknown fields and lacks semantic validation.** A typo can silently default a section or branch list. Add `#[serde(deny_unknown_fields)]`, reject empty URLs/identity values, invalid branches and duplicates.
-- **LOW - README test count is stale.** It says 82; the current suite has 120.
-- **INFO - No production unsafe Rust.** The only `unsafe` blocks are test-only environment mutation required under Edition 2024.
-- **INFO - No direct shell invocation.** There is no `sh -c`, `bash -c` or PowerShell. GPR-001 occurs because Git interprets an argument as an option and then launches its own helper.
-- **INFO - Dependency shape is restrained.** Nine direct runtime dependencies, no Git dependencies, no project `build.rs`, and no reachable duplicate versions reported by `cargo tree --duplicates`. `git2` brings native libgit2/zlib build dependencies.
+- **LOW - Explicit external config paths remain operator-controlled.** A user
+  can deliberately pass a relative `--config` containing `..`; this is not
+  repository-filename traversal. Policy files used by mutating commands are
+  regular-file checked and authenticated before use.
+- **INFO - Configuration validation is now explicit.** Unknown TOML fields,
+  empty identity/URLs, invalid or duplicate branches and oversized control
+  files are rejected (`b4ff279`, `aaf31db`).
+- **INFO - No production unsafe Rust.** The only `unsafe` blocks are test-only
+  environment mutation required under Edition 2024.
+- **INFO - No direct shell invocation.** There is no `sh -c`, `bash -c` or
+  PowerShell execution in production. Direct `Command::arg` use is not shell
+  injection; Git's own hooks/helpers remain a trusted boundary.
+- **INFO - Dependency shape is restrained.** Ten direct runtime dependencies,
+  no Git dependencies, no project `build.rs`, and no duplicate versions in the
+  default `cargo tree --duplicates` check. `git2` brings native libgit2/zlib
+  build dependencies.
 - **INFO - The two existing untracked root files are pager-help output and were present before review; they were not treated as repository source.**
 
 ## 7. Git and Subprocess Security Assessment
 
 Positive properties:
 
-- Subprocess calls are centralized.
+- Production subprocess calls are centralized through a runner with bounded
+  concurrent capture, closed stdin, `GIT_TERMINAL_PROMPT=0` and a deadline.
 - Arguments use `Command::arg`, not shell strings.
+- Remote values are validated and separated from Git options with `--`.
 - OIDs passed to cherry-pick and merge-tree are structurally safe.
+- Branch names are validated before branch/refspec construction.
 - Push uses a full destination ref and never passes `--force`.
 - Exit status is checked everywhere.
 - Merge conflicts use Git's real merge engine.
 - Source and destination push races are retried with recomputation.
+- Push race classification parses porcelain ref-status bytes, not localized
+  prose.
+- Git version `>=2.45` is checked before merge-tree synchronization.
+- Git child environments remove the state key and resolved fallback URLs while
+  retaining normal authentication variables.
 
 Problems:
 
-- Remote operands need explicit option termination.
-- Fetch needs a validated source ref, not an arbitrary refspec.
-- Git environment/config is inherited wholesale.
-- `git` is resolved through `PATH`, normal for a CLI but therefore part of the trusted execution environment.
-- Repository-local `core.sshCommand`, transport settings, helpers and hooks can execute programs. Normal clones do not transfer hooks or `.git/config`, but a shared or attacker-prepared `.git` directory cannot be treated as safe.
-- `resolve` runs porcelain operations that may execute local Git hooks.
-- Network calls have no timeout or explicit non-interactive policy.
-- Push status parsing is brittle.
+- `git` is resolved through `PATH`, normal for a CLI but therefore part of the
+  trusted execution environment.
+- Repository-local `core.sshCommand`, transport settings, credential helpers
+  and hooks can execute programs. Normal clones do not transfer hooks or
+  `.git/config`, but a shared or attacker-prepared `.git` directory cannot be
+  treated as safe.
+- `resolve` deliberately runs ordinary Git porcelain and may execute local
+  Git hooks; the configured identity is deterministic, not a sandbox.
+- A timeout is enforced, but a valid large operation can still consume the
+  configured deadline and must be retried or investigated by an operator.
 
 Edge-case behavior:
 
-- Detached HEAD: setup rejects; sync operates on local refs; resolve requires the target checked out.
-- Bare repositories: intentionally rejected for commands, though tests use bare remotes.
-- Worktrees: `Repository::discover`, `workdir()` and `repo.path()/CHERRY_PICK_HEAD` are structurally compatible, but untested.
+- Detached HEAD: setup rejects; sync operates on local refs; dest-to-source
+  resolve requires its source branch checked out, while source-to-dest resolve
+  uses its authenticated linked worktree.
+- Bare repositories: intentionally rejected for mutating source commands,
+  though tests use bare remotes.
+- Worktrees: repository discovery and linked worktree state use Git's common
+  directory; the operation lock is shared by linked worktrees.
 - Unborn/no-commit repositories: setup supports a fresh source when destination branches exist; empty destination repositories are untested.
 - Missing/deleted branches: explicit behavior exists for round-tripped and mirror-only branches.
-- Submodules: gitlinks are preserved and not traversed, but there is no dedicated submodule integration test.
-- Corruption: most libgit2/Git failures propagate with context; several rollback and `.ok()` paths weaken this.
+- Submodules: gitlinks are preserved and not traversed; a dedicated end-to-end
+  submodule workflow remains an open test gap.
+- Corruption: libgit2/Git failures propagate with context, resource limits
+  reject oversized/malformed work, and rollback failures are aggregated.
 
 ## 8. Filesystem Safety Assessment
 
@@ -355,40 +502,72 @@ Strengths:
 - Symlink blobs and executable modes are preserved.
 - Submodule gitlinks are not traversed.
 - Checkout is non-forced.
+- Policy/control files must be regular files, are size-bounded and are
+  authenticated before mutation.
+- Source/destination local ref advancement uses a safe checkout and CAS.
+- Authenticated source-to-destination resolution records the exact temporary
+  worktree path, verifies that it is a registered worktree for the same Git
+  common directory, and checks its HEAD before continuing (`2202885`).
+- Control-file reads open a handle and reject symlink/substitution and
+  Unix hard-link cases; rollback restores entries by removing the existing
+  directory entry and creating a new regular file rather than following it.
+  The create-new restoration strategy is portable; hard-link rejection is
+  Unix-specific (`2202885`).
 - No general recursive deletion exists.
 - No repository-derived path is directly passed to `remove_dir_all` or similar destructive APIs.
 
 Risks:
 
-- Setup follows config/control-file symlinks during `read_to_string`.
-- An explicit relative `--config` containing `..` can read outside the repository. This is direct user intent, not traversal by a repository filename, but should be documented.
-- Setup deletes control files before checkout, and partial failures are not fully transactional.
-- Refspec injection is a more serious repository-boundary mutation than any ordinary filesystem path operation.
-- Checkout can materialize repository-controlled symlinks, as Git normally does; gitprism itself does not subsequently follow those symlinks for arbitrary writes.
+- An explicit relative `--config` containing `..` can read outside the
+  repository. This is direct user intent, not traversal by a repository
+  filename, and is bounded by the operator-selected path.
+- Setup still performs several filesystem/ref operations that cannot be made a
+  single filesystem transaction. Rollback now attempts every action and
+  reports all failures, but a hard crash can leave ordinary Git recovery work.
+- Checkout can materialize repository-controlled symlinks, as Git normally
+  does; gitprism itself does not subsequently follow those symlinks for
+  arbitrary writes.
+- The control-file replacement sequence is deliberately fail-closed for
+  symlinks and Unix hard links, but it is still a sequence of filesystem
+  operations rather than a cross-platform atomic no-follow primitive; a
+  hostile local process racing the operator's repository remains outside
+  gitprism's trust boundary.
 
-No confirmed path was found where a tree filename alone causes gitprism to delete or overwrite a filesystem object outside the repository.
+No confirmed path was found where a tree filename alone causes gitprism to
+delete or overwrite a filesystem object outside the repository.
 
 ## 9. Testing Gaps
 
-Highest-priority missing tests:
+Covered by the current 186-test suite:
 
-1. Leading-dash source/destination URLs for every subprocess helper.
-2. Branch values containing `+`, `:`, leading `-`, empty strings and malformed refs, asserting no ref mutation.
-3. Forged, duplicated and malformed `Gitprism-*` trailers authored independently.
-4. Source->dest conflict recovery end to end.
-5. Credential URL redaction in every failure path.
-6. Concurrent local ref update between validation and write.
-7. Remote push success followed by dirty-worktree/local-ref update failure.
-8. `resolve` with global/system Git identity disabled.
-9. Missing `git` executable and hostile Git environment/config.
-10. Non-UTF-8 filenames, commit messages and conflict paths on Unix.
-11. Newline/ANSI content in remote diagnostics and config values.
-12. Worktrees, submodules/gitlinks, nested repositories and malformed objects.
-13. Empty destination repository and unborn branch behavior.
-14. Permission failures during control-file deletion/restoration and rollback.
-15. Large-history/resource-bound tests and subprocess timeout behavior.
-16. CLI parsing tests for global `--config`, `resolve --continue`, and invalid combinations.
-17. Linux and Windows CI integration tests.
+- Leading-dash and malformed remote values, validated branches and raw
+  refspec rejection.
+- Authenticated/forged/duplicate marker state and protected policy digests.
+- Credential redaction, terminal control escaping and invalid Git bytes.
+- Source-to-dest and dest-to-source conflict reproduction, explicit operator
+  continuation, excluded-path protection and stale state.
+- CAS local ref movement, operation-lock behavior, dirty worktrees and
+  untracked-file collisions.
+- Configured Git identity, rollback aggregation, bounded Git output/deadlines
+  and repository-controlled resource limits.
+- Unicode/non-UTF-8 path diagnostics and Unix byte-path preservation.
+- Authenticated exact resolution-worktree identity, registered common-directory
+  checks, and symlink/Unix-hard-link-safe control-file read/restore behavior
+  (`2202885`).
+
+Still-open tests and validation:
+
+1. Execute the pinned GitHub Actions matrix on Linux, macOS and Windows; the
+   workflow is present but has not run in this local environment.
+2. Add dedicated worktree, submodule/gitlink, nested-repository and malformed
+   object integration scenarios.
+3. Add empty-destination and unborn-branch workflow tests.
+4. Exercise missing `git`, hostile Git configuration and permission failures
+   on each supported platform.
+5. Add large-history benchmarks and verify practical behavior at each static
+   resource limit.
+6. Decide and test a release artifact smoke-test/install workflow after the
+   owner selects license, tags and distribution channels.
 
 The current suite is strongest around merge correctness, filtering, races at remote push, branch deletion policy, setup rollback under ref locking, rename behavior and conflict detection.
 
@@ -403,19 +582,30 @@ Strengths:
 - The two sync directions share `merge-tree`, avoiding divergent conflict semantics.
 - Object-only sync avoids unnecessary working-tree mutation.
 - The system uses fast-forward pushes and compare-and-swap correctly in `resolve`.
+- Setup/sync/resolve mutations share a non-blocking lock in Git's common
+  directory, including linked worktrees.
+- Repository-controlled policy and generated mapping state have separate
+  external authentication/verification boundaries.
+- Static repository/work/process budgets fail clearly rather than truncating or
+  silently dropping data.
 - Error propagation is generally contextual and user-oriented.
 - No production global mutable state.
 
 Weaknesses:
 
 - `sync.rs` combines orchestration, state discovery, filtering, marker parsing, commit construction, branch policy and local ref mutation. Its production portion is about 1,500 lines; its test module takes the file beyond 4,700.
-- Marker parsing is too weak to serve as a security-sensitive source of truth.
-- The configuration/exclusion-policy trust model conflicts with malicious-repository handling.
-- Git subprocess execution is centralized but not modeled through a small runner that can enforce option termination, environment policy, redaction and output bounds consistently.
+- The deployment policy digest and state key are external trust inputs; a
+  deployment that approves the wrong digest/key can still authorize the wrong
+  repository policy by design.
+- Git subprocess execution is centralized and hardened, but the Git executable,
+  configuration, credential helpers and hooks remain intentionally trusted.
 - `anyhow` is appropriate at the CLI boundary, but a few more typed outcomes would remove the need to parse Git prose and improve failure testing.
-- Several design documents are drafts despite implemented behavior, while README descriptions occasionally overstate `resolve` coverage.
+- Several design documents remain drafts despite implemented behavior; those
+  status labels should be reconciled before a public release.
 
-A rewrite is not warranted. The current structure can be strengthened by hardening `git.rs`, introducing validated domain types, and extracting marker/state and branch-advancement logic from `sync.rs`.
+A rewrite is not warranted. The current structure can be strengthened by
+introducing validated domain types and extracting marker/state and
+branch-advancement logic from `sync.rs`.
 
 ## 11. Recommended Action Plan
 
@@ -423,53 +613,44 @@ A rewrite is not warranted. The current structure can be strengthened by hardeni
 
 | Recommendation | Impact | Effort |
 |---|---|---|
-| Terminate Git option parsing and reject leading-dash remotes. | High | Small |
-| Validate branch names before any subprocess and fetch only fully qualified source refs. | High | Small |
-| Redesign or strictly verify trailer provenance; reject duplicates and forged marker shapes. | High | Medium/Large |
-| Remove raw remote URLs from all errors and logs. | High | Small |
-| Establish a protected source for remote and exclusion policy in CI. | High | Medium |
+| Protect `GITPRISM_POLICY_SHA256` and `GITPRISM_STATE_KEY` in the deployment system, and require approved source revisions. | High | Medium |
+| Run a pilot against a real source/destination pair with backup/recovery procedures before enabling unattended mutation. | High | Medium |
 
 ### P1 - Before Release
 
 | Recommendation | Impact | Effort |
 |---|---|---|
-| Implement or accurately document source->dest conflict recovery. | High | Medium/Large |
-| Make local ref advancement CAS-based and define post-push recovery. | High | Medium |
-| Add a repository operation lock. | High | Medium |
-| Use configured committer identity for resolve subprocesses. | Medium | Small |
-| Stop discarding rollback failures. | Medium | Medium |
-| Replace push prose parsing with porcelain output. | Medium | Medium |
-| Add the hostile-input and failure-atomicity tests listed above. | High | Medium |
+| Execute and require the pinned Linux/macOS/Windows Rust 1.89 CI matrix, including `cargo audit` and `cargo deny`. | High | Small |
+| Add worktree, submodule, malformed-object and empty-repository integration coverage. | Medium | Medium |
+| Choose and document the project license, canonical repository URL, release tag/version policy and signing policy. | High | Medium |
+| Replace `publish = false` with the owner-approved publication setting only after legal/distribution decisions are settled. | Medium | Small |
 
 ### P2 - Near Term
 
 | Recommendation | Impact | Effort |
 |---|---|---|
-| Add bounded output, non-interactive mode and configurable subprocess timeouts. | Medium | Medium |
-| Support or explicitly reject non-UTF-8 Git objects with documented behavior. | Medium | Medium/Large |
-| Extract validated `BranchName`, redacted `Remote`, marker parser and ref-update components. | Medium | Medium |
-| Add Linux/macOS/Windows CI plus worktree/submodule scenarios. | Medium | Medium |
-| Add license, Cargo metadata, MSRV, Git minimum version and reproducible release artifacts. | Medium | Medium |
-| Run `cargo audit`/`cargo deny` in CI with an explicit policy. | Medium | Small |
+| Extract validated branch/remote/state/ref-update components from the large command modules. | Medium | Medium |
+| Add release artifact packaging, checksums and installation instructions after owner decisions. | Medium | Medium/Large |
+| Add practical large-history benchmarks and tune documented static budgets from real workloads. | Medium | Medium |
+| Add a dedicated test for trusted Git hook/helper behavior and document that it is outside gitprism's sandbox. | Low | Small |
 
 ### P3 - Opportunistic
 
 | Recommendation | Impact | Effort |
 |---|---|---|
 | Split large inline test modules into integration/support modules. | Low | Medium |
-| Reject unknown TOML fields and duplicate branch entries. | Low | Small |
-| Preserve non-UTF-8 commit messages byte-for-byte. | Low/Medium | Medium |
-| Reconcile draft decision statuses and update the README test count. | Low | Small |
+| Add platform-specific artifact smoke tests and installer/package-manager integrations. | Low | Medium/Large |
+| Revisit full arbitrary-byte commit-message/tree-name support only if a real workflow requires it. | Low | Large |
 
 ## 12. Top 10 Recommendations
 
-1. Block leading-dash remote values and add option terminators to all Git commands.
-2. Validate branch names and never pass config values as raw fetch refspecs.
-3. Make synchronization markers unforgeable or structurally/provenance validated.
-4. Redact remote URLs and credentials from every diagnostic.
-5. Move config/exclusion policy to a protected trust boundary for CI execution.
-6. Provide a real source->dest conflict-resolution path.
-7. Use CAS ref updates and a repository-wide operation lock.
-8. Make resolve independent of global Git identity and hooks where possible.
-9. Add hostile-repository, non-UTF-8, dirty-worktree and partial-failure tests.
-10. Establish cross-platform CI, dependency auditing and production release metadata.
+1. Protect the external policy digest and authenticated state key in CI.
+2. Run a real source/destination pilot with documented rollback and recovery.
+3. Execute and require the pinned Linux/macOS/Windows Rust 1.89 workflow.
+4. Add worktree, submodule, malformed-object and empty-repository integration tests.
+5. Choose the license, canonical repository identity and release version/tag policy.
+6. Decide whether and how release artifacts are signed and verified.
+7. Add reproducible platform archives and SHA-256 checksums after those decisions.
+8. Keep `publish = false` until the legal and distribution review is complete.
+9. Extract state/ref-update/validated-input components from the large command modules.
+10. Benchmark real large repositories and tune the documented resource budgets.

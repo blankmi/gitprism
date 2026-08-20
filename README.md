@@ -29,10 +29,17 @@ compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (182 tests
+helper described below are implemented and covered by `cargo test` (186 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
+
+The repository CI workflow validates formatting, Clippy, locked tests and a
+locked release build with Rust 1.89, and runs the test suite on Linux, macOS
+and Windows. Dependency checks use `cargo audit` and `cargo deny`. This is
+engineering validation, not a production-distribution claim: there are no
+published packages, signed release artifacts, installers or package-manager
+formulas yet.
 
 ## How it works, briefly
 
@@ -64,9 +71,10 @@ and rejected — is recorded as individual decisions in
 
 ## Installing / building
 
-Requires Rust 1.89 or newer (2024 edition) and a `git` binary on `PATH` — gitprism calls
-out to real `git` for push/fetch/cherry-pick rather than reimplementing
-network or working-tree operations.
+Requires Rust 1.89 or newer (2024 edition) and Git 2.45 or newer on `PATH` —
+gitprism calls out to real `git` for push/fetch/cherry-pick rather than
+reimplementing network or working-tree operations. Git 2.45 is required for
+the raw-tree `git merge-tree` interface used by synchronization.
 
 Git subprocesses are noninteractive (`stdin` is closed and
 `GIT_TERMINAL_PROMPT=0`) and have a 300-second deadline. Operators running
@@ -97,10 +105,13 @@ those objects across platforms.
 Repository-controlled input also has static safety budgets: control files are
 limited to 1 MiB, small Git state files to 64 KiB, commit messages to 1 MiB,
 configured branches to 1,024, source-branch discovery to 4,096, pending
-commits to 10,000, and marker scans to 100,000 first-parent commits. Recursive tree work is limited to 1,000,000
-entries and depth 256; conflict reporting is limited to 100,000 records and
-8 MiB of raw path bytes. Exceeding a budget fails the operation; gitprism does
-not truncate data, skip conflicts, or choose a conflict resolution.
+commits to 10,000, and marker scans to 100,000 first-parent commits. Recursive
+tree work is limited to 1,000,000 entries and depth 256; conflict reporting is
+limited to 100,000 records and 8 MiB of raw path bytes. Resolution worktrees
+are signed into their operation state and must remain registered to the same
+Git common directory; tampered or legacy state fails closed. Exceeding a
+budget fails the operation; gitprism does not truncate data, skip conflicts,
+or choose a conflict resolution.
 
 ## Configuration: `.gitprism.toml`
 
