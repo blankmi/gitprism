@@ -50,3 +50,9 @@ trailer and performs the ff-only push itself.
 * The helper needs its own small piece of design later: how it identifies "which
   pair, which conflicting commit" without the human having to supply raw shas by
   hand — deferred as a concrete follow-up, not resolved here.
+
+## Source-to-dest resolution
+
+[Decision 0027](0027-source-to-dest-resolution-state.md) extends this helper to
+source→dest conflicts using an authenticated linked worktree and filtered
+synthetic patch. The original source checkout remains untouched.

@@ -437,7 +437,7 @@ fn sync_pair_to_dest_with_key(
                 Direction::SourceToDest,
                 round_tripped,
                 Some(&format!(
-                    "hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to dest's {branch:?} branch",
+                    "hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve <branch> --direction source-to-dest`; commits before it were still pushed to dest's {branch:?} branch",
                     conflict.commit, conflict.paths
                 )),
             );
@@ -447,7 +447,7 @@ fn sync_pair_to_dest_with_key(
             // otherwise read as "the run hung," not "the run errored."
             reporter.finish();
             anyhow::bail!(
-                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to dest's {branch:?} branch",
+                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at source commit {} in {:?} — resolve it with `gitprism resolve <branch> --direction source-to-dest`; commits before it were still pushed to dest's {branch:?} branch",
                 conflict.commit,
                 conflict.paths
             );
@@ -801,7 +801,7 @@ fn dest_tip_is_accounted_for(
 /// or to the graft: an older boundary would make [`pending_commits`]
 /// re-yield everything between the two markers, the same bug with a wider
 /// blast radius.
-fn dest_resume_point_for_branch(
+pub(crate) fn dest_resume_point_for_branch(
     repo: &Repository,
     source_tip: Oid,
     dest_tip: Oid,
@@ -859,7 +859,7 @@ fn dest_resume_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Resul
 /// walking what's pending for source — the walk itself doesn't care which
 /// repo-side branch it's scoped to (decisions/0005: the ref you scan already
 /// supplies that context).
-fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Result<Vec<Oid>> {
+pub(crate) fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Result<Vec<Oid>> {
     let mut revwalk = repo.revwalk().context("starting a pending-commit walk")?;
     revwalk
         .push(tip)
@@ -914,7 +914,7 @@ fn load_current_exclude_list(repo: &Repository, source_tip: Oid) -> Result<Exclu
 /// Non-tree entries are re-inserted with their original `filemode()`
 /// preserved — what keeps executable bits, symlinks, and gitlinks intact,
 /// and stops a submodule being recursed into as if it were an ordinary tree.
-fn filter_tree(
+pub(crate) fn filter_tree(
     repo: &Repository,
     tree: &git2::Tree,
     prefix: &Path,
@@ -981,7 +981,7 @@ fn empty_tree(repo: &Repository) -> Result<Oid> {
 /// Preserves the original author, stamps gitprism's own committer identity
 /// (decisions/0010), and carries the `Gitprism-Source-Commit` trailer
 /// (decisions/0003) that lets a future sync resume from here.
-fn build_dest_commit(
+pub(crate) fn build_dest_commit(
     repo: &Repository,
     config: &Config,
     parent: Oid,

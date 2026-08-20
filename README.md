@@ -23,7 +23,7 @@ preference.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (140 tests
+helper described below are implemented and covered by `cargo test` (144 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -185,6 +185,28 @@ gitprism resolve <branch> --continue
 which finishes the cherry-pick, writes the trailer gitprism needs to track
 that the conflict is resolved, and pushes the result. No trailer to hand-type,
 no gitprism-specific merge UI — resolution is 100% standard git.
+
+For a source-to-dest conflict, use the explicit direction:
+
+```sh
+gitprism resolve <branch> --direction source-to-dest
+```
+
+Gitprism creates a unique linked worktree containing destination-space content
+and leaves the source checkout unchanged. Resolve and stage the conflict there,
+then run:
+
+```sh
+gitprism resolve <branch> --direction source-to-dest --continue
+```
+
+The operation is authenticated and resumable through Git metadata. Edits to
+excluded paths are rejected, and destination-owned paths matching an exclusion
+remain intact. If the destination moves or the final push loses its
+fast-forward race, copy or save the staged resolution, remove the reported
+linked worktree, rerun the source-to-dest resolve command against the new
+destination, and reapply the resolution there. Do not retry `--continue` after
+the destination has moved.
 
 ## Design documentation
 

@@ -33,6 +33,8 @@ pub(crate) enum Direction {
     Setup,
     SourceToDest,
     DestToSource,
+    ResolveSourceToDestState,
+    ResolveSourceToDestPatch,
 }
 
 impl Direction {
@@ -41,6 +43,8 @@ impl Direction {
             Self::Setup => "setup",
             Self::SourceToDest => "source-to-dest",
             Self::DestToSource => "dest-to-source",
+            Self::ResolveSourceToDestState => "resolve-source-to-dest-state",
+            Self::ResolveSourceToDestPatch => "resolve-source-to-dest-patch",
         }
     }
 }
@@ -52,7 +56,7 @@ pub(crate) struct ParsedMarker {
     pub(crate) branch: String,
     pub(crate) counterpart: Oid,
     mac: [u8; MAC_BYTES],
-    body: String,
+    pub(crate) body: String,
 }
 
 /// Read and validate the external state key. Tests use a fixed key so unit
@@ -258,6 +262,8 @@ pub(crate) fn parse(message: &str) -> Option<ParsedMarker> {
         "setup" => Direction::Setup,
         "source-to-dest" => Direction::SourceToDest,
         "dest-to-source" => Direction::DestToSource,
+        "resolve-source-to-dest-state" => Direction::ResolveSourceToDestState,
+        "resolve-source-to-dest-patch" => Direction::ResolveSourceToDestPatch,
         _ => return None,
     };
     let branch = final_lines[2].strip_prefix("Gitprism-Branch: ")?;
@@ -270,7 +276,9 @@ pub(crate) fn parse(message: &str) -> Option<ParsedMarker> {
     let mapping_prefix = format!(
         "Gitprism-{}-Commit: {counterpart}",
         match direction {
-            Direction::SourceToDest => "Source",
+            Direction::SourceToDest
+            | Direction::ResolveSourceToDestState
+            | Direction::ResolveSourceToDestPatch => "Source",
             Direction::Setup | Direction::DestToSource => "Dest",
         }
     );

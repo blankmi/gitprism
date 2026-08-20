@@ -11,7 +11,7 @@ use std::path::Path;
 
 use clap::Parser;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, ResolveDirection};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -19,9 +19,20 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Commands::Setup => commands::setup::run(Path::new("."), &cli.config),
         Commands::Sync => commands::sync::run(Path::new("."), &cli.config),
-        Commands::Resolve { branch, r#continue } => {
-            commands::resolve::run(Path::new("."), &cli.config, branch, *r#continue)
-        }
+        Commands::Resolve {
+            branch,
+            direction,
+            r#continue,
+        } => commands::resolve::run_with_direction(
+            Path::new("."),
+            &cli.config,
+            branch,
+            *r#continue,
+            match direction {
+                ResolveDirection::DestToSource => commands::resolve::Direction::DestToSource,
+                ResolveDirection::SourceToDest => commands::resolve::Direction::SourceToDest,
+            },
+        ),
         Commands::PolicyHash => commands::policy_hash::run(Path::new("."), &cli.config),
     }
 }

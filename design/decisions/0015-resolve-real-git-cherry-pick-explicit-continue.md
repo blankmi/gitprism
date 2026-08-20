@@ -107,7 +107,7 @@ index still has unresolved conflicts.
   cherry-pick was judged not worth the added complexity for how infrequently this
   runs. Can be revisited if it turns out to matter in practice.
 * This decision is written for dest→source's conflict shape specifically (cherry-pick).
-  Source→dest's own conflict (decisions/0014, a failed diff apply rather than a
-  cherry-pick) is not yet wired into `resolve` — tracked as a follow-up, not solved
-  here.
+  Source→dest's conflict path is now specified by [decision 0027](0027-source-to-dest-resolution-state.md):
+  it uses a filtered synthetic one-parent patch in an isolated linked worktree,
+  with an authenticated Git operation ref and `--continue` validation.
 </content>

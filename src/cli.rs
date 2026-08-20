@@ -11,7 +11,15 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ResolveDirection {
+    /// Apply a pending destination commit onto source (the historical default).
+    DestToSource,
+    /// Apply a pending source commit onto destination.
+    SourceToDest,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "gitprism", version, about, long_about = None)]
@@ -48,6 +56,11 @@ pub enum Commands {
         /// `sync`'s own conflict error prints.
         branch: String,
 
+        /// Direction of the conflict to resolve. Defaults to dest-to-source
+        /// for compatibility with the original resolve command.
+        #[arg(long, value_enum, default_value_t = ResolveDirection::DestToSource)]
+        direction: ResolveDirection,
+
         /// Finish a cherry-pick already started by a prior `gitprism resolve
         /// <branch>` run, once the human has resolved its conflicts and `git
         /// add`ed them. Explicit, matching git's own `rebase`/`cherry-pick`/
@@ -77,5 +90,27 @@ mod tests {
         let cli =
             Cli::try_parse_from(["gitprism", "--config", "policy.toml", "policy-hash"]).unwrap();
         assert_eq!(cli.config, PathBuf::from("policy.toml"));
+    }
+
+    #[test]
+    fn resolve_direction_is_explicit_and_defaults_to_dest_to_source() {
+        let cli = Cli::try_parse_from(["gitprism", "resolve", "main"]).unwrap();
+        let Commands::Resolve { direction, .. } = cli.command else {
+            panic!("expected resolve command");
+        };
+        assert_eq!(direction, ResolveDirection::DestToSource);
+
+        let cli = Cli::try_parse_from([
+            "gitprism",
+            "resolve",
+            "main",
+            "--direction",
+            "source-to-dest",
+        ])
+        .unwrap();
+        let Commands::Resolve { direction, .. } = cli.command else {
+            panic!("expected resolve command");
+        };
+        assert_eq!(direction, ResolveDirection::SourceToDest);
     }
 }

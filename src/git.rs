@@ -267,6 +267,45 @@ pub fn push(
     );
 }
 
+/// Add a detached linked worktree for an interactive resolve operation. The
+/// path is passed as an argument, never through a shell, and the worktree is
+/// deliberately owned by git so its cherry-pick state survives the command
+/// that starts the human resolution.
+pub(crate) fn worktree_add(repo_dir: &Path, worktree: &Path, commit: git2::Oid) -> Result<()> {
+    let output = git_command()
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("worktree")
+        .arg("add")
+        .arg("--detach")
+        .arg(worktree)
+        .arg(commit.to_string())
+        .output()
+        .context("running git worktree add")?;
+    if !output.status.success() {
+        let stderr = git_diagnostic(&output.stderr, None);
+        anyhow::bail!("git worktree add failed ({}): {stderr}", output.status);
+    }
+    Ok(())
+}
+
+pub(crate) fn worktree_remove(repo_dir: &Path, worktree: &Path) -> Result<()> {
+    let output = git_command()
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("worktree")
+        .arg("remove")
+        .arg("--force")
+        .arg(worktree)
+        .output()
+        .context("running git worktree remove")?;
+    if !output.status.success() {
+        let stderr = git_diagnostic(&output.stderr, None);
+        anyhow::bail!("git worktree remove failed ({}): {stderr}", output.status);
+    }
+    Ok(())
+}
+
 /// What a real `git cherry-pick` subprocess attempt (decisions/0015) came
 /// back with. `Clean` covers both "applied with no conflicts" and, for
 /// [`cherry_pick_continue`], "the human's resolution is now complete" —
@@ -325,6 +364,26 @@ pub fn cherry_pick(
         .output()
         .with_context(|| format!("running git cherry-pick {commit}"))?;
     cherry_pick_outcome(output, || format!("git cherry-pick {commit}"))
+}
+
+/// Starts an interactive cherry-pick without creating a commit. This keeps
+/// identity and commit hooks out of the temporary resolution worktree; the
+/// final authenticated commit is built by gitprism after the index is staged.
+pub(crate) fn cherry_pick_no_commit(
+    repo_dir: &Path,
+    commit: git2::Oid,
+    mainline: Option<u32>,
+) -> Result<CherryPickOutcome> {
+    let mut cmd = git_command();
+    cmd.arg("-C").arg(repo_dir).arg("cherry-pick");
+    if let Some(mainline) = mainline {
+        cmd.arg("-m").arg(mainline.to_string());
+    }
+    cmd.arg("--no-commit").arg(commit.to_string());
+    let output = cmd
+        .output()
+        .with_context(|| format!("running git cherry-pick --no-commit {commit}"))?;
+    cherry_pick_outcome(output, || format!("git cherry-pick --no-commit {commit}"))
 }
 
 /// Finishes a cherry-pick already in progress in `repo_dir` (started by

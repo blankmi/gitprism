@@ -110,7 +110,7 @@ fn read_control_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("reading config at {}", path.display()))
 }
 
-fn digest_bytes(config: &[u8], ignore: &[u8]) -> String {
+pub(crate) fn digest_bytes(config: &[u8], ignore: &[u8]) -> String {
     let mut input = Vec::with_capacity(DOMAIN.len() + config.len() + ignore.len() + 16);
     input.extend_from_slice(DOMAIN);
     for field in [config, ignore] {

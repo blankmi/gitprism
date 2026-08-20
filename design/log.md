@@ -1037,3 +1037,10 @@ versioned `.gitprism.toml` and `.gitprismignore` remain reviewable, but
 `GITPRISM_POLICY_SHA256` digest over their exact raw bytes before parsing or
 mutation. `sync` uses one verified exclude list for the entire run, and the
 read-only `gitprism policy-hash` command prints the deployment pin.
+
+**Update**: Decided [0027](decisions/0027-source-to-dest-resolution-state.md) —
+source-to-dest conflicts use an authenticated Git operation ref, a filtered
+synthetic patch, and a unique linked worktree. The source checkout remains
+untouched; continuation validates source, policy, patch, and worktree state,
+rejects excluded-path edits, and applies the allowed resolution delta back onto
+the original destination tree before an ff-only push.
