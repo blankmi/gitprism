@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v<package-version> tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-tag:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Verify tag matches package version
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          package_version="$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && $0 ~ /^version[[:space:]]*=/ {
+              sub(/^[^=]*=[[:space:]]*/, "")
+              sub(/[[:space:]]*#.*/, "")
+              gsub(/^"|"$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          expected_tag="v${package_version}"
+          test -n "$package_version" || { echo "Could not read package version" >&2; exit 1; }
+          test "$RELEASE_TAG" = "$expected_tag" || {
+            echo "Release tag $RELEASE_TAG does not match package version tag $expected_tag" >&2
+            exit 1
+          }
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG" || {
+            echo "Release tag $RELEASE_TAG does not exist" >&2
+            exit 1
+          }
+          tag_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          test "$head_commit" = "$tag_commit" || {
+            echo "Checked-out HEAD $head_commit does not match peeled tag commit $tag_commit" >&2
+            exit 1
+          }
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: verify-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - name: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - name: macOS x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.verify-tag.outputs.tag }}
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.89.0
+          targets: ${{ matrix.target }}
+
+      - name: Verify checked-out tag commit
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.verify-tag.outputs.commit }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+
+      - name: Build locked release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Run locked release-target tests
+        run: cargo test --workspace --all-features --locked --target "${{ matrix.target }}"
+
+      - name: Smoke-test binary
+        shell: bash
+        run: ./target/${{ matrix.target }}/release/gitprism${{ matrix.archive == 'zip' && '.exe' || '' }} --version
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          archive="gitprism-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          staging="package-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/gitprism" "$staging/gitprism"
+          cp README.md LICENSE "$staging/"
+          tar -czf "$archive" -C "$staging" gitprism README.md LICENSE
+          mkdir dist
+          mv "$archive" dist/
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          $archive = "gitprism-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+          $staging = "package-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging, dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\gitprism.exe" "$staging\gitprism.exe"
+          Copy-Item README.md, LICENSE $staging
+          Compress-Archive -Path "$staging\gitprism.exe", "$staging\README.md", "$staging\LICENSE" -DestinationPath "dist\$archive"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: gitprism-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs:
+      - verify-tag
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.verify-tag.outputs.tag }}
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checked-out tag commit
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.verify-tag.outputs.commit }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$(find dist -maxdepth 1 -type f -print -quit)"
+          (cd dist && sha256sum -- * > SHA256SUMS)
+
+      - name: Create draft GitHub release with assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: gh release create "$RELEASE_TAG" dist/* --draft --verify-tag --title "$RELEASE_TAG" --generate-notes
+
+      - name: Publish release after asset upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
