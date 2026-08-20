@@ -1,0 +1,69 @@
+---
+type: Decision
+title: Materialize control files byte-exact regardless of checkout filtering
+description: .gitprism.toml and .gitprismignore are rewritten straight from their blob bytes after every checkout that might place them, bypassing text/CRLF filtering; every other file keeps its ordinary checkout attributes.
+tags: [security, config, filtering, portability]
+status: stable
+generated: { by: "human:michael.blank@evia.de", at: 2026-08-20T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-20T00:00:00Z }
+---
+
+# Context
+
+[0026](0026-protected-versioned-policy.md) requires `.gitprism.toml` and
+`.gitprismignore` to be authenticated as exact bytes: `GITPRISM_POLICY_SHA256`
+pins a digest over the raw bytes every command reads back off disk. libgit2's
+checkout applies ordinary text/CRLF filtering (`core.autocrlf`,
+`.gitattributes`) when materializing a tree into the working directory, the
+same as for any other tracked file, and gitprism never overrode that for
+these two. On a machine where `core.autocrlf=true` — a common Git for
+Windows default — checkout silently turns the committed LF blob into CRLF on
+disk with no change to the blob itself, so the bytes a deployment pinned no
+longer match what a later `setup`/`sync`/`resolve` run reads back, for
+reasons unrelated to any real content change. This defeats 0026's premise of
+an exact, portable byte anchor. Windows CI surfaced it concretely:
+`setup`'s own "don't run again against your own prior graft" guard misfired
+because its raw-byte comparison against the external `--config` file saw a
+checkout-mangled copy instead of what was actually committed.
+
+# Decision
+
+Every checkout that might place `.gitprism.toml` or `.gitprismignore` in the
+working tree — `setup`'s initial graft/merge checkout, and `sync`'s/
+`resolve`'s checkout of what dest→source or a resolve replacement just
+landed on the local source branch — is immediately followed by
+`policy::restore_control_files_exact`, which re-writes both files straight
+from the checked-out commit's tree blobs via a raw filesystem write. This
+bypasses the working-tree filter pipeline entirely, but only for these two
+filenames: every other file continues through git's normal checkout
+attribute/config handling untouched, so a repository owner's own
+`.gitattributes`/`core.autocrlf` choices for their own tracked content are
+unaffected. The digest comparison itself (`policy::verify_expected_digest`)
+and `setup`'s `ensure_external_config_is_not_overwritten` raw-byte comparison
+are unchanged — this fixes what lands on disk, not what an already-correct
+comparison does with it. Neither is loosened or made to normalize bytes
+before comparing.
+
+Rejected: disabling checkout filters for the whole tree via
+`CheckoutBuilder::disable_filters`. That would also strip whatever filtering
+a repository owner legitimately relies on for their own source/dest content,
+which is unrelated to gitprism's own two control files.
+
+# Why
+
+0026's digest is only a meaningful trust boundary if the exact bytes it
+authenticates are also the exact bytes every command reads back, on every
+platform gitprism runs on. Scoping the fix to the two known control-file
+names preserves that guarantee without imposing an opinion on how the rest
+of the repository's content should be checked out.
+
+# Consequences
+
+`policy::restore_control_files_exact` must run after every real (non-dry-run)
+checkout of a tree that may contain these two files; a future checkout call
+site that forgets it reintroduces this bug. Tests set `core.autocrlf=true` on
+the test repository itself (not the process's ambient git config) and prove
+both directions: the two control files stay byte-identical and pass a
+`policy::hash_files` check, while an ordinary tracked text file still
+receives normal CRLF conversion.

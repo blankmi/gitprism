@@ -1500,6 +1500,7 @@ fn advance_local_source_branch(
         // overwritten just because dest→source advanced the branch.
         repo.checkout_tree(new_commit.as_object(), None)
             .context("checking out what dest→source just pushed into the working tree")?;
+        crate::policy::restore_control_files_exact(repo, &new_commit.tree()?)?;
     }
 
     repo.reference_matching(

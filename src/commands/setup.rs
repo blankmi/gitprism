@@ -713,6 +713,7 @@ fn checkout_branch(repo: &Repository, branch: &str, original_oid: Option<git2::O
     // as a checkout conflict, not get silently overwritten.
     repo.checkout_tree(commit.as_object(), None)
         .with_context(|| format!("checking out {refname} into the working directory"))?;
+    crate::policy::restore_control_files_exact(repo, &commit.tree()?)?;
     repo.set_head(&refname)
         .with_context(|| format!("setting HEAD to {refname}"))?;
     Ok(())
@@ -1065,6 +1066,58 @@ mod tests {
         assert!(
             repo.find_branch("main", git2::BranchType::Local).is_ok(),
             "the configured branch, having no local copy, must still get a fresh graft"
+        );
+    }
+
+    #[test]
+    fn run_keeps_control_files_byte_exact_when_source_repo_has_autocrlf_enabled() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(
+            dest_dir.path(),
+            "main",
+            &[("a.txt", "line one\nline two\n")],
+        );
+
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        // Reproduces a real Windows machine's ambient Git for Windows
+        // default on the repo under test, without touching this test
+        // process's own global git config.
+        repo.config()
+            .unwrap()
+            .set_bool("core.autocrlf", true)
+            .unwrap();
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+        let config_raw = fs::read(config.path()).unwrap();
+
+        run(source_dir.path(), config.path()).expect("setup should succeed");
+
+        // decisions/0026 and 0034: the checked-out control file must stay
+        // byte-for-byte what was written to its blob, regardless of the
+        // repo's own autocrlf setting.
+        let config_path = source_dir.path().join(crate::config::FILENAME);
+        let on_disk_config = fs::read(&config_path).unwrap();
+        assert_eq!(
+            on_disk_config, config_raw,
+            "'.gitprism.toml' must stay byte-exact even when the source repo has core.autocrlf enabled"
+        );
+        let ignore_path = source_dir.path().join(exclude::FILENAME);
+        let on_disk_ignore = fs::read(&ignore_path).unwrap();
+        assert_eq!(
+            crate::policy::hash_files(&config_path, &ignore_path).unwrap(),
+            crate::policy::digest_bytes(&on_disk_config, &on_disk_ignore),
+            "policy-hash must see exactly the bytes setup committed, unaffected by checkout filtering"
+        );
+
+        // An ordinary tracked file is not special-cased — it must still
+        // receive git's normal autocrlf checkout conversion, proving the fix
+        // is scoped to the two control files rather than disabling checkout
+        // filtering altogether.
+        assert_eq!(
+            fs::read(source_dir.path().join("a.txt")).unwrap(),
+            b"line one\r\nline two\r\n",
+            "an ordinary text file must still receive autocrlf checkout conversion"
         );
     }
 

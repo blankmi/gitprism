@@ -1125,3 +1125,15 @@ every archive, intentionally unsigned artifacts, and no crates.io publication.
 tags, builds/tests/smoke-checks the four approved targets, uploads the archives,
 generates `SHA256SUMS`, and draft-gates GitHub publication. Artifacts remain
 intentionally unsigned.
+
+## 2026-08-20 — control files stay byte-exact through checkout
+
+**Update**: Decided [0034](decisions/0034-control-files-stay-byte-exact-through-checkout.md)
+— Windows CI surfaced that libgit2's checkout applies ordinary `core.autocrlf`/
+`.gitattributes` text filtering to `.gitprism.toml`/`.gitprismignore` like any
+other tracked file, silently invalidating decision 0026's pinned digest on a
+machine where `core.autocrlf=true` even though nothing in the repository
+changed. `policy::restore_control_files_exact` now re-writes both straight
+from their blob bytes after every checkout that might place them; every other
+file keeps its ordinary checkout attributes, and disabling filters for the
+whole tree was rejected as overreach.

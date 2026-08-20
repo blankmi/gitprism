@@ -89,6 +89,42 @@ fn parse_verified_bytes(
     })
 }
 
+/// `.gitprism.toml` and `.gitprismignore` are authenticated by their exact
+/// bytes (decisions/0026) — every other file in a checkout stays free to go
+/// through git's ordinary text/CRLF filtering (`core.autocrlf`,
+/// `.gitattributes`) exactly like any other tracked file. libgit2 applies
+/// that same filtering to these two files during an ordinary checkout, so a
+/// working tree materialized on a machine with, e.g., `core.autocrlf=true`
+/// can silently change their on-disk bytes without their blob ever changing
+/// — invalidating a deployment's pinned `GITPRISM_POLICY_SHA256` for reasons
+/// that have nothing to do with an actual content change.
+///
+/// Re-materialize both straight from `tree`'s blobs after any checkout that
+/// might have touched them, bypassing the working-tree filter pipeline
+/// entirely. This is scoped to just these two files rather than disabling
+/// filters for the whole checkout (`CheckoutBuilder::disable_filters`),
+/// which would also strip filtering the repository owner legitimately
+/// relies on for their own source/dest content.
+pub(crate) fn restore_control_files_exact(
+    repo: &git2::Repository,
+    tree: &git2::Tree,
+) -> Result<()> {
+    let workdir = repo
+        .workdir()
+        .context("resolving the working directory to restore control files exactly")?;
+    for filename in [crate::config::FILENAME, crate::exclude::FILENAME] {
+        let Some(entry) = tree.get_name(filename) else {
+            continue;
+        };
+        let blob = repo
+            .find_blob(entry.id())
+            .with_context(|| format!("reading the {filename} blob to restore it exactly"))?;
+        fs::write(workdir.join(filename), blob.content())
+            .with_context(|| format!("restoring {filename} byte-exact after checkout"))?;
+    }
+    Ok(())
+}
+
 fn read_ignore(path: &Path) -> Result<Vec<u8>> {
     match fs::symlink_metadata(path) {
         Ok(_) => limits::read_regular_file(path, limits::MAX_CONTROL_FILE_BYTES, "ignore file"),
