@@ -7,7 +7,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::thread;
@@ -553,7 +553,7 @@ pub(crate) fn worktree_add(repo_dir: &Path, worktree: &Path, commit: git2::Oid) 
         .arg("worktree")
         .arg("add")
         .arg("--detach")
-        .arg(worktree)
+        .arg(subprocess_path(worktree))
         .arg(commit.to_string());
     let output = run_git_output(command, SMALL_OUTPUT).context("running git worktree add")?;
     if !output.status.success() {
@@ -571,13 +571,41 @@ pub(crate) fn worktree_remove(repo_dir: &Path, worktree: &Path) -> Result<()> {
         .arg("worktree")
         .arg("remove")
         .arg("--force")
-        .arg(worktree);
+        .arg(subprocess_path(worktree));
     let output = run_git_output(command, SMALL_OUTPUT).context("running git worktree remove")?;
     if !output.status.success() {
         let stderr = git_diagnostic(&output.stderr, None);
         anyhow::bail!("git worktree remove failed ({}): {stderr}", output.status);
     }
     Ok(())
+}
+
+/// `fs::canonicalize` on Windows returns an extended-length (`\\?\`-prefixed,
+/// "verbatim") path. `worktree_add`/`worktree_remove` above run through Git
+/// for Windows' MSYS-based git, which does not reliably accept that prefix
+/// as a path argument — strip it back to an ordinary absolute path for
+/// exactly this subprocess-argument boundary. This must never leak into a
+/// caller's own copy of the path: decisions/0033's symlink-substitution
+/// check authenticates a resolution worktree path by requiring it to equal
+/// its own `fs::canonicalize` output exactly, which on Windows is always
+/// verbatim-prefixed.
+#[cfg(windows)]
+fn subprocess_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn subprocess_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// What a real `git cherry-pick` subprocess attempt (decisions/0015) came

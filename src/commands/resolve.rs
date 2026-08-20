@@ -644,10 +644,8 @@ fn reject_excluded_edits(
 }
 
 fn resolution_worktree_path() -> Result<PathBuf> {
-    let root = strip_windows_verbatim_prefix(
-        fs::canonicalize(std::env::temp_dir())
-            .context("canonicalizing the temporary directory for resolution worktrees")?,
-    );
+    let root = fs::canonicalize(std::env::temp_dir())
+        .context("canonicalizing the temporary directory for resolution worktrees")?;
     let pid = std::process::id();
     let start = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -662,29 +660,6 @@ fn resolution_worktree_path() -> Result<PathBuf> {
         }
     }
     anyhow::bail!("unable to reserve a unique gitprism resolution worktree path")
-}
-
-/// `fs::canonicalize` on Windows returns an extended-length (`\\?\`-prefixed,
-/// "verbatim") path. `git worktree add` below runs through Git for Windows'
-/// MSYS-based subprocess, which does not reliably accept that prefix as a
-/// path argument — strip it back to an ordinary absolute path first.
-#[cfg(windows)]
-fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
-    let Some(text) = path.to_str() else {
-        return path;
-    };
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        path
-    }
-}
-
-#[cfg(not(windows))]
-fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
-    path
 }
 
 fn reserve_resolution_worktree_path(path: &Path) -> Result<()> {

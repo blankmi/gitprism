@@ -1137,3 +1137,13 @@ changed. `policy::restore_control_files_exact` now re-writes both straight
 from their blob bytes after every checkout that might place them; every other
 file keeps its ordinary checkout attributes, and disabling filters for the
 whole tree was rejected as overreach.
+
+**Update**: Windows CI also exposed a `git worktree add`/`remove` failure
+underneath [0033](decisions/0033-authenticated-resolution-worktree-and-safe-file-recovery.md):
+`fs::canonicalize`'s Windows result is an extended-length (`\\?\`-prefixed)
+path, which Git for Windows' MSYS-based git does not reliably accept as a
+`worktree add`/`remove` argument. The authenticated worktree path itself
+still keeps `fs::canonicalize`'s exact output everywhere — 0033's
+symlink-substitution check depends on that canonical form matching itself —
+`git::worktree_add`/`worktree_remove` now strip the verbatim prefix only for
+the literal subprocess argument they pass to `git`.
