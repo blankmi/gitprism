@@ -29,7 +29,7 @@ compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (154 tests
+helper described below are implemented and covered by `cargo test` (156 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -133,7 +133,11 @@ and store it in your CI secret manager. Gitprism keeps the
 normal `Gitprism-Source-Commit` / `Gitprism-Dest-Commit` trailers readable, but
 trusts them only when the commit also has a final authenticated state block.
 The key is never committed and is removed from Git subprocess environments so
-repository hooks and helpers cannot read it. User-supplied `Gitprism-*` lines
+repository hooks and helpers cannot read it. Resolved `GITPRISM_SOURCE_URL` and
+`GITPRISM_DEST_URL` fallback values are scrubbed from those children too;
+normal Git authentication variables such as `GIT_ASKPASS` remain available.
+Git's executable, global/local configuration, credential helpers, and
+repository hooks are still a trusted boundary. User-supplied `Gitprism-*` lines
 are stripped from generated messages to prevent a second trusted marker; use
 ordinary prose for literal documentation of those names.
 
@@ -190,7 +194,10 @@ gitprism resolve <branch> --continue
 
 which finishes the cherry-pick, writes the trailer gitprism needs to track
 that the conflict is resolved, and pushes the result. No trailer to hand-type,
-no gitprism-specific merge UI — resolution is 100% standard git.
+no gitprism-specific merge UI — resolution is 100% standard git. The temporary
+cherry-pick commit uses the configured `[committer]` identity and preserves the
+picked commit's author; it does not depend on the operator's global Git
+identity.
 
 For a source-to-dest conflict, use the explicit direction:
 

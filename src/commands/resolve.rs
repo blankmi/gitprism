@@ -163,7 +163,7 @@ fn require_branch_checked_out(repo: &Repository, branch: &str) -> Result<()> {
 
     if !head_points_here {
         anyhow::bail!(
-            "gitprism resolve: branch {branch:?} isn't checked out — check it out first (`git checkout {branch}`)"
+            "gitprism resolve: branch {branch:?} isn't checked out — check it out first with `git checkout <branch>`"
         );
     }
     Ok(())
@@ -871,7 +871,7 @@ fn resolve_start(
 ) -> Result<()> {
     if cherry_pick_head.exists() {
         anyhow::bail!(
-            "gitprism resolve: a cherry-pick is already in progress for {branch:?} — resolve its conflicts and run `gitprism resolve {branch} --continue`, or `git cherry-pick --abort` to cancel and start over"
+            "gitprism resolve: a cherry-pick is already in progress for {branch:?} — resolve its conflicts and run `gitprism resolve <branch> --continue`, or `git cherry-pick --abort` to cancel and start over"
         );
     }
     require_branch_checked_out(repo, branch)?;
@@ -908,8 +908,14 @@ fn resolve_start(
         .context("resolving the dest commit to cherry-pick")?;
     let mainline = (dest_commit.parent_count() > 1).then_some(1);
 
-    match git::cherry_pick(source_root, dest_oid, mainline)
-        .with_context(|| format!("cherry-picking dest commit {dest_oid} onto source"))?
+    match git::cherry_pick(
+        source_root,
+        dest_oid,
+        mainline,
+        &config.committer.name,
+        &config.committer.email,
+    )
+    .with_context(|| format!("cherry-picking dest commit {dest_oid} onto source"))?
     {
         CherryPickOutcome::Clean => {
             finish(repo, source_root, config, branch, dest_oid, state_key)?;
@@ -918,7 +924,7 @@ fn resolve_start(
         CherryPickOutcome::Conflict => {
             let conflicted_paths = conflicted_paths(repo)?;
             anyhow::bail!(
-                "gitprism resolve: {branch:?} <- {branch:?} hit a real conflict cherry-picking dest commit {dest_oid} — resolve the conflict markers in {conflicted_paths:?}, `git add` them, then run `gitprism resolve {branch} --continue`"
+                "gitprism resolve: {branch:?} <- {branch:?} hit a real conflict cherry-picking dest commit {dest_oid} — resolve the conflict markers in {conflicted_paths:?}, `git add` them, then run `gitprism resolve <branch> --continue`"
             );
         }
     }
@@ -934,7 +940,7 @@ fn resolve_continue(
 ) -> Result<()> {
     if !cherry_pick_head.exists() {
         anyhow::bail!(
-            "gitprism resolve: no cherry-pick in progress for {branch:?} — run `gitprism resolve {branch}` first"
+            "gitprism resolve: no cherry-pick in progress for {branch:?} — run `gitprism resolve <branch>` first"
         );
     }
     require_branch_checked_out(repo, branch)?;
@@ -990,16 +996,18 @@ fn resolve_continue(
     {
         let conflicted_paths = conflicted_paths(repo)?;
         anyhow::bail!(
-            "gitprism resolve: {branch:?} still has unresolved conflicts in {conflicted_paths:?} — resolve them and `git add` before running `gitprism resolve {branch} --continue` again"
+            "gitprism resolve: {branch:?} still has unresolved conflicts in {conflicted_paths:?} — resolve them and `git add` before running `gitprism resolve <branch> --continue` again"
         );
     }
 
-    match git::cherry_pick_continue(source_root).context("finishing the cherry-pick")? {
+    match git::cherry_pick_continue(source_root, &config.committer.name, &config.committer.email)
+        .context("finishing the cherry-pick")?
+    {
         CherryPickOutcome::Clean => finish(repo, source_root, config, branch, dest_oid, state_key),
         CherryPickOutcome::Conflict => {
             let conflicted_paths = conflicted_paths(repo)?;
             anyhow::bail!(
-                "gitprism resolve: {branch:?} still has unresolved conflicts in {conflicted_paths:?} — resolve them and `git add` before running `gitprism resolve {branch} --continue` again"
+                "gitprism resolve: {branch:?} still has unresolved conflicts in {conflicted_paths:?} — resolve them and `git add` before running `gitprism resolve <branch> --continue` again"
             );
         }
     }
@@ -1138,6 +1146,22 @@ mod tests {
         )
         .unwrap();
         file
+    }
+
+    #[test]
+    fn hostile_branch_names_are_displayed_outside_literal_operator_commands() {
+        let branch = "feature-$(touch-pwned)";
+        git::validate_branch_name(branch).expect("the hostile test branch remains a valid ref");
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let error = require_branch_checked_out(&repo, branch)
+            .expect_err("an unborn repository cannot have the requested branch checked out");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains(&format!("branch {branch:?}")));
+        assert!(rendered.contains("`git checkout <branch>`"));
+        assert!(!rendered.contains(&format!("`git checkout {branch}`")));
     }
 
     fn bare_repo_with_a_commit_on(dir: &Path, branch: &str, files: &[(&str, &str)]) -> Oid {
@@ -1717,7 +1741,14 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            git::cherry_pick(source_dir.path(), rogue, None).unwrap(),
+            git::cherry_pick(
+                source_dir.path(),
+                rogue,
+                None,
+                "gitprism",
+                "gitprism@example.com",
+            )
+            .unwrap(),
             git::CherryPickOutcome::Conflict,
             "the rogue pick must actually conflict for this test to mean anything"
         );

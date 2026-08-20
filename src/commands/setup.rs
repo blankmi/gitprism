@@ -204,7 +204,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
                 }
                 let base = repo.merge_base(existing_oid, dest_tip).map_err(|_| {
                     anyhow::anyhow!(
-                        "gitprism setup: source's local branch {branch:?} has no history in common with dest — gitprism won't merge unrelated histories automatically; merge dest into it yourself with real git first (e.g. `git merge --allow-unrelated-histories <dest-remote>/{branch}`), then re-run setup."
+                        "gitprism setup: source's local branch {branch:?} has no history in common with dest — gitprism won't merge unrelated histories automatically; merge dest into it yourself with real git first (e.g. `git merge --allow-unrelated-histories <dest-remote>/<branch>`), then re-run setup."
                     )
                 })?;
                 let base_tree = repo
@@ -229,7 +229,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
                         Some(existing_oid),
                     ),
                     git::MergeTreeOutcome::Conflict { paths } => anyhow::bail!(
-                        "gitprism setup: {branch:?} has a real conflict between its existing content and dest's tip in {paths:?} — resolve it yourself with real git (e.g. `git merge <dest-remote>/{branch}` in this repo), then re-run setup once done; there is no `gitprism resolve` for this one-time case."
+                        "gitprism setup: {branch:?} has a real conflict between its existing content and dest's tip in {paths:?} — resolve it yourself with real git (e.g. `git merge <dest-remote>/<branch>` in this repo), then re-run setup once done; there is no `gitprism resolve` for this one-time case."
                     ),
                 }
             }

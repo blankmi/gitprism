@@ -1187,7 +1187,7 @@ fn sync_pair_from_dest_with_key(
                 Direction::DestToSource,
                 true,
                 Some(&format!(
-                    "hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to source's {branch:?} branch",
+                    "hit a real conflict at dest commit {} in {:?} on branch {branch:?} — resolve it with `gitprism resolve <branch>`; commits before it were still pushed to source's branch",
                     conflict.commit, conflict.paths
                 )),
             );
@@ -1197,7 +1197,7 @@ fn sync_pair_from_dest_with_key(
             // otherwise read as "the run hung," not "the run errored."
             reporter.finish();
             anyhow::bail!(
-                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve {branch:?}`; commits before it were still pushed to source's {branch:?} branch",
+                "gitprism sync: {branch:?} <- {branch:?} hit a real conflict at dest commit {} in {:?} — resolve it with `gitprism resolve <branch>`; commits before it were still pushed to source's branch",
                 conflict.commit,
                 conflict.paths
             );

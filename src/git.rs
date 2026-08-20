@@ -12,12 +12,16 @@ use anyhow::{Context, Result};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
-/// Git hooks and helpers inherit a subprocess environment.  The state key is
-/// intentionally removed from every git invocation so repository-controlled
-/// hooks cannot read the secret used to authenticate mapping markers.
+/// Git hooks and helpers inherit a subprocess environment. The marker key and
+/// resolved URL fallbacks are intentionally removed from every git invocation:
+/// repository-controlled hooks must not receive either the mapping secret or
+/// credential-bearing remote values. Authentication variables such as
+/// `GIT_ASKPASS` remain inherited so normal Git transport behavior is intact.
 fn git_command() -> Command {
     let mut command = Command::new("git");
     command.env_remove("GITPRISM_STATE_KEY");
+    command.env_remove("GITPRISM_SOURCE_URL");
+    command.env_remove("GITPRISM_DEST_URL");
     command
 }
 
@@ -346,10 +350,17 @@ pub enum CherryPickOutcome {
 /// `--skip` even though there was never a real conflict to resolve, and this
 /// function would have no way to tell that apart from an actual conflict
 /// from the exit code alone.
+///
+/// `committer_name` and `committer_email` are supplied as Git's committer
+/// environment for the temporary commit. The picked commit's author remains
+/// untouched, and the final gitprism commit is rebuilt with the same identity
+/// through git2.
 pub fn cherry_pick(
     repo_dir: &Path,
     commit: git2::Oid,
     mainline: Option<u32>,
+    committer_name: &str,
+    committer_email: &str,
 ) -> Result<CherryPickOutcome> {
     let mut cmd = git_command();
     cmd.arg("-C").arg(repo_dir).arg("cherry-pick");
@@ -359,6 +370,7 @@ pub fn cherry_pick(
     cmd.arg("--empty=keep");
     cmd.arg(commit.to_string());
     cmd.env("GIT_EDITOR", "true");
+    set_committer_identity(&mut cmd, committer_name, committer_email);
 
     let output = cmd
         .output()
@@ -399,8 +411,14 @@ pub(crate) fn cherry_pick_no_commit(
 /// a genuine still-unresolved conflict by whether any unmerged paths remain:
 /// none left means finish it by hand with `git commit --allow-empty`, which
 /// clears the sequencer state exactly like a normal `--continue` would.
-pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
-    let output = git_command()
+pub fn cherry_pick_continue(
+    repo_dir: &Path,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<CherryPickOutcome> {
+    let mut command = git_command();
+    set_committer_identity(&mut command, committer_name, committer_email);
+    let output = command
         .arg("-C")
         .arg(repo_dir)
         .arg("cherry-pick")
@@ -412,7 +430,7 @@ pub fn cherry_pick_continue(repo_dir: &Path) -> Result<CherryPickOutcome> {
     match output.status.code() {
         Some(0) => Ok(CherryPickOutcome::Clean),
         Some(1) if !has_unmerged_paths(repo_dir)? => {
-            finish_empty_continue(repo_dir)?;
+            finish_empty_continue(repo_dir, committer_name, committer_email)?;
             Ok(CherryPickOutcome::Clean)
         }
         Some(1) => Ok(CherryPickOutcome::Conflict),
@@ -453,9 +471,16 @@ fn has_unmerged_paths(repo_dir: &Path) -> Result<bool> {
 /// `CHERRY_PICK_HEAD`) exactly like a normal `--continue` would have.
 /// `gitprism resolve` immediately replaces whatever commit this produces
 /// with its own properly-stamped one, so this commit's own message/identity
-/// are never user-visible.
-fn finish_empty_continue(repo_dir: &Path) -> Result<()> {
-    let output = git_command()
+/// are never user-visible. Its committer identity still comes from the
+/// verified gitprism configuration rather than the operator's Git config.
+fn finish_empty_continue(
+    repo_dir: &Path,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<()> {
+    let mut command = git_command();
+    set_committer_identity(&mut command, committer_name, committer_email);
+    let output = command
         .arg("-C")
         .arg(repo_dir)
         .arg("commit")
@@ -471,6 +496,12 @@ fn finish_empty_continue(repo_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn set_committer_identity(command: &mut Command, name: &str, email: &str) {
+    command
+        .env("GIT_COMMITTER_NAME", name)
+        .env("GIT_COMMITTER_EMAIL", email);
 }
 
 fn cherry_pick_outcome(
@@ -997,16 +1028,33 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = checkout_with_a_commit_on(dir.path(), "main", &[("f.txt", "1")]);
         let repo = Repository::open(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.name", "local-config-user")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "local-config@example.com")
+            .unwrap();
         // A commit that touches a different file entirely — applies cleanly
         // onto "main", which is still checked out at `base`.
         let to_pick = commit_on_branch(&repo, "topic", base, &[("g.txt", "from topic")]);
 
-        let outcome =
-            cherry_pick(dir.path(), to_pick, None).expect("a non-conflicting pick should succeed");
+        let outcome = cherry_pick(
+            dir.path(),
+            to_pick,
+            None,
+            "gitprism",
+            "gitprism@example.com",
+        )
+        .expect("a non-conflicting pick should succeed");
         assert_eq!(outcome, CherryPickOutcome::Clean);
 
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.parent_id(0).unwrap(), base);
+        assert_eq!(head.author().name().unwrap(), "Test");
+        assert_eq!(head.committer().name().unwrap(), "gitprism");
+        assert_eq!(head.committer().email().unwrap(), "gitprism@example.com");
         assert!(dir.path().join("g.txt").exists());
     }
 
@@ -1015,6 +1063,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = checkout_with_a_commit_on(dir.path(), "main", &[("f.txt", "1")]);
         let repo = Repository::open(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.name", "local-config-user")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "local-config@example.com")
+            .unwrap();
         let to_pick = commit_on_branch(&repo, "topic", base, &[("f.txt", "from topic")]);
         // main itself diverges on the very same file/line, so picking
         // `to_pick` onto it is a real conflict.
@@ -1037,8 +1093,14 @@ mod tests {
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
 
-        let outcome =
-            cherry_pick(dir.path(), to_pick, None).expect("a real conflict is a reported outcome");
+        let outcome = cherry_pick(
+            dir.path(),
+            to_pick,
+            None,
+            "gitprism",
+            "gitprism@example.com",
+        )
+        .expect("a real conflict is a reported outcome");
         assert_eq!(outcome, CherryPickOutcome::Conflict);
 
         assert!(
@@ -1057,6 +1119,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = checkout_with_a_commit_on(dir.path(), "main", &[("f.txt", "1")]);
         let repo = Repository::open(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.name", "local-config-user")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "local-config@example.com")
+            .unwrap();
         let to_pick = commit_on_branch(&repo, "topic", base, &[("f.txt", "from topic")]);
         std::fs::write(dir.path().join("f.txt"), "from main").unwrap();
         let signature = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -1079,7 +1149,14 @@ mod tests {
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
         assert_eq!(
-            cherry_pick(dir.path(), to_pick, None).unwrap(),
+            cherry_pick(
+                dir.path(),
+                to_pick,
+                None,
+                "gitprism",
+                "gitprism@example.com",
+            )
+            .unwrap(),
             CherryPickOutcome::Conflict
         );
 
@@ -1089,9 +1166,15 @@ mod tests {
         index.add_path(Path::new("f.txt")).unwrap();
         index.write().unwrap();
 
-        let outcome = cherry_pick_continue(dir.path())
+        let outcome = cherry_pick_continue(dir.path(), "gitprism", "gitprism@example.com")
             .expect("finishing a fully-resolved cherry-pick should succeed");
         assert_eq!(outcome, CherryPickOutcome::Clean);
+        let temporary_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(temporary_commit.committer().name().unwrap(), "gitprism");
+        assert_eq!(
+            temporary_commit.committer().email().unwrap(),
+            "gitprism@example.com"
+        );
         assert!(
             !dir.path().join(".git/CHERRY_PICK_HEAD").exists(),
             "a completed cherry-pick must not leave CHERRY_PICK_HEAD behind"
@@ -1130,8 +1213,14 @@ mod tests {
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
 
-        let outcome = cherry_pick(dir.path(), to_pick, None)
-            .expect("an empty-result pick must still succeed thanks to --empty=keep");
+        let outcome = cherry_pick(
+            dir.path(),
+            to_pick,
+            None,
+            "gitprism",
+            "gitprism@example.com",
+        )
+        .expect("an empty-result pick must still succeed thanks to --empty=keep");
         assert_eq!(outcome, CherryPickOutcome::Clean);
         assert!(!dir.path().join(".git/CHERRY_PICK_HEAD").exists());
     }
@@ -1163,7 +1252,14 @@ mod tests {
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
         assert_eq!(
-            cherry_pick(dir.path(), to_pick, None).unwrap(),
+            cherry_pick(
+                dir.path(),
+                to_pick,
+                None,
+                "gitprism",
+                "gitprism@example.com",
+            )
+            .unwrap(),
             CherryPickOutcome::Conflict
         );
 
@@ -1176,7 +1272,7 @@ mod tests {
         index.add_path(Path::new("f.txt")).unwrap();
         index.write().unwrap();
 
-        let outcome = cherry_pick_continue(dir.path())
+        let outcome = cherry_pick_continue(dir.path(), "gitprism", "gitprism@example.com")
             .expect("an empty-result resolution must still finish, not be reported as a conflict");
         assert_eq!(outcome, CherryPickOutcome::Clean);
         assert!(
@@ -1192,10 +1288,33 @@ mod tests {
         let dir = tempdir().unwrap();
         checkout_with_a_commit_on(dir.path(), "main", &[("f.txt", "1")]);
 
-        let err = cherry_pick_continue(dir.path())
+        let err = cherry_pick_continue(dir.path(), "gitprism", "gitprism@example.com")
             .expect_err("continuing with no cherry-pick in progress must not silently succeed");
 
         assert!(err.to_string().contains("cherry-pick --continue"));
+    }
+
+    #[test]
+    fn git_commands_scrub_gitprism_urls_and_state_but_preserve_auth_helpers() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GITPRISM_STATE_KEY")),
+            Some(&None)
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GITPRISM_SOURCE_URL")),
+            Some(&None)
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GITPRISM_DEST_URL")),
+            Some(&None)
+        );
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new("GIT_ASKPASS")),
+            "credential helper variables remain inherited rather than being scrubbed"
+        );
     }
 
     /// A tree built directly via `repo.treebuilder`, no commit needed — the

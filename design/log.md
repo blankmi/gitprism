@@ -1050,3 +1050,16 @@ mutating commands take a non-blocking lock in Git's common directory, and
 dest-to-source local advancement is preflighted against a safe checkout and
 finished with a compare-and-swap ref update. A concurrent external Git move is
 never overwritten after a successful remote push.
+
+## 2026-08-20 — operator resolution identity and Git process boundary
+
+**Update**: Decided [0029](decisions/0029-operator-resolution-identity-and-process-boundary.md)
+— conflicts remain fail-fast and operator-resolved: gitprism reproduces the
+conflict, the operator edits and stages it, and explicit continuation records
+the chosen result. Dest-to-source temporary cherry-pick commits now receive
+the configured committer identity while preserving the picked author. Git
+children scrub the state key and resolved URL fallbacks but retain normal
+authentication variables such as `GIT_ASKPASS`. Git itself, its configuration,
+credential helpers, and repository hooks remain a documented trust boundary;
+gitprism does not claim to sandbox them. Operator command snippets use literal
+`<branch>` placeholders so hostile branch names cannot become shell fragments.
