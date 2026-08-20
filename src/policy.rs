@@ -112,6 +112,7 @@ pub(crate) fn restore_control_files_exact(
     let workdir = repo
         .workdir()
         .context("resolving the working directory to restore control files exactly")?;
+    let mut restored = Vec::new();
     for filename in [crate::config::FILENAME, crate::exclude::FILENAME] {
         let Some(entry) = tree.get_name(filename) else {
             continue;
@@ -121,7 +122,30 @@ pub(crate) fn restore_control_files_exact(
             .with_context(|| format!("reading the {filename} blob to restore it exactly"))?;
         fs::write(workdir.join(filename), blob.content())
             .with_context(|| format!("restoring {filename} byte-exact after checkout"))?;
+        restored.push(filename);
     }
+    if restored.is_empty() {
+        return Ok(());
+    }
+    // The raw write above bypasses git2's index entirely, so without
+    // re-staging, the index still carries whatever checkout's own
+    // (possibly filtered) write hashed to — leaving these paths reported
+    // dirty (`WT_MODIFIED`) forever after, even though nothing meaningful
+    // changed, tripping every clean-working-tree guard `setup`/`sync` rely
+    // on. `Index::add_path` hashes the file's current on-disk bytes with no
+    // filtering of its own, so re-staging what was just written reproduces
+    // exactly the blob id already in `tree`.
+    let mut index = repo
+        .index()
+        .context("opening the index to re-stage restored control files")?;
+    for filename in restored {
+        index
+            .add_path(Path::new(filename))
+            .with_context(|| format!("re-staging {filename} after restoring it exactly"))?;
+    }
+    index
+        .write()
+        .context("writing the index after restoring control files exactly")?;
     Ok(())
 }
 

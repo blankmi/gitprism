@@ -1110,6 +1110,22 @@ mod tests {
             "policy-hash must see exactly the bytes setup committed, unaffected by checkout filtering"
         );
 
+        // Restoring the exact bytes must not leave the repo permanently
+        // dirty: the index has to be re-staged to match, or every later
+        // dirty-working-tree guard sync/setup rely on would misfire forever.
+        assert!(
+            repo.status_file(Path::new(crate::config::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "'.gitprism.toml' must be clean in HEAD/index/working-tree after the byte-exact restore"
+        );
+        assert!(
+            repo.status_file(Path::new(exclude::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "'.gitprismignore' must be clean in HEAD/index/working-tree after the byte-exact restore"
+        );
+
         // An ordinary tracked file is not special-cased — it must still
         // receive git's normal autocrlf checkout conversion, proving the fix
         // is scoped to the two control files rather than disabling checkout
