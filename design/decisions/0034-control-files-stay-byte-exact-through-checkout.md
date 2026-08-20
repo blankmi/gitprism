@@ -124,8 +124,20 @@ checkout produces for a git-tracked mode. `Exact` keeps applying to the
 open handle after creation, bypassing the umask — what `setup`'s own
 control-file recovery wants, since it's reproducing a previously captured
 mode byte-for-byte rather than creating a new file the umask should
-constrain. A Unix test sets `umask 077` (guarded by a mutex, following
-`config::ENV_VAR_LOCK`'s precedent for the same problem with env vars — the
-umask is one process-global, changing it unguarded would race any other
-test's own file creation) and confirms a `100755`/`100644` control file
-restores to `0700`/`0600`, not the git mode's bits verbatim.
+constrain. A Unix test sets `umask 077` and confirms a `100755`/`100644`
+control file restores to `0700`/`0600`, not the git mode's bits verbatim.
+
+That test's first version guarded the umask change with a mutex, following
+`config::ENV_VAR_LOCK`'s precedent for env vars — but a mutex only
+synchronizes against other tests that also take it, and no other test in
+the suite has any reason to expect the umask to change, so none of them
+do. The umask is a process-global, not a per-test one: every other test in
+the same binary that creates a file — including this file's own
+executable-bit test just above — was still exposed to whatever umask this
+test happened to have set while it ran concurrently, and a panic between
+setting it and restoring it would have left it wrong for the rest of the
+run with no `Drop` to catch that. Fixed by re-executing this one test
+alone, filtered by its own libtest-assigned thread name, in a freshly
+spawned subprocess (`std::env::current_exe()` plus `--exact`): the umask
+change and any panic are then contained to a process nothing else in the
+suite ever runs in, and the parent test only checks its exit status.

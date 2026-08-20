@@ -1200,3 +1200,22 @@ unguarded — and confirms a `100755`/`100644` control file restores to
 `0700`/`0600`. See 0034's Consequences section for detail. `cargo test`:
 190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
 --check`: clean.
+
+**Update**: A fourth review round caught a real gap in that umask test
+itself: its mutex only synchronizes against other tests that also take it,
+and no other test in the suite has any reason to expect the process umask
+to change, so none of them do — meaning every other test that creates a
+file (including this file's own executable-bit test) could observe
+whatever umask this test happened to have set while running concurrently,
+and a panic between setting it and restoring it would have left the wrong
+umask in place for the rest of the run, with no `Drop` to catch that.
+Fixed by re-executing this one test alone, filtered by its own
+libtest-assigned thread name (`std::thread::current().name()`), in a
+freshly spawned subprocess (`std::env::current_exe()` plus `--exact
+--nocapture`) — the umask change and any panic are now contained to a
+process nothing else in the suite ever runs in; the parent test only
+checks the subprocess's exit status, surfacing its captured stdout/stderr
+on failure. The mutex is gone; no test anywhere else needed to change to
+stay correct. See 0034's Consequences section for detail. `cargo test`:
+190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
+--check`: clean.

@@ -305,24 +305,60 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// The process umask is one shared global — a test that changes it to
-    /// observe the effect must hold this for its whole save/mutate/restore
-    /// window, or a concurrently running test's own file creations would see
-    /// the wrong umask too. Mirrors `config::ENV_VAR_LOCK`'s precedent for
-    /// the same problem with env vars.
+    /// Env var naming this one test's re-exec'd subprocess to itself — see
+    /// [`restore_control_files_exact_constrains_the_creation_mode_by_umask`].
     #[cfg(unix)]
-    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const UMASK_TEST_SUBPROCESS_MARKER: &str = "GITPRISM_TEST_UMASK_SUBPROCESS";
 
+    /// The umask is one process-global, and *every* test that creates a file
+    /// runs in this same test binary — not just ones that would think to
+    /// take a lock over a umask they have no reason to expect changed. A
+    /// mutex only synchronizes against other tests that also take it, so it
+    /// can't actually isolate this test from the rest of the suite; and a
+    /// panic between changing the umask and restoring it would leave every
+    /// other test in this process running under the wrong umask for the
+    /// remainder of the run, with no `Drop` to save it. Re-exec this one
+    /// test alone, filtered by its own libtest-assigned thread name, in a
+    /// fresh child process — the umask change, and any panic, are then
+    /// entirely contained to that child; the parent only checks its exit
+    /// status.
     #[test]
     #[cfg(unix)]
     fn restore_control_files_exact_constrains_the_creation_mode_by_umask() {
+        if std::env::var_os(UMASK_TEST_SUBPROCESS_MARKER).is_some() {
+            restore_control_files_exact_constrains_the_creation_mode_by_umask_body();
+            return;
+        }
+        let test_name = std::thread::current()
+            .name()
+            .expect("libtest names each test's thread after its own fully-qualified path")
+            .to_owned();
+        let exe =
+            std::env::current_exe().expect("resolving this test binary's own path to re-exec it");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", "--nocapture", &test_name])
+            .env(UMASK_TEST_SUBPROCESS_MARKER, "1")
+            .output()
+            .expect("re-executing this test in an isolated subprocess");
+        assert!(
+            output.status.success(),
+            "umask test failed inside its isolated subprocess:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(unix)]
+    fn restore_control_files_exact_constrains_the_creation_mode_by_umask_body() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = UMASK_LOCK.lock().unwrap();
-        // SAFETY: `umask` is a plain libc call with no preconditions; the
-        // lock above is what makes changing this process-global safe
-        // against other tests.
-        let original_umask = unsafe { libc::umask(0o077) };
+        // SAFETY: `umask` is a plain libc call with no preconditions. This
+        // process exists only to run this one test, so there is nothing
+        // else in it for a changed umask (or a panic that never restores
+        // it) to affect.
+        unsafe {
+            libc::umask(0o077);
+        }
 
         let dir = tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
@@ -348,11 +384,7 @@ mod tests {
             .unwrap();
         let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
 
-        let result = restore_control_files_exact(&repo, &tree);
-        unsafe {
-            libc::umask(original_umask);
-        }
-        result.unwrap();
+        restore_control_files_exact(&repo, &tree).unwrap();
 
         let mode_of = |filename: &str| {
             fs::metadata(dir.path().join(filename))
