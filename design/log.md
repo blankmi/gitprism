@@ -1063,3 +1063,15 @@ authentication variables such as `GIT_ASKPASS`. Git itself, its configuration,
 credential helpers, and repository hooks remain a documented trust boundary;
 gitprism does not claim to sandbox them. Operator command snippets use literal
 `<branch>` placeholders so hostile branch names cannot become shell fragments.
+
+## 2026-08-20 — setup rollback error reporting
+
+Implemented the rollback safety already required by decisions 0021 and 0023:
+setup now preserves its primary failure while reporting every branch, HEAD, and
+control-file recovery failure; expected missing fresh branches remain harmless,
+while unexpected lookup failures are surfaced. Control-file restoration
+snapshots the actual source-root files, including absence, bytes, and Unix
+permissions, and external `--config` input cannot replace a different
+source-root config. Control-file removal failures now enter the same rollback
+path. Fetch side effects remain outside rollback by design. Added deterministic
+aggregation and removal-failure tests; no new architecture decision was needed.

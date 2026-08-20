@@ -45,6 +45,15 @@ use crate::marker::{self, Direction as MarkerDirection};
 use crate::policy;
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+    let remove_file = |path: &Path| fs::remove_file(path);
+    run_with_remove_file(cwd, config_path, &remove_file)
+}
+
+fn run_with_remove_file(
+    cwd: &Path,
+    config_path: &Path,
+    remove_file: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism setup must be run inside an existing git repository (none found at or above {}) — run `git init` first, same as any other git command",
@@ -79,6 +88,12 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let config_raw = policy.config_raw;
     let ignore_raw = policy.ignore_raw;
     let config = policy.config;
+    let control_file_snapshot = ControlFileSnapshot::capture(&source_root)?;
+    control_file_snapshot.ensure_external_config_is_not_overwritten(
+        &source_root.join(crate::config::FILENAME),
+        &config_path,
+        &config_raw,
+    )?;
     // Validate the pair secret after the immutable policy pin has passed, and
     // before any fetch or ref/tree mutation.
     let state_key = marker::load_key()?;
@@ -278,8 +293,10 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
                 original_oid: *original_oid,
             }),
             Err(err) => {
-                rollback_branches(&repo, &touched_branches, original_head.as_deref());
-                return Err(err);
+                return Err(with_recovery_failures(
+                    err,
+                    rollback_branches(&repo, &touched_branches, original_head.as_deref()),
+                ));
             }
         }
     }
@@ -292,9 +309,18 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // since it has no baseline yet to recognize the content as identical.
     for filename in [crate::config::FILENAME, exclude::FILENAME] {
         let path = source_root.join(filename);
-        if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("removing {} before checkout", path.display()))?;
+        if path.exists()
+            && let Err(error) = remove_file(&path)
+        {
+            let primary = anyhow::Error::new(error)
+                .context(format!("removing {} before checkout", path.display()));
+            let mut recovery = control_file_snapshot.restore(&source_root);
+            recovery.extend(rollback_branches(
+                &repo,
+                &touched_branches,
+                original_head.as_deref(),
+            ));
+            return Err(with_recovery_failures(primary, recovery));
         }
     }
 
@@ -314,20 +340,203 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     {
         // The control files were just deleted above to let checkout land
         // them cleanly; a failed checkout must not leave the user without
-        // their own bootstrap `.gitprism.toml` — restore them from the exact
-        // bytes already read, same as rollback restores the branch refs.
-        restore_control_files(&source_root, &config_raw, &ignore_raw);
-        rollback_branches(&repo, &touched_branches, original_head.as_deref());
-        return Err(err);
+        // their own bootstrap files — restore their exact pre-run state,
+        // same as rollback restores the branch refs.
+        let mut recovery = control_file_snapshot.restore(&source_root);
+        recovery.extend(rollback_branches(
+            &repo,
+            &touched_branches,
+            original_head.as_deref(),
+        ));
+        return Err(with_recovery_failures(err, recovery));
     }
 
     Ok(())
 }
 
-fn restore_control_files(source_root: &Path, config_raw: &str, ignore_raw: &str) {
-    let _ = fs::write(source_root.join(crate::config::FILENAME), config_raw);
-    let _ = fs::write(source_root.join(exclude::FILENAME), ignore_raw);
+#[derive(Debug)]
+struct ControlFileSnapshot {
+    config: ControlFileState,
+    ignore: ControlFileState,
 }
+
+#[derive(Debug)]
+enum ControlFileState {
+    Missing,
+    Regular {
+        bytes: Vec<u8>,
+        #[cfg(unix)]
+        mode: u32,
+    },
+    Other,
+}
+
+impl ControlFileSnapshot {
+    fn capture(source_root: &Path) -> Result<Self> {
+        Ok(Self {
+            config: ControlFileState::capture(&source_root.join(crate::config::FILENAME))?,
+            ignore: ControlFileState::capture(&source_root.join(exclude::FILENAME))?,
+        })
+    }
+
+    fn ensure_external_config_is_not_overwritten(
+        &self,
+        source_config_path: &Path,
+        config_path: &Path,
+        config_raw: &str,
+    ) -> Result<()> {
+        if config_path == source_config_path {
+            return Ok(());
+        }
+        match &self.config {
+            ControlFileState::Regular { bytes, .. } if bytes == config_raw.as_bytes() => {}
+            ControlFileState::Regular { .. } | ControlFileState::Other => {
+                anyhow::bail!(
+                    "gitprism setup: source's existing {} differs from or is incompatible with the external --config file {}; refusing to replace it",
+                    crate::config::FILENAME,
+                    config_path.display()
+                );
+            }
+            ControlFileState::Missing => {}
+        }
+        Ok(())
+    }
+
+    fn restore(&self, source_root: &Path) -> Vec<anyhow::Error> {
+        let write_file = |path: &Path, bytes: &[u8]| fs::write(path, bytes);
+        self.restore_with_writer(source_root, &write_file)
+    }
+
+    fn restore_with_writer(
+        &self,
+        source_root: &Path,
+        write_file: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+    ) -> Vec<anyhow::Error> {
+        [
+            (crate::config::FILENAME, &self.config),
+            (exclude::FILENAME, &self.ignore),
+        ]
+        .into_iter()
+        .flat_map(|(filename, state)| {
+            state.restore_with_writer(&source_root.join(filename), write_file)
+        })
+        .collect()
+    }
+}
+
+impl ControlFileState {
+    fn capture(path: &Path) -> Result<Self> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::Missing);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(Self::Other);
+        }
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(Self::Regular {
+            bytes,
+            #[cfg(unix)]
+            mode: {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            },
+        })
+    }
+
+    fn restore_with_writer(
+        &self,
+        path: &Path,
+        write_file: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+    ) -> Option<anyhow::Error> {
+        match self {
+            Self::Missing => match fs::symlink_metadata(path) {
+                Ok(_) => fs::remove_file(path).err().map(|error| {
+                    anyhow::Error::new(error).context(format!(
+                        "removing {} that did not exist before setup",
+                        path.display()
+                    ))
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some(
+                    anyhow::Error::new(error)
+                        .context(format!("checking whether {} was restored", path.display())),
+                ),
+            },
+            Self::Regular {
+                bytes,
+                #[cfg(unix)]
+                mode,
+            } => {
+                if let Err(error) = write_file(path, bytes) {
+                    return Some(
+                        anyhow::Error::new(error).context(format!("restoring {}", path.display())),
+                    );
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(*mode))
+                    {
+                        return Some(
+                            anyhow::Error::new(error)
+                                .context(format!("restoring permissions for {}", path.display())),
+                        );
+                    }
+                }
+                None
+            }
+            Self::Other => match fs::symlink_metadata(path) {
+                Ok(_) => None,
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Some(anyhow::Error::new(error).context(format!(
+                        "checking whether unsupported control file {} remains",
+                        path.display()
+                    )))
+                }
+                Err(_) => Some(anyhow::anyhow!(
+                    "cannot restore unsupported control file {} after setup removed it",
+                    path.display()
+                )),
+            },
+        }
+    }
+}
+
+fn with_recovery_failures(primary: anyhow::Error, failures: Vec<anyhow::Error>) -> anyhow::Error {
+    if failures.is_empty() {
+        return primary;
+    }
+    let details = failures
+        .into_iter()
+        .map(|failure| format!("- {failure:#}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::Error::new(RecoveryError { primary, details })
+}
+
+#[derive(Debug)]
+struct RecoveryError {
+    primary: anyhow::Error,
+    details: String,
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:#}\nrecovery also failed:\n{}",
+            self.primary, self.details
+        )
+    }
+}
+
+impl std::error::Error for RecoveryError {}
 
 /// What the commit phase does for one configured branch, decided during the
 /// fetch/planning loop (decisions/0023) so any hard-fail (no shared history,
@@ -370,28 +579,57 @@ struct TouchedBranch<'a> {
 /// libgit2 refuses to touch the branch HEAD symbolically points at even
 /// while still unborn, which a fresh `git init`'s default branch name
 /// (commonly "main") can easily collide with.
-fn rollback_branches(repo: &Repository, touched: &[TouchedBranch], original_head: Option<&str>) {
-    let _ = repo.set_head("refs/heads/gitprism-setup-rollback-scratch");
+fn rollback_branches(
+    repo: &Repository,
+    touched: &[TouchedBranch],
+    original_head: Option<&str>,
+) -> Vec<anyhow::Error> {
+    let mut failures = Vec::new();
+    if let Err(error) = repo.set_head("refs/heads/gitprism-setup-rollback-scratch") {
+        failures.push(anyhow::Error::new(error).context("moving HEAD to rollback scratch"));
+    }
     for branch in touched {
         match branch.original_oid {
             Some(oid) => {
-                let _ = repo.reference(
+                if let Err(error) = repo.reference(
                     &format!("refs/heads/{}", branch.name),
                     oid,
                     true,
                     "gitprism setup: rollback to pre-existing tip",
-                );
+                ) {
+                    failures.push(anyhow::Error::new(error).context(format!(
+                        "restoring branch {:?} to its original tip",
+                        branch.name
+                    )));
+                }
             }
             None => {
-                if let Ok(mut b) = repo.find_branch(branch.name, git2::BranchType::Local) {
-                    let _ = b.delete();
+                match repo.find_branch(branch.name, git2::BranchType::Local) {
+                    Ok(mut branch_ref) => {
+                        if let Err(error) = branch_ref.delete() {
+                            failures.push(anyhow::Error::new(error).context(format!(
+                                "deleting newly-created branch {:?}",
+                                branch.name
+                            )));
+                        }
+                    }
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                    Err(error) => failures.push(anyhow::Error::new(error).context(format!(
+                        "looking up newly-created branch {:?} during rollback",
+                        branch.name
+                    ))),
                 }
             }
         }
     }
-    if let Some(target) = original_head {
-        let _ = repo.set_head(target);
+    if let Some(target) = original_head
+        && let Err(error) = repo.set_head(target)
+    {
+        failures.push(
+            anyhow::Error::new(error).context(format!("restoring original HEAD target {target:?}")),
+        );
     }
+    failures
 }
 
 /// `original_oid` is `branch`'s tip *before* this run touched it — `Some`
@@ -917,6 +1155,205 @@ mod tests {
             fs::read_to_string(source_dir.path().join(crate::config::FILENAME)).unwrap(),
             config_toml,
             "rejecting an empty branches list must not touch the user's config file"
+        );
+    }
+
+    #[test]
+    fn control_file_restore_reports_every_write_failure() {
+        let source_dir = tempdir().unwrap();
+        fs::write(
+            source_dir.path().join(crate::config::FILENAME),
+            "config bytes",
+        )
+        .unwrap();
+        fs::write(source_dir.path().join(exclude::FILENAME), "ignore bytes").unwrap();
+        let snapshot = ControlFileSnapshot::capture(source_dir.path()).unwrap();
+        let write_file = |_path: &Path, _bytes: &[u8]| {
+            Err(std::io::Error::other("injected control-file write failure"))
+        };
+
+        let failures = snapshot.restore_with_writer(source_dir.path(), &write_file);
+
+        assert_eq!(failures.len(), 2);
+        let details = failures
+            .iter()
+            .map(|failure| format!("{failure:#}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(details.contains(crate::config::FILENAME));
+        assert!(details.contains(exclude::FILENAME));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(
+                source_dir.path().join(crate::config::FILENAME),
+                fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+            let mode_snapshot = ControlFileSnapshot::capture(source_dir.path()).unwrap();
+            fs::remove_file(source_dir.path().join(crate::config::FILENAME)).unwrap();
+            assert!(mode_snapshot.restore(source_dir.path()).is_empty());
+            assert_eq!(
+                fs::symlink_metadata(source_dir.path().join(crate::config::FILENAME))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_collects_ref_lookup_and_head_failures() {
+        let source_dir = tempdir().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        let touched = [
+            TouchedBranch {
+                name: "invalid branch",
+                original_oid: Some(git2::Oid::from_bytes(&[0; 20]).unwrap()),
+            },
+            TouchedBranch {
+                name: "another invalid branch",
+                original_oid: None,
+            },
+        ];
+
+        let failures = rollback_branches(&repo, &touched, Some("refs/heads/invalid original head"));
+
+        assert!(failures.len() >= 3, "failures were: {failures:#?}");
+        let details = failures
+            .iter()
+            .map(|failure| format!("{failure:#}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(details.contains("restoring branch"));
+        assert!(details.contains("looking up newly-created branch"));
+        assert!(details.contains("restoring original HEAD target"));
+    }
+
+    #[test]
+    fn recovery_keeps_primary_error_and_lists_all_cleanup_failures() {
+        let primary = anyhow::anyhow!("checkout failed");
+        let failures = vec![
+            anyhow::anyhow!("restoring config failed"),
+            anyhow::anyhow!("restoring HEAD failed"),
+        ];
+
+        let error = with_recovery_failures(primary, failures);
+        let message = format!("{error:#}");
+
+        assert!(message.starts_with("checkout failed"));
+        assert_eq!(message.matches("checkout failed").count(), 1);
+        assert!(message.contains("recovery also failed:\n"));
+        assert!(message.contains("- restoring config failed\n"));
+        assert!(message.contains("- restoring HEAD failed"));
+    }
+
+    #[test]
+    fn external_config_cannot_replace_different_source_root_config() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        fs::write(
+            source_dir.path().join(crate::config::FILENAME),
+            "source-owned config\n",
+        )
+        .unwrap();
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        let error = run(source_dir.path(), config.path())
+            .expect_err("different source-root config must be rejected before mutation");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("refusing to replace it"), "{message}");
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join(crate::config::FILENAME)).unwrap(),
+            "source-owned config\n"
+        );
+        assert!(
+            Repository::open(source_dir.path())
+                .unwrap()
+                .find_branch("main", git2::BranchType::Local)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removal_failure_rolls_back_created_branches_and_restores_control_files() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+        let config_raw = fs::read_to_string(config.path()).unwrap();
+        fs::write(source_dir.path().join(crate::config::FILENAME), &config_raw).unwrap();
+        let ignore_raw = "original-ignore\n";
+        fs::write(source_dir.path().join(exclude::FILENAME), ignore_raw).unwrap();
+        let remove_file = |path: &Path| {
+            if path.file_name().and_then(|name| name.to_str()) == Some(exclude::FILENAME) {
+                Err(std::io::Error::other(
+                    "injected second control-file removal failure",
+                ))
+            } else {
+                fs::remove_file(path)
+            }
+        };
+
+        let error = run_with_remove_file(source_dir.path(), config.path(), &remove_file)
+            .expect_err("an injected control-file removal failure must stop setup");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("injected second control-file removal failure"));
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join(crate::config::FILENAME)).unwrap(),
+            config_raw
+        );
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join(exclude::FILENAME)).unwrap(),
+            ignore_raw
+        );
+        assert!(
+            Repository::open(source_dir.path())
+                .unwrap()
+                .find_branch("main", git2::BranchType::Local)
+                .is_err(),
+            "the grafted branch must be rolled back after removal failure"
+        );
+    }
+
+    #[test]
+    fn failed_checkout_does_not_create_absent_control_files_or_modify_external_config() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        fs::write(
+            source_dir.path().join("a.txt"),
+            "locally written, not dest's",
+        )
+        .unwrap();
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+        let config_raw = fs::read_to_string(config.path()).unwrap();
+
+        run(source_dir.path(), config.path())
+            .expect_err("a checkout conflict must trigger exact recovery");
+
+        assert_eq!(fs::read_to_string(config.path()).unwrap(), config_raw);
+        assert!(!source_dir.path().join(crate::config::FILENAME).exists());
+        assert!(!source_dir.path().join(exclude::FILENAME).exists());
+        assert!(
+            Repository::open(source_dir.path())
+                .unwrap()
+                .find_branch("main", git2::BranchType::Local)
+                .is_err(),
+            "the grafted branch must be rolled back after checkout failure"
         );
     }
 
