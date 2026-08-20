@@ -1103,3 +1103,13 @@ helpers; commit messages, branch collections, tree traversal, conflict reports,
 pending history, and marker scans have static fail-closed limits. Decision 0019's
 “unbounded marker scan” wording is superseded: scans still do not hide the graft
 point, but stop with an error when the safety budget is exceeded.
+
+## 2026-08-20 — authenticated resolution worktree and safe file recovery
+
+**Update**: Decided [0033](decisions/0033-authenticated-resolution-worktree-and-safe-file-recovery.md)
+— source-to-dest continuation now authenticates the exact generated worktree
+locator, verifies its registration and common Git directory before opening it,
+and fails closed for tampered or legacy state. Bounded reads validate the
+opened handle, while setup rollback uses create-new replacement handles that
+cannot follow raced symlinks or hard links. Conflict handling remains
+fail-fast and operator-driven.

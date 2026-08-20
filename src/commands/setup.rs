@@ -375,6 +375,8 @@ struct ControlFileSnapshot {
     ignore: ControlFileState,
 }
 
+type RestoreWriter = dyn Fn(&Path, &[u8], Option<u32>) -> std::io::Result<()>;
+
 #[derive(Debug)]
 enum ControlFileState {
     Missing,
@@ -418,14 +420,15 @@ impl ControlFileSnapshot {
     }
 
     fn restore(&self, source_root: &Path) -> Vec<anyhow::Error> {
-        let write_file = |path: &Path, bytes: &[u8]| fs::write(path, bytes);
+        let write_file =
+            |path: &Path, bytes: &[u8], mode: Option<u32>| restore_regular_file(path, bytes, mode);
         self.restore_with_writer(source_root, &write_file)
     }
 
     fn restore_with_writer(
         &self,
         source_root: &Path,
-        write_file: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+        write_file: &RestoreWriter,
     ) -> Vec<anyhow::Error> {
         [
             (crate::config::FILENAME, &self.config),
@@ -437,6 +440,27 @@ impl ControlFileSnapshot {
         })
         .collect()
     }
+}
+
+fn restore_regular_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    use std::io::Write as _;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 impl ControlFileState {
@@ -468,7 +492,7 @@ impl ControlFileState {
     fn restore_with_writer(
         &self,
         path: &Path,
-        write_file: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+        write_file: &RestoreWriter,
     ) -> Option<anyhow::Error> {
         match self {
             Self::Missing => match fs::symlink_metadata(path) {
@@ -489,21 +513,14 @@ impl ControlFileState {
                 #[cfg(unix)]
                 mode,
             } => {
-                if let Err(error) = write_file(path, bytes) {
+                #[cfg(unix)]
+                let mode = Some(*mode);
+                #[cfg(not(unix))]
+                let mode = None;
+                if let Err(error) = write_file(path, bytes, mode) {
                     return Some(
                         anyhow::Error::new(error).context(format!("restoring {}", path.display())),
                     );
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(*mode))
-                    {
-                        return Some(
-                            anyhow::Error::new(error)
-                                .context(format!("restoring permissions for {}", path.display())),
-                        );
-                    }
                 }
                 None
             }
@@ -1184,7 +1201,7 @@ mod tests {
         .unwrap();
         fs::write(source_dir.path().join(exclude::FILENAME), "ignore bytes").unwrap();
         let snapshot = ControlFileSnapshot::capture(source_dir.path()).unwrap();
-        let write_file = |_path: &Path, _bytes: &[u8]| {
+        let write_file = |_path: &Path, _bytes: &[u8], _mode: Option<u32>| {
             Err(std::io::Error::other("injected control-file write failure"))
         };
 
@@ -1220,6 +1237,41 @@ mod tests {
                 0o640
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_file_restore_replaces_symlink_and_hardlink_entries_safely() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_dir = tempdir().unwrap();
+        let config_path = source_dir.path().join(crate::config::FILENAME);
+        fs::write(&config_path, b"config bytes").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let snapshot = ControlFileSnapshot::capture(source_dir.path()).unwrap();
+
+        let outside = tempdir().unwrap();
+        let outside_path = outside.path().join("outside");
+        fs::write(&outside_path, b"outside bytes").unwrap();
+        fs::remove_file(&config_path).unwrap();
+        std::os::unix::fs::symlink(&outside_path, &config_path).unwrap();
+        assert!(snapshot.restore(source_dir.path()).is_empty());
+        assert_eq!(fs::read(&outside_path).unwrap(), b"outside bytes");
+        assert_eq!(fs::read(&config_path).unwrap(), b"config bytes");
+
+        fs::remove_file(&config_path).unwrap();
+        std::fs::hard_link(&outside_path, &config_path).unwrap();
+        assert!(snapshot.restore(source_dir.path()).is_empty());
+        assert_eq!(fs::read(&outside_path).unwrap(), b"outside bytes");
+        assert_eq!(fs::read(&config_path).unwrap(), b"config bytes");
+        assert_eq!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
     }
 
     #[test]

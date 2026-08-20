@@ -193,6 +193,7 @@ fn require_branch_checked_out(repo: &Repository, branch: &str) -> Result<()> {
 
 struct SourceToDestOperation {
     worktree: PathBuf,
+    worktree_repo: Repository,
     state_commit: Oid,
     cherry_pick: Oid,
     source_commit: Oid,
@@ -365,8 +366,10 @@ fn start_source_to_dest(
         &repo.find_commit(dest_base)?.tree()?,
         &[&repo.find_commit(dest_base)?],
     )?;
+    let path = resolution_worktree_path()?;
+    let worktree_locator = encode_worktree_locator(&path)?;
     let operation_body = format!(
-        "Resolve-State: v1\nResolve-Source-Tip: {source_tip}\nResolve-Dest-Tip: {dest_tip}\nResolve-Dest-Base: {dest_base}\nResolve-Checkout-Base: {base_commit}\nResolve-Source-Commit: {source_oid}\nResolve-Patch-Commit: PLACEHOLDER\nResolve-Policy-SHA256: {policy_digest}\nResolve-Dest-Ref-Existed: true"
+        "Resolve-State: v1\nResolve-Source-Tip: {source_tip}\nResolve-Dest-Tip: {dest_tip}\nResolve-Dest-Base: {dest_base}\nResolve-Checkout-Base: {base_commit}\nResolve-Source-Commit: {source_oid}\nResolve-Patch-Commit: PLACEHOLDER\nResolve-Worktree-Path: {worktree_locator}\nResolve-Policy-SHA256: {policy_digest}\nResolve-Dest-Ref-Existed: true"
     );
     let synthetic_message = marker::build_message(
         &operation_body,
@@ -415,15 +418,12 @@ fn start_source_to_dest(
     )?;
     let refname = format!("refs/gitprism/resolve/source-to-dest/{branch}");
     repo.reference(&refname, state_commit, true, "gitprism resolve: start")?;
-    let path = match resolution_worktree_path() {
-        Ok(path) => path,
-        Err(error) => {
-            let _ = repo
-                .find_reference(&refname)
-                .and_then(|mut reference| reference.delete());
-            return Err(error);
-        }
-    };
+    if let Err(error) = reserve_resolution_worktree_path(&path) {
+        let _ = repo
+            .find_reference(&refname)
+            .and_then(|mut reference| reference.delete());
+        return Err(error);
+    }
     if let Err(error) = git::worktree_add(source_root, &path, state_commit) {
         let _ = repo
             .find_reference(&refname)
@@ -431,10 +431,21 @@ fn start_source_to_dest(
         let _ = fs::remove_dir(&path);
         return Err(error);
     }
+    let worktree_repo = match validate_registered_worktree(repo, &path) {
+        Ok(worktree_repo) => worktree_repo,
+        Err(error) => {
+            let _ = repo
+                .find_reference(&refname)
+                .and_then(|mut reference| reference.delete());
+            let _ = git::worktree_remove(source_root, &path);
+            return Err(error).context("validating newly-created resolution worktree");
+        }
+    };
     match git::cherry_pick_no_commit(&path, synthetic, None) {
         Ok(git::CherryPickOutcome::Clean) => {
             let operation = SourceToDestOperation {
                 worktree: path,
+                worktree_repo,
                 state_commit,
                 cherry_pick: synthetic,
                 source_commit: source_oid,
@@ -510,7 +521,7 @@ fn finish_source_to_dest(
     policy_digest: &str,
     finish_mode: SourceToDestFinishMode,
 ) -> Result<()> {
-    let worktree_repo = Repository::open(&operation.worktree)?;
+    let worktree_repo = &operation.worktree_repo;
     let state = worktree_repo.head()?.peel_to_commit()?;
     if state.id() != operation.state_commit {
         anyhow::bail!(
@@ -572,6 +583,12 @@ fn finish_source_to_dest(
         )
     })? {
         git::PushOutcome::Accepted => {
+            if let Err(error) = validate_registered_worktree(repo, &operation.worktree) {
+                anyhow::bail!(
+                    "gitprism resolve: destination push succeeded as {new_dest}, but cleanup was refused because the authenticated resolution worktree changed ({error:#}); operation state and worktree remain at {}",
+                    operation.worktree.display()
+                );
+            }
             if let Err(error) = git::worktree_remove(source_root, &operation.worktree) {
                 anyhow::bail!(
                     "gitprism resolve: destination push succeeded as {new_dest}, but cleanup failed ({error:#}); operation state and worktree remain at {}",
@@ -627,7 +644,8 @@ fn reject_excluded_edits(
 }
 
 fn resolution_worktree_path() -> Result<PathBuf> {
-    let root = std::env::temp_dir();
+    let root = fs::canonicalize(std::env::temp_dir())
+        .context("canonicalizing the temporary directory for resolution worktrees")?;
     let pid = std::process::id();
     let start = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -637,11 +655,80 @@ fn resolution_worktree_path() -> Result<PathBuf> {
             "gitprism-resolve-{pid}-{}",
             start.saturating_add(offset)
         ));
-        if fs::create_dir(&path).is_ok() {
+        if !path.exists() {
             return Ok(path);
         }
     }
     anyhow::bail!("unable to reserve a unique gitprism resolution worktree path")
+}
+
+fn reserve_resolution_worktree_path(path: &Path) -> Result<()> {
+    fs::create_dir(path).with_context(|| {
+        format!(
+            "reserving the signed gitprism resolution worktree path {}",
+            path.display()
+        )
+    })
+}
+
+fn encode_worktree_locator(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(hex_encode(path.as_os_str().as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        let text = path
+            .to_str()
+            .context("resolution worktree path is not representable as UTF-8")?;
+        Ok(hex_encode(text.as_bytes()))
+    }
+}
+
+fn decode_worktree_locator(raw: &str) -> Result<PathBuf> {
+    let bytes = hex_decode(raw).context("authenticated resolution worktree locator is invalid")?;
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(OsStr::from_bytes(&bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let text = std::str::from_utf8(&bytes)
+            .context("authenticated resolution worktree path is not valid UTF-8")?;
+        Ok(PathBuf::from(text))
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(raw: &str) -> Option<Vec<u8>> {
+    if !raw.len().is_multiple_of(2) {
+        return None;
+    }
+    raw.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
+        .collect()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn find_source_to_dest_operation(
@@ -686,54 +773,133 @@ fn find_source_to_dest_operation(
         .get("Resolve-Patch-Commit")
         .and_then(|value| Oid::from_str(value).ok())
         .context("source-to-dest operation has no valid patch commit")?;
-    let mut matched_worktree = None;
-    let worktrees = repo.path().join("worktrees");
-    if let Ok(entries) = fs::read_dir(&worktrees) {
-        for entry in entries {
-            let metadata = entry?.path();
-            let Ok(raw) = read_state_file(&metadata.join("gitdir"), "linked-worktree gitdir")
-            else {
-                continue;
-            };
-            let mut gitdir = PathBuf::from(raw.trim());
-            if gitdir.is_relative() {
-                gitdir = metadata.join(gitdir);
-            }
-            let Some(worktree) = gitdir.parent() else {
-                continue;
-            };
-            let worktree_repo = Repository::open(worktree)
-                .with_context(|| format!("opening linked worktree {}", worktree.display()))?;
-            let Ok(head) = worktree_repo.head().and_then(|head| head.peel_to_commit()) else {
-                continue;
-            };
-            if head.id() != state.id() {
-                continue;
-            }
-            if matched_worktree.replace(worktree.to_path_buf()).is_some() {
-                anyhow::bail!(
-                    "gitprism resolve: authenticated source-to-dest operation has multiple linked worktrees"
-                );
-            }
-        }
+    let locator = fields
+        .get("Resolve-Worktree-Path")
+        .context("source-to-dest operation has no authenticated worktree locator")?;
+    let worktree = decode_worktree_locator(locator)?;
+    let worktree_repo = validate_registered_worktree(repo, &worktree)?;
+    let head_id = {
+        let head = worktree_repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .context("resolving the authenticated resolution worktree HEAD")?;
+        head.id()
+    };
+    if head_id != state.id() {
+        anyhow::bail!(
+            "gitprism resolve: authenticated resolution worktree HEAD does not match its operation state"
+        );
     }
-    if let Some(worktree) = matched_worktree {
-        return Ok(SourceToDestOperation {
-            worktree,
-            state_commit: state.id(),
-            cherry_pick: patch,
-            source_commit,
-            checkout_base,
-            refname,
-        });
+    Ok(SourceToDestOperation {
+        worktree,
+        worktree_repo,
+        state_commit: state.id(),
+        cherry_pick: patch,
+        source_commit,
+        checkout_base,
+        refname,
+    })
+}
+
+fn validate_registered_worktree(repo: &Repository, worktree: &Path) -> Result<Repository> {
+    if !worktree.is_absolute() {
+        anyhow::bail!("authenticated resolution worktree path is not absolute");
+    }
+    let canonical_worktree = fs::canonicalize(worktree).with_context(|| {
+        format!(
+            "resolving authenticated resolution worktree path {}",
+            worktree.display()
+        )
+    })?;
+    if canonical_worktree != worktree {
+        anyhow::bail!(
+            "authenticated resolution worktree path {} is a symlink or path substitution",
+            worktree.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(worktree)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "authenticated resolution worktree {} is not a real directory",
+            worktree.display()
+        );
+    }
+    let worktree_git = worktree.join(".git");
+    let git_metadata = fs::symlink_metadata(&worktree_git).with_context(|| {
+        format!(
+            "reading authenticated resolution worktree metadata {}",
+            worktree_git.display()
+        )
+    })?;
+    if !git_metadata.file_type().is_file() || git_metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "authenticated resolution worktree {} has unsafe Git metadata",
+            worktree.display()
+        );
+    }
+    let expected_common = fs::canonicalize(repo.commondir())?;
+    let worktrees = expected_common.join("worktrees");
+    let entries = fs::read_dir(&worktrees).with_context(|| {
+        format!(
+            "reading registered Git worktrees in {}",
+            worktrees.display()
+        )
+    })?;
+    for entry in entries {
+        let metadata_dir = entry?.path();
+        let metadata = fs::symlink_metadata(&metadata_dir)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let gitdir_path = metadata_dir.join("gitdir");
+        let Ok(raw) = read_state_file(&gitdir_path, "linked-worktree gitdir") else {
+            continue;
+        };
+        let mut gitdir = PathBuf::from(raw.trim());
+        if gitdir.is_relative() {
+            gitdir = metadata_dir.join(gitdir);
+        }
+        let Ok(gitdir) = fs::canonicalize(gitdir) else {
+            continue;
+        };
+        if gitdir != fs::canonicalize(&worktree_git)? {
+            continue;
+        }
+        let worktree_git_contents = read_state_file(&worktree_git, "linked worktree .git")?;
+        let pointer = worktree_git_contents
+            .trim()
+            .strip_prefix("gitdir: ")
+            .context("linked worktree .git file has no gitdir pointer")?;
+        let pointer = PathBuf::from(pointer);
+        let pointer = if pointer.is_absolute() {
+            pointer
+        } else {
+            worktree.join(pointer)
+        };
+        if fs::canonicalize(pointer)? != fs::canonicalize(&metadata_dir)? {
+            anyhow::bail!(
+                "authenticated resolution worktree {} has a Git pointer that does not match its registered metadata",
+                worktree.display()
+            );
+        }
+        let worktree_repo = Repository::open(worktree)
+            .with_context(|| format!("opening linked worktree {}", worktree.display()))?;
+        if fs::canonicalize(worktree_repo.commondir())? != expected_common {
+            anyhow::bail!(
+                "authenticated resolution worktree {} is registered to a different Git repository",
+                worktree.display()
+            );
+        }
+        return Ok(worktree_repo);
     }
     anyhow::bail!(
-        "gitprism resolve: no authenticated source-to-dest resolution is in progress for {branch:?} — run `gitprism resolve <branch> --direction source-to-dest` first"
+        "authenticated resolution worktree {} is not registered by this Git repository",
+        worktree.display()
     )
 }
 
 fn parse_operation_state(body: &str) -> Result<std::collections::HashMap<String, String>> {
-    const KEYS: [&str; 9] = [
+    const KEYS: [&str; 10] = [
         "Resolve-State",
         "Resolve-Source-Tip",
         "Resolve-Dest-Tip",
@@ -741,12 +907,16 @@ fn parse_operation_state(body: &str) -> Result<std::collections::HashMap<String,
         "Resolve-Checkout-Base",
         "Resolve-Source-Commit",
         "Resolve-Patch-Commit",
+        "Resolve-Worktree-Path",
         "Resolve-Policy-SHA256",
         "Resolve-Dest-Ref-Existed",
     ];
     let lines: Vec<&str> = body.lines().collect();
-    if lines.len() != 9 {
-        anyhow::bail!("source-to-dest operation state must contain exactly nine canonical fields");
+    if lines.len() != KEYS.len() {
+        anyhow::bail!(
+            "source-to-dest operation state must contain exactly {} canonical fields",
+            KEYS.len()
+        );
     }
     let mut fields = std::collections::HashMap::new();
     for (line, key) in lines.iter().zip(KEYS.iter()) {
@@ -1208,6 +1378,12 @@ mod tests {
         assert!(rendered.contains(&format!("branch {branch:?}")));
         assert!(rendered.contains("`git checkout <branch>`"));
         assert!(!rendered.contains(&format!("`git checkout {branch}`")));
+    }
+
+    #[test]
+    fn legacy_source_to_dest_operation_state_is_rejected_without_a_worktree_locator() {
+        let legacy = "Resolve-State: v1\nResolve-Source-Tip: 0000000000000000000000000000000000000000\nResolve-Dest-Tip: 0000000000000000000000000000000000000000\nResolve-Dest-Base: 0000000000000000000000000000000000000000\nResolve-Checkout-Base: 0000000000000000000000000000000000000000\nResolve-Source-Commit: 0000000000000000000000000000000000000000\nResolve-Patch-Commit: 0000000000000000000000000000000000000000\nResolve-Policy-SHA256: 0000000000000000000000000000000000000000000000000000000000000000\nResolve-Dest-Ref-Existed: true";
+        assert!(parse_operation_state(legacy).is_err());
     }
 
     #[cfg(unix)]
@@ -2013,6 +2189,57 @@ mod tests {
             operation.state_commit
         );
         assert!(worktree_repo.path().join("CHERRY_PICK_HEAD").exists());
+
+        let linked_gitdir_path = worktree.path().join("gitdir");
+        let original_linked_gitdir = fs::read(&linked_gitdir_path).unwrap();
+        let outside = tempdir().unwrap();
+        Repository::init(outside.path()).unwrap();
+        let outside_sentinel = outside.path().join("sentinel");
+        fs::write(&outside_sentinel, b"must remain untouched").unwrap();
+        fs::write(
+            &linked_gitdir_path,
+            format!("{}\n", outside.path().join(".git").display()),
+        )
+        .unwrap();
+        let tampered = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "main",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect_err("a tampered linked-worktree locator must fail closed");
+        assert!(format!("{tampered:#}").contains("not registered"));
+        assert_eq!(
+            fs::read(&outside_sentinel).unwrap(),
+            b"must remain untouched"
+        );
+        fs::write(&linked_gitdir_path, original_linked_gitdir).unwrap();
+
+        let worktree_git_path = worktree_path.join(".git");
+        let original_worktree_git = fs::read(&worktree_git_path).unwrap();
+        let outside_metadata = outside.path().join("metadata");
+        fs::create_dir(&outside_metadata).unwrap();
+        fs::write(
+            &worktree_git_path,
+            format!("gitdir: {}\n", outside_metadata.display()),
+        )
+        .unwrap();
+        let dual_tampered = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "main",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect_err("both linked-worktree pointers must be authenticated");
+        assert!(format!("{dual_tampered:#}").contains("Git pointer"));
+        assert_eq!(
+            fs::read(&outside_sentinel).unwrap(),
+            b"must remain untouched"
+        );
+        fs::write(&worktree_git_path, original_worktree_git).unwrap();
+
         fs::write(worktree_path.join("dest-owned.secret"), "human edit").unwrap();
         fs::write(worktree_path.join("f.txt"), "human resolution").unwrap();
         let mut index = worktree_repo.index().unwrap();

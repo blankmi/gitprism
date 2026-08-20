@@ -27,10 +27,35 @@ pub(crate) const MAX_CONFLICT_PATH_BYTES: usize = 8 * 1024 * 1024;
 /// attacker-controlled length. The metadata size is checked before the first
 /// allocation and every read is checked again in case the file grows.
 pub(crate) fn read_regular_file(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
+    let mut file = fs::File::open(path)
         .with_context(|| format!("reading {description} at {}", path.display()))?;
-    if !metadata.file_type().is_file() {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {description} at {}", path.display()))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {description} at {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || !path_metadata.file_type().is_file()
+        || path_metadata.file_type().is_symlink()
+    {
         anyhow::bail!("{description} at {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+            anyhow::bail!(
+                "{description} at {} changed while it was being opened",
+                path.display()
+            );
+        }
+        if metadata.nlink() > 1 {
+            anyhow::bail!(
+                "{description} at {} is hard-linked and cannot be read safely",
+                path.display()
+            );
+        }
     }
     if metadata.len() > limit as u64 {
         anyhow::bail!(
@@ -40,8 +65,6 @@ pub(crate) fn read_regular_file(path: &Path, limit: usize, description: &str) ->
         );
     }
 
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("reading {description} at {}", path.display()))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     let mut buffer = [0; 8192];
     loop {
@@ -108,6 +131,31 @@ mod tests {
 
         let error = read_regular_file(&path, 16, "state").unwrap_err();
         assert!(error.to_string().contains("16 byte limit"));
+    }
+
+    #[test]
+    fn regular_file_reader_reads_a_regular_file_through_its_open_handle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(&path, b"state bytes").unwrap();
+
+        assert_eq!(
+            read_regular_file(&path, 64, "state").unwrap(),
+            b"state bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_reader_rejects_hard_links() {
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let path = dir.path().join("state");
+        fs::write(&outside, b"state bytes").unwrap();
+        std::fs::hard_link(&outside, &path).unwrap();
+
+        let error = read_regular_file(&path, 64, "state").unwrap_err();
+        assert!(error.to_string().contains("hard-linked"));
     }
 
     #[test]
