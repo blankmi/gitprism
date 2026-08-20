@@ -1932,15 +1932,22 @@ mod tests {
         let tree = repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::now("Dest Author", "author@example.com").unwrap();
 
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap()
+        let oid = repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                "initial",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        // `Repository::init_bare` points HEAD at libgit2's environment
+        // default branch, which need not be `branch` (e.g. it's "master"
+        // in CI). Repoint it so push_head() in tests resolves correctly
+        // regardless of that default.
+        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+        oid
     }
 
     /// `source_url` only actually gets dereferenced (fetched from or pushed
