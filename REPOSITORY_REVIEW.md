@@ -11,8 +11,8 @@ hybrid `git2`/Git CLI approach remains reasonable for this tool.
 The original review's confirmed critical/high implementation findings have
 been remediated. The project is still **not ready for production distribution**:
 it has not run against a real production repository pair, cross-platform CI has
-not yet executed in this environment, and release-tag, artifact-signing and
-packaging decisions remain intentionally open.
+not yet executed in this environment, and the release workflow has not yet
+been exercised by a first tagged release.
 
 | Area | Score | Rationale |
 |---|---:|---|
@@ -24,18 +24,20 @@ packaging decisions remain intentionally open.
 | Testing | 8/10 | 186 tests cover hostile inputs and rollback/concurrency cases; real-pair and cross-platform execution remain pending. |
 | Cross-Platform Robustness | 7/10 | Unix byte paths are preserved, unsupported Windows bytes fail clearly, and CI covers three OSes; CI has not run here yet. |
 | Maintainability | 6/10 | Rationale is strong, but the two command modules and inline tests remain oversized. |
-| Production Readiness | 6/10 | CI, dependency policy, MIT licensing and repository metadata are present; tagging, packaging, signing and real deployment validation remain open. |
+| Production Readiness | 7/10 | CI, dependency policy, MIT licensing, repository metadata and the pinned release workflow are present; first-release execution and real deployment validation remain open. |
 
 Release recommendation: **Conditional no-go for public production distribution.**
 No confirmed CRITICAL or HIGH implementation finding remains in the reviewed
-paths, but distribution should wait for the remaining release-process
-decisions, executed Linux/macOS/Windows CI, and a real repository-pair pilot.
+paths, but distribution should wait for a first tagged release, executed
+Linux/macOS/Windows CI, and a real repository-pair pilot.
 
 Verification performed:
 
 - `cargo test --workspace --all-features --locked`: 186 passed locally.
 - `cargo build --release --locked`: passed locally.
 - Workflow and Dependabot YAML parsed successfully; `deny.toml` parsed successfully.
+- The pinned release workflow and distribution playbook were reviewed; no
+  first tagged release has been executed in this environment.
 - `cargo tree --duplicates`: no duplicate versions reported.
 - `cargo audit` and `cargo deny` are not installed locally; CI now invokes both,
   so no local vulnerability-clean claim is made.
@@ -405,10 +407,12 @@ This is argument injection into Git, not shell interpolation by `Command::arg()`
 - Category: Distribution
 - Severity: **MEDIUM**
 - Confidence: High
-- Status: **Partially fixed** in `d512c91` plus the owner-approved metadata
-  update.
+- Status: **Fixed for the approved source/GitHub unsigned distribution policy**
+  in `52fb6cd` plus the owner-approved metadata update; first-release execution
+  remains residual validation.
 - Files: `Cargo.toml`, `LICENSE`, `README.md`, `.github/workflows/ci.yml`,
-  `.github/dependabot.yml`, `deny.toml`
+  `.github/dependabot.yml`, `.github/workflows/release.yml`, `deny.toml`,
+  `design/playbooks/0002-release-distribution.md`
 - Evidence:
   - Pinned-SHA CI now runs Rust 1.89 formatting, Clippy, locked tests and a
     locked release build, plus Linux/macOS/Windows tests.
@@ -416,14 +420,19 @@ This is argument injection into Git, not shell interpolation by `Command::arg()`
   - The owner-approved MIT `LICENSE`, canonical repository URL, Cargo
     `license = "MIT"`, `repository` metadata and `publish = false` are now
     present. README documents source installation and the no-crates.io status.
-  - Release-tag/version policy, signed artifact workflow, release archives,
-    installer and package-manager integration remain intentionally open.
-- Impact: Licensing and project identity are now explicit, but public
-  distribution is not yet operationally complete.
-- Recommended remediation: Decide the release tag/version and signing
-  policies, then add reproducible release archives/checksums and installation
-  channels. Retain `publish = false` unless the owner explicitly changes the
-  no-crates.io decision.
+  - The approved release policy is documented: tags exactly
+    `v<package-version>`; Linux x86_64, macOS arm64/x86_64 and Windows x86_64
+    archives; `SHA256SUMS` for every archive; and intentionally unsigned
+    artifacts. Checksums detect corruption but do not authenticate provenance.
+  - `release.yml` verifies the exact tag, builds/tests/smoke-checks all four
+    target archives, uploads them, generates `SHA256SUMS`, creates a draft
+    release and publishes it after assets are present.
+- Impact: The chosen distribution path is implemented; the first tagged run,
+  asset inspection and real deployment validation remain.
+- Recommended remediation: Run and inspect the first exact-version tagged
+  release, verify all four archives and `SHA256SUMS`, and retain the explicit
+  unsigned-artifact limitation. Installer and package-manager integrations are
+  optional follow-up work, not release blockers.
 
 ## 6. Low and Informational Findings
 
@@ -568,8 +577,8 @@ Still-open tests and validation:
    on each supported platform.
 5. Add large-history benchmarks and verify practical behavior at each static
    resource limit.
-6. Decide and test a release artifact smoke-test/install workflow after the
-   owner selects tags, signing and distribution channels.
+6. Run and inspect the first exact-version tagged release, including all
+   archives and `SHA256SUMS`.
 
 The current suite is strongest around merge correctness, filtering, races at remote push, branch deletion policy, setup rollback under ref locking, rename behavior and conflict detection.
 
@@ -624,14 +633,13 @@ branch-advancement logic from `sync.rs`.
 |---|---|---|
 | Execute and require the pinned Linux/macOS/Windows Rust 1.89 CI matrix, including `cargo audit` and `cargo deny`. | High | Small |
 | Add worktree, submodule, malformed-object and empty-repository integration coverage. | Medium | Medium |
-| Choose and document the release tag/version policy and signing policy. | High | Medium |
+| Run and inspect the first exact-version tagged release, including all four platform archives and `SHA256SUMS`; retain the intentionally unsigned provenance limitation. | High | Small |
 
 ### P2 - Near Term
 
 | Recommendation | Impact | Effort |
 |---|---|---|
 | Extract validated branch/remote/state/ref-update components from the large command modules. | Medium | Medium |
-| Add release artifact packaging, checksums and installation instructions after owner decisions. | Medium | Medium/Large |
 | Add practical large-history benchmarks and tune documented static budgets from real workloads. | Medium | Medium |
 | Add a dedicated test for trusted Git hook/helper behavior and document that it is outside gitprism's sandbox. | Low | Small |
 
@@ -649,9 +657,9 @@ branch-advancement logic from `sync.rs`.
 2. Run a real source/destination pilot with documented rollback and recovery.
 3. Execute and require the pinned Linux/macOS/Windows Rust 1.89 workflow.
 4. Add worktree, submodule, malformed-object and empty-repository integration tests.
-5. Decide and document the release version/tag policy.
-6. Decide whether and how release artifacts are signed and verified.
-7. Add reproducible platform archives and SHA-256 checksums after those decisions.
+5. Run the first exact `v<package-version>` release and inspect its published assets.
+6. Verify all four archives and `SHA256SUMS` after the first release workflow run.
+7. Exercise missing-Git, hostile-configuration and permission failures on each supported platform.
 8. Add a dedicated test for the trusted Git hook/helper boundary.
 9. Extract state/ref-update/validated-input components from the large command modules.
-10. Benchmark real large repositories and tune the documented resource budgets.
+10. Benchmark large repositories and tune the documented resource budgets.

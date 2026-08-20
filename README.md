@@ -37,9 +37,10 @@ before assuming behavior beyond what's written here.
 The repository CI workflow validates formatting, Clippy, locked tests and a
 locked release build with Rust 1.89, and runs the test suite on Linux, macOS
 and Windows. Dependency checks use `cargo audit` and `cargo deny`. This is
-engineering validation, not a production-distribution claim: there are no
-published packages, signed release artifacts, installers or package-manager
-formulas yet.
+engineering validation, not a claim that a release has already shipped: no
+tagged release has been published yet. The pinned release workflow builds,
+tests and smoke-checks the approved archives and publishes their checksums;
+installer and package-manager integrations are optional.
 
 ## How it works, briefly
 
@@ -95,6 +96,18 @@ gitprism is distributed from source and is not published to crates.io;
 clone the canonical repository at
 [`https://github.com/blankmi/gitprism`](https://github.com/blankmi/gitprism)
 and build it locally. It is available under the [MIT License](LICENSE).
+
+### Release policy
+
+Release tags are exactly `v<package-version>`. Each release must provide
+archives for Linux x86_64, macOS arm64, macOS x86_64 and Windows x86_64, plus
+a `SHA256SUMS` file covering every archive. Artifacts are
+intentionally unsigned: the checksums detect corruption, but do not
+authenticate release provenance. Push the exact tag to run the pinned release
+workflow; it collects the archives, generates `SHA256SUMS`, creates one draft
+release with all assets, and then publishes it. The release automation is
+documented in
+[`design/playbooks/0002-release-distribution.md`](design/playbooks/0002-release-distribution.md).
 
 ### Byte and platform compatibility
 

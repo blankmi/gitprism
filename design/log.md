@@ -1113,3 +1113,15 @@ and fails closed for tampered or legacy state. Bounded reads validate the
 opened handle, while setup rollback uses create-new replacement handles that
 cannot follow raced symlinks or hard links. Conflict handling remains
 fail-fast and operator-driven.
+
+## 2026-08-20 — release distribution policy
+
+**Update**: Added [playbooks/0002](playbooks/0002-release-distribution.md) to
+record the approved release policy: exact `v<package-version>` tags, Linux
+x86_64/macOS arm64/macOS x86_64/Windows x86_64 archives, `SHA256SUMS` for
+every archive, intentionally unsigned artifacts, and no crates.io publication.
+
+**Update**: The tagged release workflow now verifies `v<package-version>`
+tags, builds/tests/smoke-checks the four approved targets, uploads the archives,
+generates `SHA256SUMS`, and draft-gates GitHub publication. Artifacts remain
+intentionally unsigned.
