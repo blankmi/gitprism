@@ -29,7 +29,7 @@ compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (162 tests
+helper described below are implemented and covered by `cargo test` (171 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -72,6 +72,17 @@ network or working-tree operations.
 cargo build --release
 # binary at target/release/gitprism
 ```
+
+### Byte and platform compatibility
+
+Git paths are handled as bytes for comparisons and diagnostics where the
+platform APIs allow it. Malformed bytes, ASCII controls, and backslashes are
+rendered with deterministic escapes rather than lossy replacement or terminal
+control sequences. Unix preserves non-UTF-8 path bytes in native paths;
+Windows and other platforms reject paths that cannot be represented safely.
+Non-UTF-8 commit messages, tree names, and branch names are rejected before a
+commit or ref is created or advanced, so gitprism does not promise to sync
+those objects across platforms.
 
 ## Configuration: `.gitprism.toml`
 

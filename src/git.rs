@@ -4,6 +4,7 @@
 //! agent/`GIT_ASKPASS` handling a human running `git` would get, rather than
 //! a library reimplementation of it.
 
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
@@ -47,38 +48,126 @@ pub(crate) fn validate_branch_name(branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Render Git path or diagnostic bytes without lossy UTF-8 replacement.
+/// Printable UTF-8 remains readable; ASCII controls and backslashes are
+/// escaped, and malformed UTF-8 bytes use deterministic `\xNN` escapes.
+pub(crate) fn escape_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                append_escaped_text(&mut escaped, text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if let Ok(text) = std::str::from_utf8(&remaining[..valid]) {
+                    append_escaped_text(&mut escaped, text);
+                }
+                let invalid = remaining[valid];
+                let _ = write!(escaped, "\\x{invalid:02X}");
+                remaining = &remaining[valid + 1..];
+            }
+        }
+    }
+    escaped
+}
+
+fn append_escaped_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            character if character.is_control() => {
+                if (character as u32) <= 0xFF {
+                    let _ = write!(output, "\\x{:02X}", character as u32);
+                } else {
+                    let _ = write!(output, "\\u{{{:X}}}", character as u32);
+                }
+            }
+            character => output.push(character),
+        }
+    }
+}
+
+/// Convert Git path bytes to a native path without calling git2's Windows
+/// byte-to-path helper, which assumes UTF-8 with an internal unwrap.
+pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Result<&Path> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        Ok(Path::new(OsStr::from_bytes(bytes)))
+    }
+
+    #[cfg(windows)]
+    {
+        let text = std::str::from_utf8(bytes).with_context(|| {
+            format!(
+                "Git path {} is not valid UTF-8 on this platform",
+                escape_bytes(bytes)
+            )
+        })?;
+        Ok(Path::new(text))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let text = std::str::from_utf8(bytes).with_context(|| {
+            format!(
+                "Git path {} is not valid UTF-8 on this platform",
+                escape_bytes(bytes)
+            )
+        })?;
+        Ok(Path::new(text))
+    }
+}
+
 fn git_diagnostic(raw: &[u8], remote: Option<&str>) -> String {
-    let text = String::from_utf8_lossy(raw);
-    let redacted = remote.map_or_else(
-        || text.to_string(),
-        |remote| text.replace(remote, "<configured remote>"),
-    );
+    let redacted = remote
+        .map(|remote| redact_bytes(raw, remote.as_bytes()))
+        .unwrap_or_else(|| raw.to_vec());
+    let redacted = escape_bytes(&redacted);
     let mut framed = String::new();
     for character in redacted.chars() {
-        let escaped = if character.is_control() {
-            if (character as u32) <= 0xff {
-                format!("\\x{:02X}", character as u32)
-            } else {
-                format!("\\u{{{:X}}}", character as u32)
-            }
-        } else {
-            character.to_string()
-        };
-        if framed.len() + escaped.len() > MAX_DIAGNOSTIC_BYTES {
+        if framed.len() + character.len_utf8() > MAX_DIAGNOSTIC_BYTES {
             framed.push('…');
             break;
         }
-        framed.push_str(&escaped);
+        framed.push(character);
     }
     framed
 }
 
+fn redact_bytes(raw: &[u8], secret: &[u8]) -> Vec<u8> {
+    if secret.is_empty() {
+        return raw.to_vec();
+    }
+
+    let mut redacted = Vec::with_capacity(raw.len());
+    let mut cursor = 0;
+    while cursor < raw.len() {
+        let Some(relative) = raw[cursor..]
+            .windows(secret.len())
+            .position(|candidate| candidate == secret)
+        else {
+            redacted.extend_from_slice(&raw[cursor..]);
+            break;
+        };
+        let start = cursor + relative;
+        redacted.extend_from_slice(&raw[cursor..start]);
+        redacted.extend_from_slice(b"<configured remote>");
+        cursor = start + secret.len();
+    }
+    redacted
+}
+
 fn is_non_fast_forward_rejection(raw: &[u8]) -> bool {
-    String::from_utf8_lossy(raw).lines().any(|line| {
-        let mut fields = line.split('\t');
+    raw.split(|byte| *byte == b'\n').any(|line| {
+        let mut fields = line.split(|byte| *byte == b'\t');
         let status = fields.next();
         let reason = fields.next_back().unwrap_or_default();
-        status == Some("!") && reason.starts_with("[rejected]")
+        status == Some(b"!") && reason.starts_with(b"[rejected]")
     })
 }
 
@@ -582,12 +671,21 @@ pub fn merge_tree(
             format!("running git merge-tree --write-tree --merge-base={base} {ours} {theirs}")
         })?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut records = stdout.split('\0').filter(|record| !record.is_empty());
+    let mut records = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
 
     match output.status.code() {
         Some(0) => {
             let tree_record = records.next().unwrap_or_default();
+            let tree_record = std::str::from_utf8(tree_record).with_context(|| {
+                format!(
+                    "merge-tree reported a non-UTF-8 tree oid {} for \
+                     --merge-base={base} {ours} {theirs}",
+                    escape_bytes(tree_record)
+                )
+            })?;
             let oid = git2::Oid::from_str(tree_record.trim()).with_context(|| {
                 format!(
                     "parsing merge-tree's reported tree oid {tree_record:?} for \
@@ -603,15 +701,15 @@ pub fn merge_tree(
         // Only the exit code decides Clean vs Conflict (decisions/0007:
         // hard-stop, never auto-resolve) — `paths` below exists purely to
         // make that hard-stop message actionable, never as a control-flow
-        // input, which is also why a lossy UTF-8 conversion is fine here
-        // rather than a bail on invalid bytes.
+        // input. Paths are escaped byte-wise below so malformed names remain
+        // actionable without being interpreted as terminal control data.
         //
         // Leaving that discarded tree (and its blobs) as unreferenced loose
         // objects is accepted, not overlooked: ordinary git garbage on an
         // error path, in a CI checkout, reclaimed by `git gc` — the same
         // residue an aborted `git merge` leaves behind.
         Some(1) => {
-            let mut paths: Vec<String> = records.skip(1).map(str::to_string).collect();
+            let mut paths: Vec<String> = records.skip(1).map(escape_bytes).collect();
             // The same normalisation resolve::conflicted_paths already
             // does — don't assume git deduplicates stages for us.
             paths.sort();
@@ -655,8 +753,13 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
         anyhow::bail!("git --version failed ({}): {stderr}", output.status);
     }
 
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let (major, minor) = parse_git_version(&raw).with_context(|| {
+    let raw = std::str::from_utf8(&output.stdout).with_context(|| {
+        format!(
+            "git --version returned non-UTF-8 output: {}",
+            escape_bytes(&output.stdout)
+        )
+    })?;
+    let (major, minor) = parse_git_version(raw).with_context(|| {
         format!(
             "could not parse a version out of {raw:?} — needed to confirm git supports \
              the merge-tree flag set gitprism relies on (--merge-base with raw tree \
@@ -680,6 +783,8 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use git2::Repository;
     use tempfile::tempdir;
 
@@ -960,6 +1065,16 @@ mod tests {
         let large = vec![b'x'; MAX_DIAGNOSTIC_BYTES + 1];
         let diagnostic = git_diagnostic(&large, None);
         assert!(diagnostic.len() <= MAX_DIAGNOSTIC_BYTES + "…".len());
+    }
+
+    #[test]
+    fn git_diagnostics_redact_raw_remote_bytes_before_escaping() {
+        let remote = r"https://user:secret@example.test/C:\repo\git.git";
+        let raw = format!("fatal: unable to access {remote}\n");
+        let diagnostic = git_diagnostic(raw.as_bytes(), Some(remote));
+        assert!(!diagnostic.contains("secret"));
+        assert!(!diagnostic.contains("C:"));
+        assert!(diagnostic.contains("<configured remote>"));
     }
 
     /// A non-bare repo with one commit on `branch` containing `files`,
@@ -1330,6 +1445,26 @@ mod tests {
         builder.write().unwrap()
     }
 
+    #[cfg(unix)]
+    fn tree_with_raw_path(repo: &Repository, path: &[u8], contents: &[u8]) -> git2::Oid {
+        let blob = repo.blob(contents).unwrap();
+        let mut input = format!("100644 blob {blob}\t").into_bytes();
+        input.extend_from_slice(path);
+        input.push(0);
+        let mut child = Command::new("git")
+            .current_dir(repo.workdir().unwrap())
+            .arg("mktree")
+            .arg("-z")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "git mktree failed: {output:?}");
+        git2::Oid::from_str(std::str::from_utf8(&output.stdout).unwrap().trim()).unwrap()
+    }
+
     #[test]
     fn merge_tree_reports_the_merged_tree_when_the_two_sides_touch_different_files() {
         let dir = tempdir().unwrap();
@@ -1388,6 +1523,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn merge_tree_escapes_invalid_bytes_in_conflicted_paths() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let path = b"bad-\xff.txt";
+        let base = tree_with_raw_path(&repo, path, b"base\n");
+        let ours = tree_with_raw_path(&repo, path, b"ours\n");
+        let theirs = tree_with_raw_path(&repo, path, b"theirs\n");
+
+        let outcome = merge_tree(dir.path(), base, ours, theirs).unwrap();
+
+        assert_eq!(
+            outcome,
+            MergeTreeOutcome::Conflict {
+                paths: vec!["bad-\\xFF.txt".to_string()]
+            }
+        );
+    }
+
     #[test]
     fn merge_tree_fails_loudly_on_an_oid_that_isnt_in_the_repository() {
         let dir = tempdir().unwrap();
@@ -1416,6 +1571,25 @@ mod tests {
         );
         assert_eq!(parse_git_version("git version 2.40.0"), Some((2, 40)));
         assert_eq!(parse_git_version("not a version"), None);
+    }
+
+    #[test]
+    fn escape_bytes_preserves_unicode_and_escapes_controls_and_invalid_bytes() {
+        assert_eq!(escape_bytes(b"caf\xc3\xa9"), "café");
+        assert_eq!(
+            escape_bytes(b"line\n\tesc\x1b\\"),
+            "line\\x0A\\x09esc\\x1B\\\\"
+        );
+        assert_eq!(escape_bytes(b"bad\xff\xfe"), "bad\\xFF\\xFE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_from_git_bytes_preserves_invalid_unix_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = path_from_git_bytes(b"bad\xff").expect("Unix paths preserve raw bytes");
+        assert_eq!(path.as_os_str().as_bytes(), b"bad\xff");
     }
 
     #[test]

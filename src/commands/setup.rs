@@ -140,10 +140,16 @@ fn run_with_remove_file(
         .context("listing source repo's existing branches")?
     {
         let (branch, _) = branch_result.context("reading an existing local branch")?;
-        let name = branch
-            .name()
-            .context("reading existing branch's name")?
-            .context("existing local branch name is not valid UTF-8")?
+        let name_bytes = branch
+            .name_bytes()
+            .context("reading existing branch's name")?;
+        let name = std::str::from_utf8(name_bytes)
+            .with_context(|| {
+                format!(
+                    "existing local branch has a non-UTF-8 name gitprism can't use: {}",
+                    git::escape_bytes(name_bytes)
+                )
+            })?
             .to_owned();
         if !config.branches.contains(&name) {
             continue;

@@ -182,10 +182,15 @@ fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
         .context("listing source's local branches")?
         .map(|entry| {
             let (branch, _) = entry.context("reading a local branch")?;
-            let name = branch
-                .name()
-                .context("reading a local branch's name")?
-                .context("a local branch has a non-UTF-8 name gitprism can't mirror by")?;
+            let name_bytes = branch
+                .name_bytes()
+                .context("reading a local branch's name")?;
+            let name = std::str::from_utf8(name_bytes).with_context(|| {
+                format!(
+                    "a local branch has a non-UTF-8 name gitprism can't mirror by: {}",
+                    git::escape_bytes(name_bytes)
+                )
+            })?;
             crate::git::validate_branch_name(name)
                 .with_context(|| format!("validating local branch {name:?}"))?;
             Ok(name.to_string())
@@ -926,9 +931,13 @@ pub(crate) fn filter_tree(
         .context("starting a filtered tree builder")?;
 
     for entry in tree.iter() {
-        let name = entry
-            .name()
-            .context("a tree entry has a non-UTF-8 name gitprism can't filter by")?;
+        let name_bytes = entry.name_bytes();
+        let name = std::str::from_utf8(name_bytes).with_context(|| {
+            format!(
+                "a tree entry has a non-UTF-8 name gitprism can't filter by: {}",
+                git::escape_bytes(name_bytes)
+            )
+        })?;
         let rel_path = prefix.join(name);
         let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
 
@@ -977,6 +986,15 @@ fn empty_tree(repo: &Repository) -> Result<Oid> {
         .context("writing the empty tree")
 }
 
+fn validated_commit_message<'a, 'b>(commit: &'a git2::Commit<'b>) -> Result<&'a str> {
+    std::str::from_utf8(commit.message_bytes()).with_context(|| {
+        format!(
+            "commit {} has a non-UTF-8 message; gitprism refuses to replace it with a lossy or empty message",
+            commit.id()
+        )
+    })
+}
+
 /// Builds one new dest-bound commit in `repo`'s object database — object
 /// only, no ref update, since the chain is pushed by oid once it's complete.
 /// Preserves the original author, stamps gitprism's own committer identity
@@ -1000,7 +1018,7 @@ pub(crate) fn build_dest_commit(
     let committer = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
     let message = marker::build_message(
-        source_commit.message().unwrap_or(""),
+        validated_commit_message(source_commit)?,
         MarkerDirection::SourceToDest,
         branch,
         source_commit.id(),
@@ -1251,6 +1269,24 @@ fn local_source_branch_tip(repo: &Repository, branch: &str) -> Result<Oid> {
         .map(|commit| commit.id())
 }
 
+fn head_points_to_branch(repo: &Repository, refname: &str) -> Result<bool> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(_) => return Ok(false),
+    };
+    let name_bytes = head.name_bytes();
+    if name_bytes.is_empty() {
+        return Ok(false);
+    }
+    let name = std::str::from_utf8(name_bytes).with_context(|| {
+        format!(
+            "symbolic HEAD name {} is not valid UTF-8",
+            git::escape_bytes(name_bytes)
+        )
+    })?;
+    Ok(name == refname)
+}
+
 /// Performs all checks that can be made without changing the local checkout.
 /// The returned OID is the exact value later used by the compare-and-swap
 /// update, so a concurrent ref move cannot be mistaken for the state checked
@@ -1271,11 +1307,7 @@ fn preflight_local_source_branch(repo: &Repository, branch: &str, new_tip: Oid) 
     }
 
     let refname = format!("refs/heads/{branch}");
-    let head_points_here = repo
-        .head()
-        .ok()
-        .and_then(|head_ref| head_ref.name().ok().map(str::to_owned))
-        .is_some_and(|name| name == refname);
+    let head_points_here = head_points_to_branch(repo, &refname)?;
 
     if head_points_here {
         // A symbolic HEAD can temporarily name a branch whose ref was moved
@@ -1333,9 +1365,9 @@ fn reject_colliding_untracked_paths(repo: &Repository, branch: &str, new_tip: Oi
     let diff = repo
         .diff_tree_to_tree(Some(&head_tree), Some(&target_tree), None)
         .context("comparing local and target trees while checking checkout collisions")?;
-    let target_paths: Vec<&Path> = diff
+    let target_paths: Vec<&[u8]> = diff
         .deltas()
-        .filter_map(|delta| delta.new_file().path())
+        .filter_map(|delta| delta.new_file().path_bytes())
         .collect();
     if target_paths.is_empty() {
         return Ok(());
@@ -1354,12 +1386,10 @@ fn reject_colliding_untracked_paths(repo: &Repository, branch: &str, new_tip: Oi
         if !(entry.status().is_wt_new() || entry.status().is_ignored()) {
             continue;
         }
-        let Ok(path) = entry.path() else {
-            continue;
-        };
+        let path = entry.path_bytes();
         if target_paths
             .iter()
-            .any(|target| target == &path || target.starts_with(path))
+            .any(|target| git_paths_conflict(target, path))
         {
             anyhow::bail!(
                 "gitprism sync: checked-out source branch {branch:?} has an untracked or ignored path that the pushed tree would overwrite; refusing to push before a safe local advancement"
@@ -1367,6 +1397,14 @@ fn reject_colliding_untracked_paths(repo: &Repository, branch: &str, new_tip: Oi
         }
     }
     Ok(())
+}
+
+fn git_paths_conflict(left: &[u8], right: &[u8]) -> bool {
+    left == right || path_component_prefix(left, right) || path_component_prefix(right, left)
+}
+
+fn path_component_prefix(prefix: &[u8], path: &[u8]) -> bool {
+    path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/'
 }
 
 /// Materializes the pushed commit and advances the local ref with a
@@ -1388,11 +1426,7 @@ fn advance_local_source_branch(
         );
     }
 
-    let head_points_here = repo
-        .head()
-        .ok()
-        .and_then(|head_ref| head_ref.name().ok().map(str::to_owned))
-        .is_some_and(|name| name == refname);
+    let head_points_here = head_points_to_branch(repo, &refname)?;
 
     if head_points_here {
         let new_commit = repo
@@ -1772,7 +1806,7 @@ pub(crate) fn build_source_commit(
     let committer = Signature::now(&config.committer.name, &config.committer.email)
         .context("building gitprism's committer signature")?;
     let message = marker::build_message(
-        dest_commit.message().unwrap_or(""),
+        validated_commit_message(dest_commit)?,
         MarkerDirection::DestToSource,
         branch,
         dest_commit.id(),
@@ -3460,6 +3494,103 @@ mod tests {
         (dir, repo, first, second)
     }
 
+    fn commit_with_raw_message(repo: &Repository, parent: Oid, message: &[u8]) -> Oid {
+        let parent_commit = repo.find_commit(parent).unwrap();
+        let mut commit = format!(
+            "tree {}\nparent {}\nauthor Author <author@example.com> 0 +0000\ncommitter Committer <committer@example.com> 0 +0000\n\n",
+            parent_commit.tree_id(), parent
+        )
+        .into_bytes();
+        commit.extend_from_slice(message);
+        let mut child = std::process::Command::new("git")
+            .current_dir(repo.workdir().unwrap())
+            .arg("hash-object")
+            .arg("-t")
+            .arg("commit")
+            .arg("-w")
+            .arg("--stdin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&commit).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git hash-object failed: {output:?}"
+        );
+        Oid::from_str(std::str::from_utf8(&output.stdout).unwrap().trim()).unwrap()
+    }
+
+    #[test]
+    fn mirrored_commit_rejects_non_utf8_messages_without_advancing_refs() {
+        let (dir, repo, first, _) = repository_with_commits();
+        let invalid = commit_with_raw_message(&repo, first, b"bad\xff message\n");
+        let config = Config::load(write_config("unused", "unused", &["main"]).path()).unwrap();
+        let tree = repo.find_commit(invalid).unwrap().tree_id();
+        let key = marker::load_key().unwrap();
+
+        let dest_error = build_dest_commit(
+            &repo,
+            &config,
+            first,
+            &repo.find_commit(invalid).unwrap(),
+            tree,
+            "main",
+            &key,
+        )
+        .unwrap_err();
+        assert!(dest_error.to_string().contains(&invalid.to_string()));
+
+        let source_error = build_source_commit(
+            &repo,
+            &config,
+            first,
+            &repo.find_commit(invalid).unwrap(),
+            tree,
+            "main",
+            &key,
+        )
+        .unwrap_err();
+        assert!(source_error.to_string().contains(&invalid.to_string()));
+        assert_eq!(
+            repo.find_branch("main", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .target(),
+            Some(first),
+            "rejecting a malformed message must not advance the branch"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn mirrored_commit_preserves_valid_unicode_messages() {
+        let (dir, repo, first, _) = repository_with_commits();
+        let unicode = commit_with_raw_message(&repo, first, "héllö 世界\n".as_bytes());
+        let config = Config::load(write_config("unused", "unused", &["main"]).path()).unwrap();
+        let tree = repo.find_commit(unicode).unwrap().tree_id();
+        let key = marker::load_key().unwrap();
+        let built = build_dest_commit(
+            &repo,
+            &config,
+            first,
+            &repo.find_commit(unicode).unwrap(),
+            tree,
+            "main",
+            &key,
+        )
+        .unwrap();
+        assert!(
+            repo.find_commit(built)
+                .unwrap()
+                .message()
+                .unwrap()
+                .contains("héllö 世界")
+        );
+        drop(dir);
+    }
+
     #[test]
     fn dirty_checked_out_branch_fails_preflight_before_push() {
         let (dir, repo, first, second) = repository_with_commits();
@@ -3559,6 +3690,22 @@ mod tests {
 
         let error = preflight_local_source_branch(&repo, "main", third).unwrap_err();
         assert!(error.to_string().contains("untracked or ignored path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_byte_paths_are_compared_without_utf8_conversion() {
+        let target = b"bad-\xff.txt";
+        assert!(git_paths_conflict(target, target));
+        assert!(git_paths_conflict(target, b"bad-\xff.txt/child"));
+        assert!(!git_paths_conflict(target, b"bad-.txt"));
+    }
+
+    #[test]
+    fn path_collision_requires_a_component_boundary() {
+        assert!(!git_paths_conflict(b"foobar", b"foo"));
+        assert!(git_paths_conflict(b"foo/bar", b"foo"));
+        assert!(git_paths_conflict(b"foo", b"foo/bar"));
     }
 
     #[test]

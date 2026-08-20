@@ -155,11 +155,21 @@ pub fn run_with_direction(
 /// (finishing needs to read/move the same branch) depend on this.
 fn require_branch_checked_out(repo: &Repository, branch: &str) -> Result<()> {
     let refname = format!("refs/heads/{branch}");
-    let head_points_here = repo
-        .head()
-        .ok()
-        .and_then(|head_ref| head_ref.name().ok().map(str::to_owned))
-        .is_some_and(|name| name == refname);
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(_) => {
+            anyhow::bail!(
+                "gitprism resolve: branch {branch:?} isn't checked out — check it out first with `git checkout <branch>`"
+            );
+        }
+    };
+    let head_name = std::str::from_utf8(head.name_bytes()).with_context(|| {
+        format!(
+            "HEAD names a non-UTF-8 ref {}; gitprism cannot safely select the checked-out branch",
+            git::escape_bytes(head.name_bytes())
+        )
+    })?;
+    let head_points_here = head_name == refname;
 
     if !head_points_here {
         anyhow::bail!(
@@ -586,12 +596,13 @@ fn reject_excluded_edits(
     let diff = repo.diff_tree_to_tree(Some(base), Some(resolved), None)?;
     let mut excluded = Vec::new();
     for delta in diff.deltas() {
-        for path in [delta.old_file().path(), delta.new_file().path()]
+        for path_bytes in [delta.old_file().path_bytes(), delta.new_file().path_bytes()]
             .into_iter()
             .flatten()
         {
+            let path = git::path_from_git_bytes(path_bytes)?;
             if exclude_list.is_excluded(path, false) {
-                excluded.push(path.display().to_string());
+                excluded.push(git::escape_bytes(path_bytes));
             }
         }
     }
@@ -648,7 +659,13 @@ fn find_source_to_dest_operation(
             "gitprism resolve: source-to-dest operation ref failed authenticated verification"
         );
     };
-    let body = marker::parse(state.message().unwrap_or(""))
+    let message = std::str::from_utf8(state.message_bytes()).with_context(|| {
+        format!(
+            "authenticated source-to-dest operation state commit {} has a non-UTF-8 message",
+            state.id()
+        )
+    })?;
+    let body = marker::parse(message)
         .context("parsing source-to-dest operation state")?
         .body;
     let fields = parse_operation_state(&body)?;
@@ -792,7 +809,13 @@ fn validate_operation_state(
             "gitprism resolve: synthetic source-to-dest patch no longer matches the filtered source commit"
         );
     }
-    let body = marker::parse(state.message().unwrap_or(""))
+    let message = std::str::from_utf8(state.message_bytes()).with_context(|| {
+        format!(
+            "authenticated source-to-dest operation state commit {} has a non-UTF-8 message",
+            state.id()
+        )
+    })?;
+    let body = marker::parse(message)
         .context("parsing authenticated source-to-dest operation state")?
         .body;
     let fields = parse_operation_state(&body)?;
@@ -1017,17 +1040,14 @@ fn resolve_continue(
 /// to make an error message actionable, not for any control-flow decision.
 fn conflicted_paths(repo: &Repository) -> Result<Vec<String>> {
     let index = repo.index().context("reading the repo's index")?;
-    let mut paths: Vec<String> = index
-        .conflicts()
-        .context("reading the index's conflicts")?
-        .filter_map(|c| c.ok())
-        .filter_map(|c| {
-            c.ancestor
-                .or(c.our)
-                .or(c.their)
-                .and_then(|entry| String::from_utf8(entry.path).ok())
-        })
-        .collect();
+    let conflicts = index.conflicts().context("reading the index's conflicts")?;
+    let mut paths = Vec::new();
+    for conflict in conflicts {
+        let conflict = conflict.context("reading an index conflict entry")?;
+        if let Some(entry) = conflict.ancestor.or(conflict.our).or(conflict.their) {
+            paths.push(git::escape_bytes(&entry.path));
+        }
+    }
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -1162,6 +1182,42 @@ mod tests {
         assert!(rendered.contains(&format!("branch {branch:?}")));
         assert!(rendered.contains("`git checkout <branch>`"));
         assert!(!rendered.contains(&format!("`git checkout {branch}`")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflicted_paths_preserves_invalid_index_bytes() {
+        use git2::{IndexEntry, IndexTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob = repo.blob(b"conflict").unwrap();
+        let path = b"conflicted-\xff.txt";
+        let mut index = repo.index().unwrap();
+        for stage in 1..=3 {
+            index
+                .add(&IndexEntry {
+                    ctime: IndexTime::new(0, 0),
+                    mtime: IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    file_size: 0,
+                    id: blob,
+                    flags: (stage as u16) << 12,
+                    flags_extended: 0,
+                    path: path.to_vec(),
+                })
+                .unwrap();
+        }
+        index.write().unwrap();
+
+        assert_eq!(
+            conflicted_paths(&repo).unwrap(),
+            vec!["conflicted-\\xFF.txt"]
+        );
     }
 
     fn bare_repo_with_a_commit_on(dir: &Path, branch: &str, files: &[(&str, &str)]) -> Oid {

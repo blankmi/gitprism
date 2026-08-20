@@ -1075,3 +1075,13 @@ permissions, and external `--config` input cannot replace a different
 source-root config. Control-file removal failures now enter the same rollback
 path. Fetch side effects remain outside rollback by design. Added deterministic
 aggregation and removal-failure tests; no new architecture decision was needed.
+
+## 2026-08-20 — byte-safe Git data
+
+**Update**: Decided [0030](decisions/0030-byte-safe-git-data.md) — Git paths
+remain raw bytes for comparisons and diagnostics where possible, malformed
+bytes are escaped deterministically for terminal output, and unsupported
+non-UTF-8 commit messages, tree names, and refs fail explicitly before any
+commit or ref mutation. Added coverage for malformed merge-tree/index paths,
+Unicode commit messages, raw remote redaction, and component-aware checkout
+collision checks.
