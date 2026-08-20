@@ -13,12 +13,12 @@
 //! branch needs no config entry to start syncing.
 
 use std::collections::HashSet;
-#[cfg(test)]
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+use crate::limits;
 
 /// The config's own filename. Self-excluded from source→dest filtering by
 /// convention (decisions/0011, decisions/0012) — never needs listing in
@@ -102,6 +102,13 @@ impl Config {
                 anyhow::bail!("config at {} contains an invalid {field}", path.display());
             }
         }
+        if config.branches.len() > limits::MAX_CONFIG_BRANCHES {
+            anyhow::bail!(
+                "config at {} contains more than the {} configured-branch limit",
+                path.display(),
+                limits::MAX_CONFIG_BRANCHES
+            );
+        }
         let mut seen = HashSet::with_capacity(config.branches.len());
         for branch in &config.branches {
             if branch.is_empty() {
@@ -132,9 +139,10 @@ impl Config {
     /// does (decisions/0012).
     #[cfg(test)]
     pub fn load(path: &Path) -> Result<Config> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("reading config at {}", path.display()))?;
-        Self::parse(&raw, path)
+        let raw = limits::read_regular_file(path, limits::MAX_CONTROL_FILE_BYTES, "config")?;
+        let raw = std::str::from_utf8(&raw)
+            .with_context(|| format!("config at {} is not valid UTF-8", path.display()))?;
+        Self::parse(raw, path)
     }
 
     /// Source's remote URL: `[source].url` if the committed config sets it,
@@ -248,6 +256,19 @@ mod tests {
             let err = Config::load(file.path()).expect_err("invalid branch config must fail");
             assert!(err.to_string().contains("branch"));
         }
+    }
+
+    #[test]
+    fn parse_rejects_too_many_configured_branches() {
+        let branches = (0..=limits::MAX_CONFIG_BRANCHES)
+            .map(|index| format!("\"branch-{index}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = format!(
+            "branches = [{branches}]\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\""
+        );
+        let error = Config::parse(&raw, Path::new(".gitprism.toml")).unwrap_err();
+        assert!(error.to_string().contains("configured-branch limit"));
     }
 
     #[test]

@@ -40,6 +40,7 @@ use crate::commands::sync::{
 use crate::config::Config;
 use crate::exclude;
 use crate::git::{self, CherryPickOutcome};
+use crate::limits;
 use crate::marker;
 use crate::policy;
 
@@ -47,6 +48,13 @@ use crate::policy;
 pub enum Direction {
     DestToSource,
     SourceToDest,
+}
+
+fn read_state_file(path: &Path, description: &str) -> Result<String> {
+    let bytes = limits::read_regular_file(path, limits::MAX_STATE_FILE_BYTES, description)?;
+    std::str::from_utf8(&bytes)
+        .with_context(|| format!("{description} at {} is not valid UTF-8", path.display()))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -469,7 +477,7 @@ fn write_source_to_dest_cherry_pick_head(worktree: &Path, patch: Oid) -> Result<
                     "gitprism resolve: refusing to use a non-regular linked-worktree CHERRY_PICK_HEAD"
                 );
             }
-            let actual = fs::read_to_string(&path)?;
+            let actual = read_state_file(&path, "linked-worktree CHERRY_PICK_HEAD")?;
             if actual.trim() != patch.to_string() {
                 anyhow::bail!(
                     "gitprism resolve: linked worktree already has a different CHERRY_PICK_HEAD"
@@ -511,7 +519,8 @@ fn finish_source_to_dest(
     }
     if finish_mode == SourceToDestFinishMode::Continue {
         let cherry_pick_head = worktree_repo.path().join("CHERRY_PICK_HEAD");
-        let actual = fs::read_to_string(&cherry_pick_head).with_context(|| {
+        let actual = read_state_file(&cherry_pick_head, "linked-worktree CHERRY_PICK_HEAD")
+            .with_context(|| {
             "gitprism resolve: source-to-dest continuation requires the authenticated cherry-pick to still be active"
         })?;
         if actual.trim() != operation.cherry_pick.to_string() {
@@ -682,7 +691,8 @@ fn find_source_to_dest_operation(
     if let Ok(entries) = fs::read_dir(&worktrees) {
         for entry in entries {
             let metadata = entry?.path();
-            let Ok(raw) = fs::read_to_string(metadata.join("gitdir")) else {
+            let Ok(raw) = read_state_file(&metadata.join("gitdir"), "linked-worktree gitdir")
+            else {
                 continue;
             };
             let mut gitdir = PathBuf::from(raw.trim());
@@ -968,7 +978,7 @@ fn resolve_continue(
     }
     require_branch_checked_out(repo, branch)?;
 
-    let dest_oid_raw = std::fs::read_to_string(cherry_pick_head)
+    let dest_oid_raw = read_state_file(cherry_pick_head, "CHERRY_PICK_HEAD")
         .context("reading CHERRY_PICK_HEAD")?
         .trim()
         .to_string();
@@ -1042,9 +1052,25 @@ fn conflicted_paths(repo: &Repository) -> Result<Vec<String>> {
     let index = repo.index().context("reading the repo's index")?;
     let conflicts = index.conflicts().context("reading the index's conflicts")?;
     let mut paths = Vec::new();
+    let mut conflict_count = 0;
+    let mut raw_path_bytes: usize = 0;
     for conflict in conflicts {
+        conflict_count += 1;
+        if conflict_count > limits::MAX_CONFLICT_RECORDS {
+            anyhow::bail!(
+                "index conflict reporting exceeds the {} record limit",
+                limits::MAX_CONFLICT_RECORDS
+            );
+        }
         let conflict = conflict.context("reading an index conflict entry")?;
         if let Some(entry) = conflict.ancestor.or(conflict.our).or(conflict.their) {
+            raw_path_bytes = raw_path_bytes.saturating_add(entry.path.len());
+            if raw_path_bytes > limits::MAX_CONFLICT_PATH_BYTES {
+                anyhow::bail!(
+                    "index conflict paths exceed the {} byte limit",
+                    limits::MAX_CONFLICT_PATH_BYTES
+                );
+            }
             paths.push(git::escape_bytes(&entry.path));
         }
     }

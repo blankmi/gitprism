@@ -87,9 +87,10 @@ the first place.
 
 Nothing else about either function changes: same signature, same trailer
 key read, same "keep walking until a match, else `None`/`bail!`" shape,
-same unbounded-walk behavior `newest_source_marker`'s doc comment already
-argues for (unbounded now means "the whole first-parent line," not "the
-whole reachable graph").
+same whole-first-parent-line behavior `newest_source_marker`'s doc comment
+already argues for (decision 0032 adds a static work bound; "whole
+first-parent line" means "do not hide the graft point," not "the whole
+reachable graph").
 
 **Documented limitation, not engineered around**: this relies on the tracked
 branch always being the first parent of its own merges. That is the default,
@@ -152,12 +153,13 @@ merge commits already depend on.
   branch" guarantee still holds**: `setup`'s own graft commit
   (decisions/0006) is a real, direct, first-parent ancestor of every branch
   it grafts, so the first-parent walk still reaches it.
-* **`newest_source_marker`'s "deliberately unbounded, doesn't hide the graft
-  point" property is unchanged in kind, narrower in scope**: the walk still
-  never stops early looking for an *older* marker sitting behind the usual
-  boundary, it just no longer looks down non-first-parent branches to find
-  one. A marker that only exists off a merged-in side branch's own history
-  was never the tracked branch's own resume point anyway.
+* **`newest_source_marker` still does not hide the graft point**, but decision
+  0032 adds a static maximum amount of first-parent history it will inspect.
+  The walk does not stop early at the usual boundary; it fails clearly if the
+  safety bound is exceeded rather than guessing a resume point. It still no
+  longer looks down non-first-parent branches to find one. A marker that only
+  exists off a merged-in side branch's own history was never the tracked
+  branch's own resume point anyway.
 * **No change to `pending_commits`, `dest_tip_is_accounted_for`'s cases 1/2,
   or `build_pending_dest_tip`/`build_pending_source_tip`'s own walks** —
   none of those revwalk full ancestry for marker discovery; the change is

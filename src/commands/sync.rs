@@ -69,6 +69,7 @@ use git2::{Oid, Repository, Signature};
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git;
+use crate::limits;
 use crate::marker::{self, Direction as MarkerDirection};
 use crate::policy;
 use crate::progress::{Direction, Outcome, Reporter};
@@ -177,25 +178,31 @@ fn load_run_policy(config_path: &Path, source_root: &Path) -> Result<policy::Ver
 /// the source→dest loop rather than listed again. A local, read-only `git
 /// branch` enumeration; no fetch involved.
 fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
-    let mut source_branches: Vec<String> = repo
+    let mut source_branches = Vec::new();
+    for entry in repo
         .branches(Some(git2::BranchType::Local))
         .context("listing source's local branches")?
-        .map(|entry| {
-            let (branch, _) = entry.context("reading a local branch")?;
-            let name_bytes = branch
-                .name_bytes()
-                .context("reading a local branch's name")?;
-            let name = std::str::from_utf8(name_bytes).with_context(|| {
-                format!(
-                    "a local branch has a non-UTF-8 name gitprism can't mirror by: {}",
-                    git::escape_bytes(name_bytes)
-                )
-            })?;
-            crate::git::validate_branch_name(name)
-                .with_context(|| format!("validating local branch {name:?}"))?;
-            Ok(name.to_string())
-        })
-        .collect::<Result<Vec<_>>>()?;
+    {
+        if source_branches.len() >= limits::MAX_SOURCE_BRANCHES {
+            anyhow::bail!(
+                "source branch enumeration exceeds the {} branch limit",
+                limits::MAX_SOURCE_BRANCHES
+            );
+        }
+        let (branch, _) = entry.context("reading a local branch")?;
+        let name_bytes = branch
+            .name_bytes()
+            .context("reading a local branch's name")?;
+        let name = std::str::from_utf8(name_bytes).with_context(|| {
+            format!(
+                "a local branch has a non-UTF-8 name gitprism can't mirror by: {}",
+                git::escape_bytes(name_bytes)
+            )
+        })?;
+        crate::git::validate_branch_name(name)
+            .with_context(|| format!("validating local branch {name:?}"))?;
+        source_branches.push(name.to_string());
+    }
     source_branches.sort();
     Ok(source_branches)
 }
@@ -877,9 +884,17 @@ pub(crate) fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Res
         .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
         .context("ordering pending commits oldest-first")?;
 
-    revwalk
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("walking pending commits")
+    let mut pending = Vec::new();
+    for oid in revwalk {
+        if pending.len() >= limits::MAX_PENDING_COMMITS {
+            anyhow::bail!(
+                "pending-commit history exceeds the {} commit limit",
+                limits::MAX_PENDING_COMMITS
+            );
+        }
+        pending.push(oid.context("walking pending commits")?);
+    }
+    Ok(pending)
 }
 
 /// Loads the exclude-list *current* as of `source_tip` — the version this
@@ -926,11 +941,25 @@ pub(crate) fn filter_tree(
     prefix: &Path,
     exclude_list: &ExcludeList,
 ) -> Result<Oid> {
+    let mut budget = limits::TraversalBudget::default();
+    filter_tree_with_budget(repo, tree, prefix, exclude_list, &mut budget, 0)
+}
+
+fn filter_tree_with_budget(
+    repo: &Repository,
+    tree: &git2::Tree,
+    prefix: &Path,
+    exclude_list: &ExcludeList,
+    budget: &mut limits::TraversalBudget,
+    depth: usize,
+) -> Result<Oid> {
+    limits::TraversalBudget::check_depth(depth, "Git tree filtering")?;
     let mut builder = repo
         .treebuilder(None)
         .context("starting a filtered tree builder")?;
 
     for entry in tree.iter() {
+        budget.visit("Git tree filtering")?;
         let name_bytes = entry.name_bytes();
         let name = std::str::from_utf8(name_bytes).with_context(|| {
             format!(
@@ -949,7 +978,14 @@ pub(crate) fn filter_tree(
             let subtree = repo
                 .find_tree(entry.id())
                 .with_context(|| format!("reading subtree {}", rel_path.display()))?;
-            let filtered_oid = filter_tree(repo, &subtree, &rel_path, exclude_list)?;
+            let filtered_oid = filter_tree_with_budget(
+                repo,
+                &subtree,
+                &rel_path,
+                exclude_list,
+                budget,
+                depth + 1,
+            )?;
             // A directory that excluding left with nothing in it must not
             // appear at all — git doesn't track directories independently
             // of their contents.
@@ -987,6 +1023,13 @@ fn empty_tree(repo: &Repository) -> Result<Oid> {
 }
 
 fn validated_commit_message<'a, 'b>(commit: &'a git2::Commit<'b>) -> Result<&'a str> {
+    if commit.message_bytes().len() > limits::MAX_COMMIT_MESSAGE_BYTES {
+        anyhow::bail!(
+            "commit {} message exceeds the {} byte limit",
+            commit.id(),
+            limits::MAX_COMMIT_MESSAGE_BYTES
+        );
+    }
     std::str::from_utf8(commit.message_bytes()).with_context(|| {
         format!(
             "commit {} has a non-UTF-8 message; gitprism refuses to replace it with a lossy or empty message",
@@ -1365,10 +1408,20 @@ fn reject_colliding_untracked_paths(repo: &Repository, branch: &str, new_tip: Oi
     let diff = repo
         .diff_tree_to_tree(Some(&head_tree), Some(&target_tree), None)
         .context("comparing local and target trees while checking checkout collisions")?;
-    let target_paths: Vec<&[u8]> = diff
-        .deltas()
-        .filter_map(|delta| delta.new_file().path_bytes())
-        .collect();
+    let mut budget = limits::TraversalBudget::default();
+    let mut target_paths = Vec::new();
+    for delta in diff.deltas() {
+        budget.visit("checkout collision scanning")?;
+        if let Some(path) = delta.new_file().path_bytes() {
+            if target_paths.len() >= limits::MAX_COLLISION_PATHS {
+                anyhow::bail!(
+                    "checkout collision scanning exceeds the {} path limit",
+                    limits::MAX_COLLISION_PATHS
+                );
+            }
+            target_paths.push(path);
+        }
+    }
     if target_paths.is_empty() {
         return Ok(());
     }
@@ -1382,7 +1435,16 @@ fn reject_colliding_untracked_paths(repo: &Repository, branch: &str, new_tip: Oi
     let statuses = repo
         .statuses(Some(&mut status_options))
         .context("checking untracked checkout collisions")?;
+    let mut status_paths = 0;
     for entry in statuses.iter() {
+        budget.visit("checkout collision scanning")?;
+        status_paths += 1;
+        if status_paths > limits::MAX_COLLISION_PATHS {
+            anyhow::bail!(
+                "checkout collision scanning exceeds the {} path limit",
+                limits::MAX_COLLISION_PATHS
+            );
+        }
         if !(entry.status().is_wt_new() || entry.status().is_ignored()) {
             continue;
         }
@@ -1521,7 +1583,13 @@ fn scan_for_dest_marker(
         "restricting source's resume-point scan to first-parent history (decisions/0019)",
     )?;
 
-    for oid in revwalk {
+    for (scanned, oid) in revwalk.enumerate() {
+        if scanned >= limits::MAX_MARKER_SCAN_COMMITS {
+            anyhow::bail!(
+                "source resume-point scan exceeds the {} commit limit",
+                limits::MAX_MARKER_SCAN_COMMITS
+            );
+        }
         let oid = oid.context("walking source's history for a resume point")?;
         let commit = repo
             .find_commit(oid)
@@ -1583,14 +1651,14 @@ fn newest_dest_marker_opt_for_branch(
 /// `Gitprism-Dest-Commit` trailer), dest legitimately has no gitprism commit
 /// at all before its very first sync.
 ///
-/// The scan is deliberately unbounded along the history it walks — it does
-/// NOT `revwalk.hide` the graft point as an optimization. Hiding it would be
-/// a pure optimization on the usual case, but a marker sitting *before* the
-/// graft point (e.g. a source repo re-grafted onto a dest gitprism had
-/// already written to) would become invisible to the scan, and the caller
-/// would then silently fall back to the graft and push instead of refusing.
-/// Unbounded, plus [`dest_resume_point`]'s own ancestry guard on the result,
-/// fails safe instead.
+/// The scan does NOT `revwalk.hide` the graft point as an optimization. Hiding
+/// it would be a pure optimization on the usual case, but a marker sitting
+/// *before* the graft point (e.g. a source repo re-grafted onto a dest
+/// gitprism had already written to) would become invisible to the scan, and
+/// the caller would then silently fall back to the graft and push instead of
+/// refusing. The scan therefore retains the whole first-parent line subject
+/// to the static [`limits::MAX_MARKER_SCAN_COMMITS`] work bound; exceeding it
+/// fails safe instead of guessing a resume point.
 ///
 /// What the walk *is* bounded to, since decisions/0019, is first-parent
 /// history (`Revwalk::simplify_first_parent()`): a full-ancestry walk used
@@ -1625,7 +1693,13 @@ fn newest_source_marker(
         .simplify_first_parent()
         .context("restricting dest's resume-point scan to first-parent history (decisions/0019)")?;
 
-    for oid in revwalk {
+    for (scanned, oid) in revwalk.enumerate() {
+        if scanned >= limits::MAX_MARKER_SCAN_COMMITS {
+            anyhow::bail!(
+                "dest resume-point scan exceeds the {} commit limit",
+                limits::MAX_MARKER_SCAN_COMMITS
+            );
+        }
         let oid = oid.context("walking dest's history for a resume point")?;
         let commit = repo
             .find_commit(oid)

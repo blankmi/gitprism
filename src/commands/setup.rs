@@ -41,6 +41,7 @@ use git2::{Repository, Signature};
 use crate::config::Config;
 use crate::exclude::{self};
 use crate::git;
+use crate::limits;
 use crate::marker::{self, Direction as MarkerDirection};
 use crate::policy;
 
@@ -135,10 +136,18 @@ fn run_with_remove_file(
         );
     }
     let mut pre_existing_branches: HashMap<String, git2::Oid> = HashMap::new();
+    let mut branch_count = 0;
     for branch_result in repo
         .branches(Some(git2::BranchType::Local))
         .context("listing source repo's existing branches")?
     {
+        branch_count += 1;
+        if branch_count > limits::MAX_SOURCE_BRANCHES {
+            anyhow::bail!(
+                "source branch enumeration exceeds the {} branch limit",
+                limits::MAX_SOURCE_BRANCHES
+            );
+        }
         let (branch, _) = branch_result.context("reading an existing local branch")?;
         let name_bytes = branch
             .name_bytes()
@@ -444,7 +453,8 @@ impl ControlFileState {
         if !metadata.file_type().is_file() {
             return Ok(Self::Other);
         }
-        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes =
+            limits::read_regular_file(path, limits::MAX_CONTROL_FILE_BYTES, "control file")?;
         Ok(Self::Regular {
             bytes,
             #[cfg(unix)]

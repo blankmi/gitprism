@@ -29,7 +29,7 @@ compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (178 tests
+helper described below are implemented and covered by `cargo test` (182 tests
 passing as of this writing), but the tool hasn't run against a real
 production pair of repos yet. Read [`design/index.md`](design/index.md)
 before assuming behavior beyond what's written here.
@@ -93,6 +93,14 @@ Windows and other platforms reject paths that cannot be represented safely.
 Non-UTF-8 commit messages, tree names, and branch names are rejected before a
 commit or ref is created or advanced, so gitprism does not promise to sync
 those objects across platforms.
+
+Repository-controlled input also has static safety budgets: control files are
+limited to 1 MiB, small Git state files to 64 KiB, commit messages to 1 MiB,
+configured branches to 1,024, source-branch discovery to 4,096, pending
+commits to 10,000, and marker scans to 100,000 first-parent commits. Recursive tree work is limited to 1,000,000
+entries and depth 256; conflict reporting is limited to 100,000 records and
+8 MiB of raw path bytes. Exceeding a budget fails the operation; gitprism does
+not truncate data, skip conflicts, or choose a conflict resolution.
 
 ## Configuration: `.gitprism.toml`
 

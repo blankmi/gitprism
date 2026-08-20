@@ -888,7 +888,26 @@ pub fn merge_tree(
         // error path, in a CI checkout, reclaimed by `git gc` — the same
         // residue an aborted `git merge` leaves behind.
         Some(1) => {
-            let mut paths: Vec<String> = records.skip(1).map(escape_bytes).collect();
+            let mut paths = Vec::new();
+            let mut record_count = 0;
+            let mut raw_path_bytes: usize = 0;
+            for record in records.skip(1) {
+                record_count += 1;
+                if record_count > crate::limits::MAX_CONFLICT_RECORDS {
+                    anyhow::bail!(
+                        "merge-tree conflict output exceeds the {} record limit",
+                        crate::limits::MAX_CONFLICT_RECORDS
+                    );
+                }
+                raw_path_bytes = raw_path_bytes.saturating_add(record.len());
+                if raw_path_bytes > crate::limits::MAX_CONFLICT_PATH_BYTES {
+                    anyhow::bail!(
+                        "merge-tree conflict paths exceed the {} byte limit",
+                        crate::limits::MAX_CONFLICT_PATH_BYTES
+                    );
+                }
+                paths.push(escape_bytes(record));
+            }
             // The same normalisation resolve::conflicted_paths already
             // does — don't assume git deduplicates stages for us.
             paths.sort();

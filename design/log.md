@@ -1094,3 +1094,12 @@ stdin, `GIT_TERMINAL_PROMPT=0`, concurrent bounded stdout/stderr capture, a
 300-second default deadline, and a strictly bounded operator override. Timeout
 or output overflow kills and reaps the direct child; incomplete output is
 never parsed as if it were complete.
+
+## 2026-08-20 — bounded repository-controlled data
+
+**Update**: Decided [0032](decisions/0032-bounded-repository-controlled-data.md)
+— control files and small Git state files are read through bounded regular-file
+helpers; commit messages, branch collections, tree traversal, conflict reports,
+pending history, and marker scans have static fail-closed limits. Decision 0019's
+“unbounded marker scan” wording is superseded: scans still do not hide the graft
+point, but stop with an error when the safety budget is exceeded.

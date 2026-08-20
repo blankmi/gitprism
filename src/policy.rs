@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::exclude::ExcludeList;
+use crate::limits;
 
 const ENV_DIGEST: &str = "GITPRISM_POLICY_SHA256";
 const DOMAIN: &[u8] = b"gitprism-policy\0";
@@ -90,24 +91,14 @@ fn parse_verified_bytes(
 
 fn read_ignore(path: &Path) -> Result<Vec<u8>> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                anyhow::bail!("{} is not a regular file", path.display());
-            }
-            fs::read(path).with_context(|| format!("reading {}", path.display()))
-        }
+        Ok(_) => limits::read_regular_file(path, limits::MAX_CONTROL_FILE_BYTES, "ignore file"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
 
 fn read_control_file(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("reading config at {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!("config at {} is not a regular file", path.display());
-    }
-    fs::read(path).with_context(|| format!("reading config at {}", path.display()))
+    limits::read_regular_file(path, limits::MAX_CONTROL_FILE_BYTES, "config")
 }
 
 pub(crate) fn digest_bytes(config: &[u8], ignore: &[u8]) -> String {

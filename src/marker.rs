@@ -18,6 +18,8 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+use crate::limits;
+
 const ENV_KEY: &str = "GITPRISM_STATE_KEY";
 const VERSION: &str = "v1";
 const KEY_BYTES: usize = 32;
@@ -244,6 +246,9 @@ pub(crate) fn build_message(
 /// Parse only the exact five-line final block. A malformed or duplicated
 /// reserved field is ordinary user content and therefore returns `None`.
 pub(crate) fn parse(message: &str) -> Option<ParsedMarker> {
+    if message.len() > limits::MAX_COMMIT_MESSAGE_BYTES {
+        return None;
+    }
     let normalized = message.strip_suffix('\n').unwrap_or(message);
     let lines: Vec<&str> = normalized.split('\n').collect();
     if lines.len() < 5 {
@@ -305,7 +310,10 @@ pub(crate) fn verify(
     counterpart: Option<Oid>,
     key: &StateKey,
 ) -> Option<Oid> {
-    let message = commit.message().ok()?;
+    if commit.message_bytes().len() > limits::MAX_COMMIT_MESSAGE_BYTES {
+        return None;
+    }
+    let message = std::str::from_utf8(commit.message_bytes()).ok()?;
     let marker = parse(message)?;
     // A setup graft is deliberately inherited by every source branch cut
     // from it (decisions/0017). Later directional markers are branch-local.
@@ -475,5 +483,11 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn oversized_marker_messages_are_rejected_before_parsing() {
+        let message = "x".repeat(limits::MAX_COMMIT_MESSAGE_BYTES + 1);
+        assert!(parse(&message).is_none());
     }
 }

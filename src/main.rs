@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod exclude;
 mod git;
+mod limits;
 mod lock;
 mod marker;
 mod policy;
