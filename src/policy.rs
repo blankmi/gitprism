@@ -125,8 +125,15 @@ pub(crate) fn restore_control_files_exact(
         // with a symlink or hardlink pointing outside the repository between
         // checkout finishing and this restore running. Remove whatever is
         // there first and recreate it fresh, the same no-follow pattern
-        // `setup`'s own control-file recovery already uses.
-        write_regular_file_no_follow(&workdir.join(filename), blob.content())
+        // `setup`'s own control-file recovery already uses. The tree's mode
+        // also has to be applied here: the fresh file otherwise keeps
+        // whatever default permissions `create_new` gave it, silently
+        // dropping an executable control file's `100755` down to `100644`
+        // on disk while the index still (correctly) points at the
+        // executable blob — dirty under `core.filemode=true` despite the
+        // content being byte-exact.
+        let filemode = (entry.filemode() as u32) & 0o777;
+        write_regular_file_no_follow(&workdir.join(filename), blob.content(), Some(filemode))
             .with_context(|| format!("restoring {filename} byte-exact after checkout"))?;
         restored.push((filename, entry.id(), entry.filemode()));
     }
@@ -178,24 +185,39 @@ pub(crate) fn restore_control_files_exact(
 }
 
 /// Write `bytes` to `path`, refusing to follow whatever might already be
-/// there. `fs::write` opens the path with ordinary create/truncate
-/// semantics, which follows an existing symlink (or writes through an
-/// existing hardlink) instead of replacing it — decisions/0033's recovery
-/// paths already reject that for exactly this reason. Remove whatever
-/// occupies `path` first, then create it fresh with `create_new`, so this
-/// write can only ever land on a brand-new inode gitprism itself created.
-pub(crate) fn write_regular_file_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// there, and — on Unix, when `mode` is given — set the resulting
+/// permissions through the still-open handle rather than by path.
+/// `fs::write` opens the path with ordinary create/truncate semantics, which
+/// follows an existing symlink (or writes through an existing hardlink)
+/// instead of replacing it — decisions/0033's recovery paths already reject
+/// that for exactly this reason. A path-based `fs::set_permissions` call
+/// after the fact reopens that same race, chmod'ing whatever now occupies
+/// `path` rather than what this call just created. Remove whatever occupies
+/// `path` first, create it fresh with `create_new`, and apply `mode` to the
+/// open `File` before dropping it, so both the write and the permission
+/// change can only ever land on the brand-new inode gitprism itself created.
+pub(crate) fn write_regular_file_no_follow(
+    path: &Path,
+    bytes: &[u8],
+    #[cfg(not(unix))] _mode: Option<u32>,
+    #[cfg(unix)] mode: Option<u32>,
+) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => fs::remove_file(path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
     use std::io::Write as _;
-    file.write_all(bytes)?;
+    (&file).write_all(bytes)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
     Ok(())
 }
 
@@ -247,6 +269,63 @@ fn verify_digest(actual: &str, expected: &str) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_control_files_exact_preserves_the_tree_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        let config_blob = repo
+            .blob(b"branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = \"unused\"\n")
+            .unwrap();
+        let ignore_blob = repo.blob(b"").unwrap();
+        let mut tree_builder = repo.treebuilder(None).unwrap();
+        tree_builder
+            .insert(
+                crate::config::FILENAME,
+                config_blob,
+                git2::FileMode::BlobExecutable.into(),
+            )
+            .unwrap();
+        tree_builder
+            .insert(
+                crate::exclude::FILENAME,
+                ignore_blob,
+                git2::FileMode::Blob.into(),
+            )
+            .unwrap();
+        let tree = repo.find_tree(tree_builder.write().unwrap()).unwrap();
+
+        let signature = git2::Signature::now("gitprism", "gitprism@example.com").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "control files",
+            &tree,
+            &[],
+        )
+        .unwrap();
+
+        restore_control_files_exact(&repo, &tree).unwrap();
+
+        let config_path = dir.path().join(crate::config::FILENAME);
+        let disk_mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            disk_mode, 0o755,
+            "the tree's executable bit must survive the raw restore, not fall back to create_new's default permissions"
+        );
+
+        assert!(
+            repo.status_file(Path::new(crate::config::FILENAME))
+                .unwrap()
+                .is_empty(),
+            "an executable control file must be reported clean, not dirty under core.filemode=true"
+        );
+    }
 
     #[test]
     fn digest_is_domain_separated_and_canonical() {

@@ -1161,3 +1161,20 @@ hardlink planted there between checkout and restore — inconsistent with
 `create_new` recovery pattern, now shared as
 `policy::write_regular_file_no_follow`. See 0034's Consequences section for
 detail.
+
+**Update**: A second review round on the same PR caught two more bugs, both
+about file mode rather than content, both on Unix only. (1)
+`write_regular_file_no_follow` chmod'd the new file by path after closing
+it — the same race its own no-follow write exists to close, since whatever
+occupies the path by the time the chmod runs gets its permissions changed,
+not necessarily the file just created. Fixed by applying the mode to the
+still-open `File` handle before dropping it. (2)
+`restore_control_files_exact`'s raw write carried over content but not
+mode, so an executable control file (`100755`) silently became `100644` on
+disk while the index still pointed at the executable blob — dirty under
+`core.filemode=true`. Fixed by passing the tree entry's mode into the same
+helper. A new Unix test commits a control file as
+`FileMode::BlobExecutable`, calls the restore directly, and asserts both the
+on-disk permission bits and `status_file`'s cleanliness. See 0034's
+Consequences section for detail. `cargo test`: 189 passed, 0 failed.
+`cargo clippy --all-targets`: clean. `cargo fmt --check`: clean.

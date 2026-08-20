@@ -443,13 +443,11 @@ impl ControlFileSnapshot {
 }
 
 fn restore_regular_file(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    crate::policy::write_regular_file_no_follow(path, bytes)?;
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
+    // `mode` must be applied through the handle `write_regular_file_no_follow`
+    // still holds open, not by a follow-up path-based `set_permissions` — the
+    // latter reopens the exact race 0033 already rejects: whatever occupies
+    // `path` by the time it runs, symlink or not, is what gets chmod'd.
+    crate::policy::write_regular_file_no_follow(path, bytes, mode)
 }
 
 impl ControlFileState {

@@ -87,3 +87,25 @@ control-file recovery, not a shortcut:
   oid/mode, with no hashing involved. A test commits such a CRLF-bearing
   blob directly and asserts the index entry's id equals HEAD's, not just
   that the working-tree bytes look right.
+
+Two more followed on Unix, both about the file's mode rather than its
+content:
+
+- `write_regular_file_no_follow` used to close the freshly created `File`
+  and then chmod it by path. That reopens exactly the race the no-follow
+  write itself exists to close: whatever occupies the path by the time the
+  chmod runs — symlink or not — is what gets its permissions changed, not
+  necessarily the file this call just created. The mode is now applied to
+  the still-open `File` handle before it's dropped, so the write and the
+  permission change are both pinned to the one inode this call created.
+  `setup`'s own control-file recovery went through the same helper and so
+  needed no separate fix.
+- `restore_control_files_exact`'s raw write only carried over the file's
+  *content*, leaving the recreated file at whatever default permissions
+  `create_new` gives it. A control file tracked as `100755` would silently
+  become `100644` on disk while the index (correctly) still pointed at the
+  executable blob — dirty under `core.filemode=true` despite nothing about
+  the content changing. The tree entry's mode is now passed into the same
+  helper alongside the bytes. A Unix test commits a control file as
+  `FileMode::BlobExecutable`, calls the restore directly, and asserts both
+  the on-disk permission bits and `status_file`'s cleanliness.
