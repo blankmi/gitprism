@@ -1494,3 +1494,52 @@ already-reviewed tool (josh, Copybara, git-subtree, jujutsu, git-filter-repo)
 was found to force-update a mirror to match an authoritative upstream. No
 code changed in this commit; `requirements/0001` was amended separately in
 `cdac783`.
+
+## 2026-08-21 — mirror-only source rewrites rebuild the projection
+
+**Update**: Added [decisions/0039](decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md),
+extending decisions/0038. Starting 0038's implementation surfaced that its
+force path is unreachable as written: `dest_resume_point_for_branch`
+(`src/commands/sync.rs`) refuses a rewritten mirror-only branch — rebase,
+amend, or reset — before any push is attempted, because
+`dest_tip_is_accounted_for`'s Case 1 still recognizes the old, pre-rewrite
+dest tip via gitprism's own stale marker, `newest_source_marker` returns the
+pre-rewrite source tip as the boundary, and `source_tip` no longer descends
+from it. This investigation is what stopped 0038's implementation and
+produced this decision instead of a workaround.
+
+Decided: a rewritten mirror-only branch is a positively identified state —
+mirror-only (absent from `config.branches`), a dest ref exists, a prior
+gitprism marker is found, and source no longer descends from the previous
+boundary — checked directly, not reached by exhausting decisions/0009's
+retries. Explicitly rejected framing this as "force after failed retries":
+that reads as a general escalation policy a future contributor could extend
+to a round-tripped branch's persistent divergence, which is exactly the
+operator boundary 0038 draws and `AGENTS.md`'s operator-intervention rule
+protects. Decisions/0009's refetch-and-recompute keeps its existing,
+narrower meaning — handling a genuine concurrent race — unchanged in both
+push modes. On a detected rewrite, the projection rebuilds from the same
+`(boundary, dest_tip)` `newest_dest_marker_opt_for_branch` already reads off
+source's own graft-derived first-parent history for the `!dest_ref_exists`
+case (decisions/0006) — no second rebuild mechanism — then force-pushes via
+0038's `ForceMirrorOnly`. Named the authority invariant explicitly:
+independent dest advancement on a mirror-only branch may be discarded only
+because the branch is currently absent from `config.branches`
+(decisions/0017 guarantees dest→source never touches such a branch, so
+nothing on its dest ref is dest's own independent contribution). Narrows
+0038's `resolve.rs` guidance: `resolve` never runs this fresh resume-point
+detection, so every `resolve.rs` push stays fast-forward-only regardless of
+branch authority, refining rather than contradicting 0038's own table.
+Restates, without re-deriving, 0038's config-role hazard (branch authority
+is decided by current `config.branches` membership, re-evaluated every run).
+
+Checked `design/references/` for prior art on rebuilding a projection from a
+shared base after a detected rewrite, as distinct from simply force-updating
+a ref: found nothing — GitLab's push-mirror docs (already cited in
+decisions/0018/0038) describe the force-update outcome but not a rebuild
+step, since a plain mirror push has no filtering stage to rebuild in the
+first place.
+
+No code changed in this commit — decisions/0038's `PushMode` enum and this
+decision's rewrite-detection/rebuild path are still to be implemented
+together.
