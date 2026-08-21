@@ -1,16 +1,58 @@
 # gitprism
 
-gitprism keeps two git repositories in sync where one — **source** — is a
-superset of the other — **dest**. Source holds everything dest has, plus
-files or folders that must never leave source (internal tooling, secrets-adjacent
-config, whatever the split exists to protect). gitprism moves changes both ways:
+gitprism synchronizes a **private source-of-truth repository** with a filtered
+customer-facing Git repository while allowing the customer repository to run
+its own normal branch, pull-request, and merge workflow.
 
-* **source → dest**: filtered, so source-only paths never appear in dest, and
-  **fast-forward only** — gitprism never force-pushes dest, because dest is
-  treated as shared history other clones depend on.
-* **dest → source**: for the branches you list, brings dest's independent
-  changes (e.g. a PR merged straight against dest) back into source,
-  unfiltered.
+The **source** repository is authoritative and is a superset of **dest**.
+Source contains everything dest contains, plus files or directories that must
+never leave source: internal tooling, secrets-adjacent configuration, CI
+infrastructure, or anything else the repository split exists to protect.
+
+The important distinction from a conventional one-way mirror is that dest is
+not read-only. It may be a real customer collaboration repository — for
+example Azure DevOps — where tickets are handled, branches are reviewed, and
+pull requests are merged. Once a change has been merged into an explicitly
+authorized destination branch, gitprism can promote that committed change back
+into the private source of truth.
+
+The synchronization policy is deliberately asymmetric:
+
+* **source → dest**: every source branch is mirrored automatically, with
+  source-only paths filtered out. Updates are **fast-forward only** — gitprism
+  never force-pushes dest, because dest is published history that customer
+  clones, branches, and pull requests may depend on.
+* **dest → source**: only explicitly configured branches are watched. If one
+  of those branches advances independently — for example because a customer
+  PR was merged directly into a release branch — gitprism brings those
+  committed changes back into source, unfiltered.
+
+A typical workflow looks like this:
+
+```text
+private source                         customer dest
+──────────────                         ─────────────
+
+main ────────────────────────────────► main
+release ─────────────────────────────► release
+feature/foo ─────────────────────────► feature/foo
+                                           │
+                                      customer work
+                                           │
+                                      pull request
+                                           │
+                                         merge
+                                           │
+release ◄──────── gitprism ─────────── release
+   │
+   └─────────────────────────────────────► ...
+```
+
+The private repository remains the durable source of truth. The destination is
+an **authorized producer of changes on selected branches**: customer work does
+not need to be imported while a PR is still under review, and gitprism does
+not need to understand or own the customer's ticket or PR system. It operates
+on Git history after the destination branch has actually advanced.
 
 If a source commit only touched excluded paths, filtering it for dest leaves
 nothing to push — gitprism skips it instead of pushing an empty commit.
@@ -25,6 +67,45 @@ directory, so linked worktrees share the same operation boundary. Dest-to-source
 local branch advancement is checked against a safe checkout (rejecting local
 working-tree conflicts while preserving unrelated untracked files) and uses a
 compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
+
+## Why gitprism?
+
+Many repository synchronization and migration tools assume a single
+authoritative repository and treat the other repository primarily as a
+projection or contribution endpoint. That works well when changes from the
+external side can be imported **before** they are merged there.
+
+gitprism targets a different boundary: the destination is allowed to have its
+own published Git history and merge workflow.
+
+This matters when, for example:
+
+* an organization keeps its complete repository private;
+* all internal branches must be available in a customer's Git service;
+* selected internal paths must never be exposed to that service;
+* the customer manages tickets, reviews, and pull requests entirely in their
+  own Git platform;
+* customer PRs are merged there using the customer's normal process;
+* only designated branches, commonly release branches, are allowed to feed
+  those completed changes back into the private source of truth; and
+* neither side's already-published history may be rewritten to make the
+  synchronization work.
+
+Tools such as Copybara are relevant prior art and share useful concepts with
+gitprism, including filtered transformations, per-commit migration, and
+commit-embedded synchronization state. Copybara's natural model, however, is
+an authoritative source plus changes imported from the other side before they
+become authoritative destination history.
+
+gitprism instead deliberately supports the case where a destination branch
+has **already advanced independently**. It reconciles that committed history
+back into source and then continues projecting source history outward without
+force-pushing destination history.
+
+In short, gitprism is designed for:
+
+> **filtered projection outward, customer-owned merges, selective promotion
+> back into the source of truth, and immutable published history.**
 
 ## Status
 
