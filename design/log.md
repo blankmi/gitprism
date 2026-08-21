@@ -1453,3 +1453,44 @@ change, exactly the disclosure risk decisions/0037 closes.
 Verification: `cargo test` — 203 passed (197 baseline + 6 new), 0 failed;
 `cargo clippy --all-targets -- -D warnings` — clean; `cargo fmt --check` —
 clean.
+
+## 2026-08-21 — branch authority determines history rewriting
+
+**Update**: Added [decisions/0038](decisions/0038-branch-authority-determines-whether-history-may-be-rewritten.md),
+formalizing `requirements/0001` step 3 as amended separately in `cdac783`:
+force semantics depend on which branch authority owns the history, not on
+push direction. Round-tripped branches (`config.branches`) stay
+fast-forward-only both ways, with persistent divergence handed to the
+operator without a prescribed reconciliation method. Mirror-only branches
+may be force-updated on source→dest to mirror a deliberately rewritten
+source branch, but only after decisions/0009's bounded refetch-and-recompute
+is exhausted — decisions/0009 itself is unchanged, this only defines what
+happens after its retries run out. Force is made opt-in and visible via an
+explicit two-variant `PushMode` every push call site must declare, rather
+than a separate force helper. Classified the four existing `git::push` call
+sites by branch authority: `src/commands/sync.rs:509` (source→dest, role
+depends on current `config.branches` membership), `src/commands/sync.rs:1404`
+(dest→source, always round-tripped), `src/commands/resolve.rs:335` and
+`:579` (dest pushes in source→dest resolve — must be classified by
+`config.branches` membership too, since `Direction::SourceToDest` accepts
+any local branch, not just round-tripped ones), and `src/commands/resolve.rs:1324`
+(source push in dest→source resolve, always round-tripped). Recorded a
+standing operator hazard: branch authority is decided by current
+`config.branches` membership, so editing that list silently changes which
+branches gitprism may rewrite. Rejected `--force-with-lease` for any branch
+type, verified directly against real git: a lease with a correct expected
+value still force-pushed a divergent history and the remote reported
+`(forced update)`; separately, plain push already rejects every race that
+could lose a concurrent writer's work, and the one race a lease adds
+detection for (remote moved to a commit gitprism already had) is harmless.
+Reconciled with `requirements/0001`'s unchanged git-filter-repo objection:
+that objection is to force-push as the permanent steady-state sync
+mechanism, which this decision does not create — the steady state stays
+fast-forward, and force fires only as an exceptional response to a
+deliberate source-side rewrite. Prior art: GitLab push mirroring (already
+cited in decisions/0018 as the closest analogue) force-updates a diverged
+mirror by default, confirmed directly from GitLab's docs; no other
+already-reviewed tool (josh, Copybara, git-subtree, jujutsu, git-filter-repo)
+was found to force-update a mirror to match an authoritative upstream. No
+code changed in this commit; `requirements/0001` was amended separately in
+`cdac783`.
