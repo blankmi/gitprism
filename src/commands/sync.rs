@@ -68,7 +68,7 @@ use git2::{Oid, Repository, Signature};
 
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
-use crate::git;
+use crate::git::{self, PushMode};
 use crate::limits;
 use crate::marker::{self, Direction as MarkerDirection};
 use crate::policy;
@@ -78,6 +78,20 @@ use crate::progress::{Direction, Outcome, Reporter};
 /// from scratch this many times before sync gives up and fails loudly. Exact
 /// bound is an implementation detail, not a design fork.
 const MAX_RACE_RETRIES: u32 = 3;
+
+/// decisions/0038's operator-facing replacement for the old "kept losing a
+/// fast-forward race after N retries" — that message stated the symptom and
+/// gave no next step. This names the branch, says the two sides diverged,
+/// and hands reconciliation to the operator using ordinary git, deliberately
+/// never mentioning merge, rebase, or cherry-pick: choosing among those is
+/// the human decision gitprism must not automate (AGENTS.md). `ff_target` is
+/// whichever side this push direction was trying to fast-forward ("dest" for
+/// source→dest, "source" for dest→source).
+fn divergence_after_exhausted_retries_message(branch: &str, ff_target: &str) -> String {
+    format!(
+        "gitprism sync: dest branch {branch:?} and source have diverged — {MAX_RACE_RETRIES} refetch-and-recompute attempts still couldn't fast-forward {ff_target} onto it; reconcile the two histories with ordinary git, then rerun gitprism sync"
+    )
+}
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // Validate the pair secret before fetching or constructing any commits.
@@ -314,6 +328,13 @@ fn sync_pair_to_dest_with_key(
         // and treating "no such ref" as the same failure it would be for a
         // branch that's supposed to already exist.
         let dest_ref_exists = git::remote_ref_exists(source_root, &dest_url, branch)?;
+        // decisions/0038, decisions/0039: force is requested only once this
+        // very run has established both that `branch` is mirror-only and
+        // that it positively identified a source-side rewrite below — the
+        // one narrow authority this project's operator-intervention default
+        // (AGENTS.md) permits gitprism to override on its own. Every other
+        // path through this loop leaves it at the fast-forward-only default.
+        let mut push_mode = PushMode::FastForwardOnly;
 
         let (dest_tip, boundary) = if dest_ref_exists {
             if round_tripped {
@@ -351,19 +372,46 @@ fn sync_pair_to_dest_with_key(
             // for this branch). Either way, proceeding could silently drop
             // content some other commit already contributed, even though the
             // ref update itself would be a legitimate fast-forward.
-            let boundary = dest_resume_point_for_branch(
-                repo,
-                source_tip,
-                dest_tip,
-                branch,
-                state_key,
-            )?
-                .with_context(|| {
-                format!(
+            match dest_resume_point_for_branch(repo, source_tip, dest_tip, branch, state_key)? {
+                Some(boundary) => (dest_tip, boundary),
+                // decisions/0039: `round_tripped` is the authority invariant
+                // itself — a mirror-only branch's dest ref is a projection
+                // nothing ever imports back (decisions/0017), so nothing on
+                // it is dest's own independent contribution gitprism is
+                // obligated to preserve. That is the *only* thing that
+                // licenses discarding it here; a round-tripped branch never
+                // reaches this arm regardless of how the four conditions
+                // otherwise line up, and falls through to the ordinary
+                // refusal below instead.
+                None if !round_tripped
+                    && mirror_only_rewrite_detected(
+                        repo, source_tip, dest_tip, branch, state_key,
+                    )? =>
+                {
+                    reporter.step(
+                        branch,
+                        Direction::SourceToDest,
+                        "source branch was rewritten (mirror-only) — rebuilding dest's projection from the shared graft",
+                    );
+                    // Reuses the same graft-derived base the `!dest_ref_exists`
+                    // arm below already computes this way — a detected
+                    // rewrite means dest's own ref can no longer answer "what
+                    // does source's ancestry say the boundary is," which is
+                    // exactly the condition that arm was already built for.
+                    let Some((boundary, rebuild_dest_tip)) =
+                        newest_dest_marker_opt_for_branch(repo, source_tip, branch, state_key)?
+                    else {
+                        anyhow::bail!(
+                            "gitprism sync: detected a rewritten mirror-only branch {branch:?} but found no Gitprism-Dest-Commit trailer to rebuild from — has `gitprism setup` been run for this pair?"
+                        )
+                    };
+                    push_mode = PushMode::ForceMirrorOnly;
+                    (rebuild_dest_tip, boundary)
+                }
+                None => anyhow::bail!(
                     "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)"
-                )
-            })?;
-            (dest_tip, boundary)
+                ),
+            }
         } else {
             // No dest ref to be unsafe about yet, so no safety check applies
             // either — this branch's own ancestry already carries dest
@@ -506,19 +554,25 @@ fn sync_pair_to_dest_with_key(
         let new_dest_tip = build.new_tip.or((!dest_ref_exists).then_some(dest_tip));
 
         if let Some(new_dest_tip) = new_dest_tip {
-            match git::push(source_root, &dest_url, new_dest_tip, branch)? {
+            match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
                 git::PushOutcome::Accepted => {}
                 git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
-                    // dest's tip moved between fetch and push — refetch
-                    // and recompute against its new state rather than
-                    // rebasing what was already built (decisions/0009).
+                    // dest's tip moved between fetch and push — refetch and
+                    // recompute against its new state rather than rebasing
+                    // what was already built (decisions/0009). This is
+                    // decisions/0009's own, narrower race handling, unrelated
+                    // to `push_mode`: an outright `ForceMirrorOnly` push
+                    // shouldn't itself be rejected as non-fast-forward, but
+                    // if it somehow is, a rewritten mirror-only branch is
+                    // re-detected fresh next iteration rather than assumed
+                    // from this rejection — force is never escalated to from
+                    // a retry count.
                     attempt += 1;
                     continue;
                 }
-                git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
-                    "gitprism sync: pushing {branch:?} kept losing a fast-forward race after {} retries",
-                    MAX_RACE_RETRIES
-                ),
+                git::PushOutcome::RejectedNotFastForward => {
+                    anyhow::bail!(divergence_after_exhausted_retries_message(branch, "dest"))
+                }
             }
         }
 
@@ -936,13 +990,26 @@ fn graft_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Oid>
 /// would find scanning forward from it, so [`dest_resume_point`] still
 /// applies the identical two ancestry guards to the identical oid and
 /// refuses in exactly the same situations as today.
-fn dest_tip_is_accounted_for(
+///
+/// decisions/0039's rewrite detection needs to tell Case 1/3 ("a prior
+/// gitprism sync genuinely landed here") apart from Case 2 ("dest hasn't
+/// moved past the graft, so no sync has happened to be rewritten yet") —
+/// a distinction the plain `bool` [`dest_tip_is_accounted_for`] collapses,
+/// so the three cases are returned as their own variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestTipAccountedFor {
+    No,
+    ViaPriorGitprismSync,
+    AtGraftOnly,
+}
+
+fn dest_tip_accounted_for(
     repo: &Repository,
     source_tip: Oid,
     dest_tip: Oid,
     branch: &str,
     key: &marker::StateKey,
-) -> Result<bool> {
+) -> Result<DestTipAccountedFor> {
     let dest_commit = repo
         .find_commit(dest_tip)
         .context("resolving dest's tip commit")?;
@@ -957,12 +1024,12 @@ fn dest_tip_is_accounted_for(
     )
     .is_some()
     {
-        return Ok(true);
+        return Ok(DestTipAccountedFor::ViaPriorGitprismSync);
     }
 
     // Case 2.
     if graft_point(repo, source_tip, dest_tip)? == dest_tip {
-        return Ok(true);
+        return Ok(DestTipAccountedFor::AtGraftOnly);
     }
 
     // Case 3: dest_tip has moved past the graft with nothing gitprism wrote
@@ -971,7 +1038,21 @@ fn dest_tip_is_accounted_for(
     // own history carries a Gitprism-Dest-Commit trailer naming it exactly
     // (this same run, since it's ordered first — see `run`'s doc comment).
     let (_, marker_names) = newest_dest_marker(repo, source_tip, branch, key)?;
-    Ok(marker_names == dest_tip)
+    Ok(if marker_names == dest_tip {
+        DestTipAccountedFor::ViaPriorGitprismSync
+    } else {
+        DestTipAccountedFor::No
+    })
+}
+
+fn dest_tip_is_accounted_for(
+    repo: &Repository,
+    source_tip: Oid,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<bool> {
+    Ok(dest_tip_accounted_for(repo, source_tip, dest_tip, branch, key)? != DestTipAccountedFor::No)
 }
 
 /// Where source's pending-commit walk ([`pending_commits`], feeding
@@ -1049,6 +1130,58 @@ pub(crate) fn dest_resume_point_for_branch(
 fn dest_resume_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Option<Oid>> {
     let key = marker::load_key()?;
     dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)
+}
+
+/// decisions/0039: positively identifies a rewritten mirror-only source
+/// branch — a state checked directly by four conditions, not inferred from
+/// exhausted retries. Callable only once [`dest_resume_point_for_branch`]
+/// has already refused (returned `Ok(None)`) for this `(source_tip,
+/// dest_tip)` pair; the caller is also responsible for condition 1
+/// (mirror-only — absent from `config.branches`) and condition 2
+/// (`dest_ref_exists`), since both are already known at the one call site
+/// this is used from. This function checks the remaining two:
+///
+/// 3. a previous gitprism marker is found on dest's own history — Case 1 or
+///    Case 3 of [`dest_tip_accounted_for`] ("a prior sync genuinely
+///    happened"), explicitly excluding Case 2 (dest sitting exactly at the
+///    graft, nothing synced yet — not a rewrite, just a first sync still
+///    pending);
+/// 4. `source_tip` no longer descends from that marker's boundary — the
+///    exact `graph_descendant_of` check [`dest_resume_point_for_branch`]
+///    already computed on its way to refusing, inspected here on its
+///    `false` result instead of discarded.
+///
+/// A missing boundary object (the trailer names a commit this clone never
+/// fetched) is a different failure than a rewrite — the boundary exists but
+/// isn't an ancestor — so it does not count as a detected rewrite either;
+/// [`dest_resume_point_for_branch`]'s ordinary refusal message stands for
+/// that case.
+fn mirror_only_rewrite_detected(
+    repo: &Repository,
+    source_tip: Oid,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<bool> {
+    if dest_tip_accounted_for(repo, source_tip, dest_tip, branch, key)?
+        != DestTipAccountedFor::ViaPriorGitprismSync
+    {
+        return Ok(false);
+    }
+
+    let Some(boundary) = newest_source_marker(repo, dest_tip, branch, key)? else {
+        return Ok(false);
+    };
+    if boundary == source_tip || repo.find_commit(boundary).is_err() {
+        return Ok(false);
+    }
+
+    let descends = repo.graph_descendant_of(source_tip, boundary).with_context(|| {
+        format!(
+            "checking whether {source_tip} descends from the Gitprism-Source-Commit trailer {boundary}"
+        )
+    })?;
+    Ok(!descends)
 }
 
 /// Every commit strictly after `boundary` up to and including `tip`, oldest
@@ -1401,7 +1534,16 @@ fn sync_pair_from_dest_with_key(
                     )
                 })?;
             let source_url = config.source_url()?;
-            match git::push(source_root, &source_url, new_source_tip, branch)? {
+            // Always round-tripped — `branch` here always comes from
+            // `config.branches` (see the doc comment above) — so
+            // fast-forward-only unconditionally, per decisions/0038.
+            match git::push(
+                source_root,
+                &source_url,
+                new_source_tip,
+                branch,
+                PushMode::FastForwardOnly,
+            )? {
                 git::PushOutcome::Accepted => {
                     advance_local_source_branch(
                         repo,
@@ -1419,10 +1561,9 @@ fn sync_pair_from_dest_with_key(
                     attempt += 1;
                     continue;
                 }
-                git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
-                    "gitprism sync: pushing {branch:?} kept losing a fast-forward race after {} retries",
-                    MAX_RACE_RETRIES
-                ),
+                git::PushOutcome::RejectedNotFastForward => {
+                    anyhow::bail!(divergence_after_exhausted_retries_message(branch, "source"))
+                }
             }
         }
 
@@ -2191,6 +2332,7 @@ mod tests {
             &dir.path().display().to_string(),
             tip,
             branch,
+            PushMode::FastForwardOnly,
         )
         .unwrap();
         assert_eq!(
@@ -6838,5 +6980,545 @@ mod tests {
                 .is_err(),
             "a halted branch must never be pushed to dest"
         );
+    }
+
+    // decisions/0039: a rewritten mirror-only source branch rebuilds its dest
+    // projection instead of being refused. Three distinct fixtures below —
+    // rebase, amend, hard reset — all reduce to the same underlying shape
+    // (source's branch tip is a new commit that source's own history no
+    // longer records as a descendant of what dest was last synced from), and
+    // decisions/0039 is explicit that all three must produce the same
+    // outcome: dest's old mirror history replaced wholesale.
+
+    #[test]
+    fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_a_rebase() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "original\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror feature-x to dest");
+        let original_mirror_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync")
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A rebase-shaped rewrite: feature-x is reset back to the graft and
+        // given a brand-new commit off it — the same parent the original
+        // commit had, but not a descendant of it.
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "rebased\n")]);
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("a rewritten mirror-only branch must rebuild its projection, not refuse");
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(
+            rebuilt.id(),
+            original_mirror_tip,
+            "the pre-rewrite mirror history must be replaced, not built upon"
+        );
+        let tree = rebuilt.tree().unwrap();
+        let blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), b"rebased\n");
+    }
+
+    #[test]
+    fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_an_amend() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit_with_message(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "original\n")],
+            "add feature",
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror feature-x to dest");
+        let original_mirror_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync")
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // An amend-shaped rewrite: the branch's only commit is replaced by a
+        // new commit object with the same parent — exactly what `git commit
+        // --amend` produces at the plumbing level.
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+            .unwrap();
+        add_commit_with_message(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "amended\n")],
+            "add feature (amended)",
+        );
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("a rewritten mirror-only branch must rebuild its projection, not refuse");
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(
+            rebuilt.id(),
+            original_mirror_tip,
+            "the pre-amend mirror history must be replaced, not built upon"
+        );
+        let tree = rebuilt.tree().unwrap();
+        let blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), b"amended\n");
+    }
+
+    #[test]
+    fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_reset_to_an_earlier_commit_plus_a_new_commit()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        let earlier = add_commit(&source_repo, "feature-x", &[("feature.txt", "a\n")]);
+        add_commit(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "a\n"), ("extra.txt", "b\n")],
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror both commits to dest");
+        let original_mirror_tip = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .expect("feature-x must exist on dest after the first sync")
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A hard reset to an earlier, already-synced commit, plus a genuinely
+        // new commit off it — dest was last synced through the second
+        // commit, but source's tip no longer descends from that.
+        source_repo
+            .branch(
+                "feature-x",
+                &source_repo.find_commit(earlier).unwrap(),
+                true,
+            )
+            .unwrap();
+        add_commit(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "a\n"), ("different.txt", "c\n")],
+        );
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("a rewritten mirror-only branch must rebuild its projection, not refuse");
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(
+            rebuilt.id(),
+            original_mirror_tip,
+            "the pre-reset mirror history must be replaced, not built upon"
+        );
+        let tree = rebuilt.tree().unwrap();
+        assert!(tree.get_name("different.txt").is_some());
+        assert!(
+            tree.get_name("extra.txt").is_none(),
+            "content only reachable through the discarded branch state must not survive"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_incorporates_a_benign_race_on_a_mirror_only_branch_via_recompute_not_force()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "s1\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror feature-x to dest");
+        let m1 = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let s2 = add_commit(&source_repo, "feature-x", &[("feature.txt", "s2\n")]);
+
+        // Stands in for another clone legitimately completing this exact
+        // sync step first: the SourceToDest marker it writes is gitprism's
+        // own shape, naming s2 exactly, so this clone's own recompute must
+        // recognize and build on it rather than treating it as unaccounted
+        // for — and, crucially, without needing to detect (or fire) a
+        // rewrite to do so, since source_tip still equals this exact marker.
+        let key = marker::load_key().unwrap();
+        let exclude_list = ExcludeList::from_contents("").unwrap();
+        let s2_commit = repo.find_commit(s2).unwrap();
+        let filtered_tree = filter_tree(
+            &repo,
+            &s2_commit.tree().unwrap(),
+            Path::new(""),
+            &exclude_list,
+        )
+        .unwrap();
+        let m2 = build_dest_commit(
+            &repo,
+            &config,
+            m1,
+            &s2_commit,
+            filtered_tree,
+            "feature-x",
+            &key,
+        )
+        .unwrap();
+        let outcome = git::push(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            m2,
+            "feature-x",
+            PushMode::FastForwardOnly,
+        )
+        .unwrap();
+        assert_eq!(outcome, git::PushOutcome::Accepted);
+
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "s3\n")]);
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter).expect(
+            "a benign, gitprism-shaped dest advance must be incorporated, not refused or forced over",
+        );
+
+        let m3 = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            m3.parent_id(0).unwrap(),
+            m2,
+            "the concurrently-added m2 must survive as m3's parent — a force rebuild would have \
+             replaced it with a fresh chain off the graft instead"
+        );
+        let tree = m3.tree().unwrap();
+        let blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), b"s3\n");
+    }
+
+    /// Identical dest-side state for decisions/0039's authority invariant
+    /// test: a bare dest and a grafted source sharing "main", a `feature-x`
+    /// branch with one commit of this clone's own, and a dest ref for
+    /// `feature-x` carrying a *valid* gitprism SourceToDest marker that
+    /// names a sibling commit this clone's own `feature-x` never had —
+    /// standing in for another, equally legitimate clone's own sync of a
+    /// source state this clone doesn't share (never a rewrite: this clone's
+    /// own source never moves). `feature_x_round_tripped` controls only
+    /// whether `feature-x` appears in the returned config's
+    /// `config.branches` — nothing else about the dest-side state differs,
+    /// so any difference in outcome is licensed by that alone.
+    fn authority_invariant_fixture(
+        feature_x_round_tripped: bool,
+    ) -> (
+        tempfile::TempDir,
+        Repository,
+        tempfile::TempDir,
+        Oid,
+        Config,
+    ) {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let original_dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo =
+            source_grafted_onto(source_dir.path(), "main", original_dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("ours.txt", "mine\n")]);
+
+        let signature = Signature::now("Sibling Clone", "sibling@example.com").unwrap();
+        let their_tree = {
+            let mut builder = source_repo
+                .treebuilder(Some(
+                    &source_repo.find_commit(graft).unwrap().tree().unwrap(),
+                ))
+                .unwrap();
+            let blob = source_repo.blob(b"theirs\n").unwrap();
+            builder
+                .insert("theirs.txt", blob, git2::FileMode::Blob.into())
+                .unwrap();
+            source_repo.find_tree(builder.write().unwrap()).unwrap()
+        };
+        let their_tip = source_repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "a sibling clone's own commit",
+                &their_tree,
+                &[&source_repo.find_commit(graft).unwrap()],
+            )
+            .unwrap();
+
+        let branches: &[&str] = if feature_x_round_tripped {
+            &["main", "feature-x"]
+        } else {
+            &["main"]
+        };
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), branches).path(),
+        )
+        .unwrap();
+
+        let key = marker::load_key().unwrap();
+        let exclude_list = ExcludeList::from_contents("").unwrap();
+        let their_commit = source_repo.find_commit(their_tip).unwrap();
+        let filtered_tree = filter_tree(
+            &source_repo,
+            &their_commit.tree().unwrap(),
+            Path::new(""),
+            &exclude_list,
+        )
+        .unwrap();
+        let their_mirror = build_dest_commit(
+            &source_repo,
+            &config,
+            original_dest_tip,
+            &their_commit,
+            filtered_tree,
+            "feature-x",
+            &key,
+        )
+        .unwrap();
+        let outcome = git::push(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            their_mirror,
+            "feature-x",
+            PushMode::FastForwardOnly,
+        )
+        .unwrap();
+        assert_eq!(outcome, git::PushOutcome::Accepted);
+
+        (dest_dir, dest_repo, source_dir, their_mirror, config)
+    }
+
+    #[test]
+    fn sync_pair_to_dest_discards_a_mirror_only_branchs_content_naming_an_unrelated_source_commit()
+    {
+        let (_dest_dir, dest_repo, source_dir, their_mirror, config) =
+            authority_invariant_fixture(false);
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter).expect(
+            "a mirror-only branch's unrecognized dest content must be discarded and rebuilt \
+             — decisions/0039's authority invariant, licensed by config.branches absence alone",
+        );
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(
+            rebuilt.id(),
+            their_mirror,
+            "the sibling clone's unrecognized mirror must be replaced"
+        );
+        let tree = rebuilt.tree().unwrap();
+        assert!(
+            tree.get_name("ours.txt").is_some(),
+            "the rebuild must reflect this clone's own source content"
+        );
+        assert!(
+            tree.get_name("theirs.txt").is_none(),
+            "the sibling clone's discarded content must not survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_stops_a_round_tripped_branchs_content_naming_an_unrelated_source_commit_instead_of_discarding_it()
+     {
+        // Identical dest-side state to the mirror-only test above — only
+        // `feature-x`'s presence in `config.branches` differs — proving the
+        // authority invariant's discard is licensed by that membership
+        // alone, not by anything else about the dest-side content.
+        let (_dest_dir, dest_repo, source_dir, their_mirror, config) =
+            authority_invariant_fixture(true);
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let err = sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect_err(
+                "a round-tripped branch must stop instead of discarding dest's unrecognized content",
+            );
+        let message = format!("{err:#}");
+        assert!(
+            !message.to_lowercase().contains("force"),
+            "a round-tripped branch's refusal must never mention forcing"
+        );
+
+        let still = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            still.id(),
+            their_mirror,
+            "a stopped sync must not touch dest's branch at all"
+        );
+    }
+
+    #[test]
+    fn divergence_after_exhausted_retries_message_names_the_branch_says_diverged_and_never_prescribes_a_reconciliation_method()
+     {
+        for ff_target in ["dest", "source"] {
+            let message = divergence_after_exhausted_retries_message("main", ff_target);
+            assert!(
+                message.contains("\"main\""),
+                "must name the branch: {message}"
+            );
+            assert!(
+                message.contains("diverged"),
+                "must say the histories diverged: {message}"
+            );
+            assert!(
+                message.contains("ordinary git"),
+                "must hand reconciliation to the operator: {message}"
+            );
+            let lower = message.to_lowercase();
+            for method in ["merge", "rebase", "cherry-pick", "cherry pick"] {
+                assert!(
+                    !lower.contains(method),
+                    "must not prescribe a specific reconciliation method ({method}): {message}"
+                );
+            }
+        }
     }
 }

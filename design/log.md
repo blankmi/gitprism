@@ -1543,3 +1543,73 @@ first place.
 No code changed in this commit — decisions/0038's `PushMode` enum and this
 decision's rewrite-detection/rebuild path are still to be implemented
 together.
+
+**Update**: Implemented decisions/0038's `PushMode` together with 0039's
+rewrite detection and rebuild.
+
+`git::push` (`src/git.rs`) now takes a required `PushMode` (`FastForwardOnly`
+| `ForceMirrorOnly`) at every call site; the refspec construction itself is
+pulled into a small `push_refspec` helper so the two modes' exact wire shape
+(plain vs. `+`-prefixed) is unit-tested directly. Per-call-site
+classification: `sync.rs`'s source→dest push (`sync_pair_to_dest_with_key`)
+is the only site that can select `ForceMirrorOnly`, and only after
+establishing both that `branch` is absent from `config.branches` and that
+`mirror_only_rewrite_detected` positively identified a rewrite; `sync.rs`'s
+dest→source push, the round-tripped `resolve.rs` source-to-dest paths
+(`start_source_to_dest`, `finish_source_to_dest`), and `resolve.rs`'s
+dest-to-source `finish` all stay `FastForwardOnly` unconditionally, matching
+0039's narrowing of 0038's `resolve.rs` guidance. The two test-only call
+sites (`resolve.rs`'s and `sync.rs`'s `bare_source_remote_seeded_at`
+fixtures) were mechanically updated to `FastForwardOnly`.
+
+Rewrite detection is `mirror_only_rewrite_detected` (`src/commands/sync.rs`),
+called only from the arm where `dest_resume_point_for_branch` has already
+returned `Ok(None)` for a branch absent from `config.branches` — the four
+conditions are checked directly there, not by counting retries:
+`dest_tip_accounted_for` (a new three-way split of the old boolean
+`dest_tip_is_accounted_for`, distinguishing "a prior gitprism sync landed
+here" from "dest is still sitting at the graft") must say
+`ViaPriorGitprismSync`; `newest_source_marker` must find a boundary; that
+boundary must exist in this clone's odb; and `source_tip` must fail
+`graph_descendant_of` against it. Decisions/0009's retry loop is untouched —
+it still only fires on an actual push rejection, and a rewrite is
+re-detected fresh on every loop iteration rather than assumed from a retry
+count. On a detected rewrite, the rebuild target comes from the existing
+`newest_dest_marker_opt_for_branch(repo, source_tip, ...)` call the
+`!dest_ref_exists` arm already uses — no second base-finding path.
+
+The exhausted-retries message (`sync.rs:519`, `sync.rs:1404` before this
+change) is now built by one pure function,
+`divergence_after_exhausted_retries_message(branch, ff_target)`: names the
+branch, says the two sides diverged, and defers to the operator via
+"ordinary git" — verified by a direct unit test to never contain "merge",
+"rebase", or "cherry-pick".
+
+Tests added (`src/git.rs`, `src/commands/sync.rs`): `push_refspec`'s two
+wire-shape unit tests; `push_force_mirror_only_overwrites_a_diverged_dest_branch_outright`
+(an outright force, no lease semantics — no expected-old-value is ever
+passed to `push`); three rewrite fixtures —
+`sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_a_rebase`,
+`..._by_an_amend`, and
+`..._reset_to_an_earlier_commit_plus_a_new_commit` — each confirming the old
+mirror history is replaced and dest ends at the rewritten content;
+`sync_pair_to_dest_incorporates_a_benign_race_on_a_mirror_only_branch_via_recompute_not_force`,
+which pre-pushes a gitprism-shaped dest commit naming exactly the source tip
+already being synced (`boundary == source_tip`, so rewrite detection is
+never even reached) and confirms the next sync extends it by ordinary
+fast-forward rather than replacing it; the authority-invariant pair
+`sync_pair_to_dest_discards_a_mirror_only_branchs_content_naming_an_unrelated_source_commit`
+and `..._stops_..._instead`, built from one shared fixture that gives dest a
+*validly marked* gitprism commit naming a sibling source commit this clone
+never had — identical dest-side state, differing only in `feature-x`'s
+`config.branches` membership, proving that membership alone licenses the
+discard; and the message unit test above. Pre-implementation, the rebase
+test failed with the old refusal ("isn't at a point this clone can safely
+build on..."), reproduced by temporarily disabling the new detection arm;
+the benign-race test failed to compile at all against the pre-task `git::push`
+signature (13 errors, including its own call site), since it directly
+exercises the new `PushMode` API.
+
+Verification: `cargo test` — 213 passed, 0 failed (baseline 203 plus 10 new:
+3 in `git.rs`, 7 in `sync.rs`). `cargo clippy --all-targets -- -D warnings` —
+clean. `cargo fmt --check` — clean after `cargo fmt`.

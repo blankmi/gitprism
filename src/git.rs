@@ -488,20 +488,50 @@ pub enum PushOutcome {
     RejectedNotFastForward,
 }
 
+/// Required at every [`push`] call site (decisions/0038, decisions/0039) so
+/// intent is declared where the push happens, not inferred from which
+/// function got called or from how many times a push was retried.
+/// `FastForwardOnly` is today's only behavior, unchanged: no `--force`, no
+/// `--force-with-lease`, no `+`-prefixed refspec. `ForceMirrorOnly` performs
+/// an outright force of that one refspec — never a lease — and is only ever
+/// requested by `sync_pair_to_dest` after positively detecting a rewritten
+/// mirror-only source branch (decisions/0039); every other call site stays
+/// `FastForwardOnly` permanently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushMode {
+    FastForwardOnly,
+    ForceMirrorOnly,
+}
+
+/// The refspec [`push`] sends to git for `mode` — pulled out on its own so
+/// the two modes' exact wire shape (plain vs. `+`-prefixed) is unit-testable
+/// without a real remote.
+fn push_refspec(mode: PushMode, commit: git2::Oid, dest_branch: &str) -> String {
+    match mode {
+        PushMode::FastForwardOnly => format!("{commit}:refs/heads/{dest_branch}"),
+        PushMode::ForceMirrorOnly => format!("+{commit}:refs/heads/{dest_branch}"),
+    }
+}
+
 /// Push `commit` (a local oid already in `repo_dir`'s object database) to
 /// `dest_branch` on `url` — same as `git push <url> <commit>:<dest_branch>`
-/// by hand. Deliberately no `--force`: git's own default refuses a
-/// non-fast-forward update, which is exactly the fast-forward-only
-/// constraint source→dest sync requires (requirements/0001, decisions/0009).
+/// by hand, or `git push <url> +<commit>:<dest_branch>` for
+/// [`PushMode::ForceMirrorOnly`]. `PushMode::FastForwardOnly` passes no
+/// `--force`/`--force-with-lease` flag and no `+`-prefixed refspec: git's own
+/// default refuses a non-fast-forward update, which is exactly the
+/// fast-forward-only constraint requirements/0001 and decisions/0009 require
+/// for every push except a positively detected mirror-only rewrite
+/// (decisions/0038, decisions/0039).
 pub fn push(
     repo_dir: &Path,
     url: &str,
     commit: git2::Oid,
     dest_branch: &str,
+    mode: PushMode,
 ) -> Result<PushOutcome> {
     validate_remote(url)?;
     validate_branch_name(dest_branch)?;
-    let refspec = format!("{commit}:refs/heads/{dest_branch}");
+    let refspec = push_refspec(mode, commit, dest_branch);
     let mut command = git_command();
     command
         .arg("-C")
@@ -1353,6 +1383,7 @@ mod tests {
             &dest_dir.path().display().to_string(),
             child,
             "main",
+            PushMode::FastForwardOnly,
         )
         .expect("pushing a fresh branch to an empty bare repo should succeed");
         assert_eq!(outcome, PushOutcome::Accepted);
@@ -1397,6 +1428,7 @@ mod tests {
             &dest_dir.path().display().to_string(),
             unrelated,
             "main",
+            PushMode::FastForwardOnly,
         )
         .expect("a lost fast-forward race is a reported outcome, not an error");
         assert_eq!(outcome, PushOutcome::RejectedNotFastForward);
@@ -1416,6 +1448,69 @@ mod tests {
     }
 
     #[test]
+    fn push_force_mirror_only_overwrites_a_diverged_dest_branch_outright() {
+        let dest_dir = tempdir().unwrap();
+        let dest_tip = repo_with_a_commit_on(dest_dir.path(), "main");
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        dest_repo.set_head("refs/heads/unrelated").unwrap();
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        let source_repo = Repository::open(source_dir.path()).unwrap();
+        // Unrelated to dest_tip, exactly like the rejected-race test above —
+        // the only difference is the mode, so this pair isolates what
+        // `ForceMirrorOnly` alone changes about the outcome.
+        let tree_oid = source_repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = source_repo.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let rewritten = source_repo
+            .commit(None, &signature, &signature, "rewritten", &tree, &[])
+            .unwrap();
+
+        // No expected-old-value is ever passed in — there is nothing here
+        // for a `--force-with-lease` compare-and-swap to check against, so
+        // this is structurally an outright force, not a lease.
+        let outcome = push(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            rewritten,
+            "main",
+            PushMode::ForceMirrorOnly,
+        )
+        .expect("ForceMirrorOnly must overwrite a diverged dest branch outright");
+        assert_eq!(outcome, PushOutcome::Accepted);
+
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        let now = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            now.id(),
+            rewritten,
+            "a force-mirror push must move dest's branch to the new tip even though it discards dest_tip"
+        );
+        assert_ne!(now.id(), dest_tip);
+    }
+
+    #[test]
+    fn push_refspec_fast_forward_only_never_carries_a_force_prefix() {
+        let commit = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let refspec = push_refspec(PushMode::FastForwardOnly, commit, "main");
+        assert_eq!(refspec, format!("{commit}:refs/heads/main"));
+        assert!(!refspec.starts_with('+'));
+    }
+
+    #[test]
+    fn push_refspec_force_mirror_only_is_plus_prefixed_a_bare_force_not_a_lease() {
+        let commit = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let refspec = push_refspec(PushMode::ForceMirrorOnly, commit, "main");
+        assert_eq!(refspec, format!("+{commit}:refs/heads/main"));
+    }
+
+    #[test]
     fn push_fails_loudly_on_an_unrelated_error_instead_of_reporting_a_rejection() {
         let source_dir = tempdir().unwrap();
         let commit = repo_with_a_commit_on(source_dir.path(), "main");
@@ -1429,6 +1524,7 @@ mod tests {
             "/nonexistent/not-a-remote",
             commit,
             "main",
+            PushMode::FastForwardOnly,
         )
         .expect_err("an unreachable remote must not silently succeed");
 
