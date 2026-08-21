@@ -19,9 +19,14 @@ into the private source of truth.
 The synchronization policy is deliberately asymmetric:
 
 * **source → dest**: every source branch is mirrored automatically, with
-  source-only paths filtered out. Updates are **fast-forward only** — gitprism
-  never force-pushes dest, because dest is published history that customer
-  clones, branches, and pull requests may depend on.
+  source-only paths filtered out. Round-tripped branches — the ones listed
+  in `.gitprism.toml` — are updated **fast-forward only**, because dest is
+  published history that customer clones, branches, and pull requests
+  depend on there. A mirror-only branch (not in that list) is a pure
+  projection of source with nothing imported back; gitprism still updates it
+  fast-forward whenever that's possible, and only force-updates dest's
+  projection when a fast-forward can no longer work because source's own
+  history there was deliberately rewritten.
 * **dest → source**: only explicitly configured branches are watched. If one
   of those branches advances independently — for example because a customer
   PR was merged directly into a release branch — gitprism brings those
@@ -57,10 +62,15 @@ on Git history after the destination branch has actually advanced.
 If a source commit only touched excluded paths, filtering it for dest leaves
 nothing to push — gitprism skips it instead of pushing an empty commit.
 
-No history rewriting, no force-pushing. See
-[`design/references/git-filter-repo.md`](design/references/git-filter-repo.md)
-for why that's a hard constraint this tool is built around, not just a
-preference.
+No history rewriting, and force-pushing is never the steady-state sync
+mechanism: it's reserved for the rare, positively-detected case of a
+mirror-only branch whose source history was deliberately rewritten, per
+[decisions/0038](design/decisions/0038-branch-authority-determines-whether-history-may-be-rewritten.md)
+and [decisions/0039](design/decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md).
+Round-tripped branches never accept a forced update, in either direction.
+See [`design/references/git-filter-repo.md`](design/references/git-filter-repo.md)
+for why avoiding force-push as the routine mechanism is a hard constraint
+this tool is built around, not just a preference.
 
 Mutating commands serialize through a non-blocking lock in Git's common
 directory, so linked worktrees share the same operation boundary. Dest-to-source
@@ -70,15 +80,7 @@ compare-and-swap ref update; gitprism never overwrites a concurrent ref move.
 
 ## Why gitprism?
 
-Many repository synchronization and migration tools assume a single
-authoritative repository and treat the other repository primarily as a
-projection or contribution endpoint. That works well when changes from the
-external side can be imported **before** they are merged there.
-
-gitprism targets a different boundary: the destination is allowed to have its
-own published Git history and merge workflow.
-
-This matters when, for example:
+This combination of constraints shows up when, for example:
 
 * an organization keeps its complete repository private;
 * all internal branches must be available in a customer's Git service;
@@ -93,14 +95,10 @@ This matters when, for example:
 
 Tools such as Copybara are relevant prior art and share useful concepts with
 gitprism, including filtered transformations, per-commit migration, and
-commit-embedded synchronization state. Copybara's natural model, however, is
-an authoritative source plus changes imported from the other side before they
-become authoritative destination history.
-
-gitprism instead deliberately supports the case where a destination branch
-has **already advanced independently**. It reconciles that committed history
-back into source and then continues projecting source history outward without
-force-pushing destination history.
+commit-embedded synchronization state. But Copybara's natural model is an
+authoritative source plus changes imported from the other side *before* they
+become authoritative destination history — not a destination branch that
+has already advanced independently, which is what gitprism reconciles.
 
 In short, gitprism is designed for:
 
