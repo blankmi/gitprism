@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: Branch authority, not push direction, determines whether history may be rewritten
-description: Round-tripped branches (config.branches) are shared history, fast-forward-only in both directions; persistent divergence is an operator boundary. Mirror-only branches are a one-way projection of source and may be force-updated to match a deliberately rewritten source branch (trigger condition superseded by decisions/0039). No lease mechanism (--force-with-lease) is adopted for any branch type. Formalizes requirements/0001 step 3 as amended in cdac783.
+description: Round-tripped branches (config.branches) are shared history, fast-forward-only in both directions; persistent divergence is an operator boundary. Mirror-only branches are a one-way projection of source and may be force-updated to match a deliberately rewritten source branch (trigger condition superseded by decisions/0039). No lease mechanism (--force-with-lease) is adopted for round-tripped branches; the blanket "no lease for any branch type" rule is superseded by decisions/0040, which adopts an explicit lease as compare-and-swap concurrency control around an already-authorized mirror-only force. Formalizes requirements/0001 step 3 as amended in cdac783.
 tags: [architecture, push, concurrency, branches]
 status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
@@ -23,6 +23,19 @@ generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
 > remain a one-way projection of source that may be force-updated to reflect
 > a deliberate source-side rewrite. That table and its reasoning stand;
 > only the trigger for reaching the force path changed.
+
+> **Also superseded in part by [decisions/0040](0040-mirror-only-force-is-a-compare-and-swap-lease.md).**
+> This decision's blanket "no lease mechanism (`--force-with-lease`) is
+> adopted for any branch type" conclusion is revised: an already-authorized
+> mirror-only force now uses an explicit
+> `--force-with-lease=refs/heads/<branch>:<fetched-dest-oid>` as
+> compare-and-swap concurrency control against the dest tip gitprism itself
+> fetched, closing a lost-update race an unconditional `+`-prefixed refspec
+> could not detect. **What still stands, unedited by 0040:** a lease must
+> never be what enables force on a round-tripped branch — git's own
+> fast-forward-only default remains their sole protection, exactly as this
+> decision's authority table requires. Passages below that state the old
+> blanket rule are marked inline.
 
 # Context
 
@@ -60,6 +73,14 @@ gitprism already had — harmless. This finding is unrelated to branch
 authority and is recorded here only because the same review conflated the
 two; no lease mechanism is adopted anywhere, for either branch type,
 regardless of this decision's outcome.
+**[Revised by decisions/0040: this paragraph's "no lease mechanism is
+adopted anywhere" conclusion is revised for mirror-only force. The finding
+that a lease with a correct expected value still force-pushes a divergent
+history is unchanged and is why a lease stays banned as a fast-forward
+substitute for round-tripped branches; 0040 uses the lease instead as
+compare-and-swap concurrency control around a force already authorized by
+branch authority and rewrite detection — a question this paragraph never
+evaluated.]**
 
 **Existing push call sites**, confirmed by reading `src/git.rs` and both
 command modules — `git::push` takes no force flag today
@@ -233,6 +254,14 @@ is pushing.**
   force are easy to conflate — a lease is concurrency control; this
   decision's force is a deliberate, config-scoped policy choice about
   which branches are allowed to be rewritten at all.
+  **[Revised by decisions/0040: the lease's own facts here — a
+  correct-value lease still reports `(forced update)` against a divergent
+  remote — are unchanged, and still ban a lease as a fast-forward substitute
+  for round-tripped branches. But this bullet's conclusion that the lease
+  "adds no safety a deliberate, authorized mirror rewrite needs" is
+  overturned: it never evaluated the lease as compare-and-swap against a
+  concurrent dest advance happening in gitprism's own fetch-to-push window,
+  which is exactly what 0040 uses it for.]**
 * **Reconciling with requirements/0001's explicit constraint.** The
   `git-filter-repo` objection (`design/references/git-filter-repo.md`) is
   that rewriting changes every commit hash on *every run*, making
@@ -272,6 +301,13 @@ is pushing.**
   require) or for mirror-only force (where the force is already outright
   and intentional — a lease's compare-and-swap adds no safety a deliberate,
   post-recompute force needs).
+  **[Revised by decisions/0040: the round-tripped half of this bullet
+  stands — a lease is still never adopted there. The mirror-only half is
+  overturned: 0040 adopts
+  `--force-with-lease=refs/heads/<branch>:<fetched-dest-oid>` for
+  mirror-only force specifically, as compare-and-swap against a concurrent
+  dest advance in the fetch-to-push window — a real safety gap an
+  unconditional force cannot close.]**
 * **Config-role hazard is a standing operational fact, not mitigated
   here.** Editing `config.branches` changes which branches gitprism may
   rewrite, not just which branches round-trip; this decision does not add

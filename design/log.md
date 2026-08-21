@@ -1667,3 +1667,20 @@ in-body passage inline with a bracketed pointer to 0039 rather than
 deleting or rewriting the original reasoning. `--force-with-lease` passages
 were left completely untouched — that question is under separate active
 review. No code changed.
+
+## 2026-08-21 — mirror-only force becomes a compare-and-swap lease
+
+**Update**: Decided [decisions/0040](decisions/0040-mirror-only-force-is-a-compare-and-swap-lease.md)
+— an external review found `PushMode::ForceMirrorOnly`'s unconditional
+`+<oid>:refs/heads/<branch>` refspec silently overwrites a concurrent dest
+advance between fetch and push, making decisions/0009's refetch-and-recompute
+retry loop unreachable for that race. Fixed by pushing with an explicit
+`--force-with-lease=refs/heads/<branch>:<fetched-dest-oid>` instead, verified
+against real git: a stale lease is rejected with the same `!`/`[rejected]`
+porcelain shape `is_non_fast_forward_rejection` already matches, so the
+existing retry loop already routes it into decisions/0009's mechanism with no
+new plumbing. `PushMode::ForceMirrorOnly` gains a required `expected_dest:
+Oid` field. Revises decisions/0038's blanket "no lease mechanism anywhere"
+conclusion for mirror-only force only — a lease still must never enable
+force on a round-tripped branch — annotated in place the same way `119c16b`
+annotated 0038's retry-escalation passages. No code changed.
