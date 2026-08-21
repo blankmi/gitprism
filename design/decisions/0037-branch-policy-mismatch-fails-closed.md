@@ -40,6 +40,11 @@ explicitly chosen fail-closed over the union.
 
 # Decision
 
+In short: a source branch may omit `.gitprismignore`, but if present it must
+exactly match the authenticated exclusion policy. A mismatch halts
+synchronization for that branch. Other branches continue, but the `sync`
+command exits non-zero.
+
 Source→dest replay compares, per pending commit, the exact bytes of that
 commit's tree entry for `.gitprismignore` and `.gitprism.toml` against the
 corresponding bytes of `VerifiedPolicy.ignore_raw`/`config_raw` — the same
@@ -77,6 +82,17 @@ completed error line be the end of the story: the overall `sync` invocation's
 exit status must be non-zero, so CI cannot mistake a halted branch for a
 clean run. A security-relevant halt that exits `0` would be worse than the
 bug it replaces — silent failure defeats the entire point of failing closed.
+
+**The two categories must stay semantically distinct.** They are not two
+shades of the same thing, and the difference must be encoded so it cannot
+erode: a *warning* means the branch wasn't synced for a benign, known reason
+and the run may still succeed; a *policy mismatch* means the branch wasn't
+synced because safety could not be established, and the run must fail. A
+later change must never reclassify a mismatch into 0024's warning semantics —
+the two differ in whether the operator is obliged to act, not in severity of
+wording. A dedicated outcome variant is acceptable if it makes that harder to
+collapse by accident; `Outcome::Error` plus the mandatory non-zero exit status
+satisfies it as written.
 
 **What the operator is told.** The message names the branch, the offending
 commit (oid), which control file differs (`.gitprismignore` or
@@ -148,6 +164,17 @@ regression: the halt is exactly the operator gate this workflow needs — it
 forces `GITPRISM_POLICY_SHA256` to be updated (or the branch reconciled)
 before the branch's control-file change silently would have been absorbed one
 way or the other.
+
+This does **not** eliminate the misleading message for every control-file-only
+branch, only for the security-relevant one. The halt fires while the branch's
+file still differs from the pin. Once the operator has updated
+`GITPRISM_POLICY_SHA256` and the working tree carries the approved policy, a
+branch holding that same new file matches the pin, does not halt, and — since
+both control files are self-excluded (`src/exclude.rs`) — still filters to a
+no-op and is still reported as "already merged into … , cleaned up there"
+despite never having existed on dest. Correcting that message is a separate,
+still-open item; this decision fixes the variant where safety could not be
+established, not the wording of the benign one.
 
 # Consequences
 
