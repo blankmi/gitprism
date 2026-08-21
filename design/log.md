@@ -1281,3 +1281,40 @@ documenting decisions/0016, that the interleaved-branch churn had
 design question, and this decision is what actually removes it. No code
 changed in this commit; the implementation and its test coverage are a
 follow-up.
+
+**Update**: Implemented. `pending_commits` (`src/commands/sync.rs`) gained
+`revwalk.simplify_first_parent()` between `hide()` and `set_sorting()` — the
+one-line change decisions/0035 specified, following the same
+`.context(...)` idiom as the two `simplify_first_parent()` calls decisions/0019
+already added. No other production code changed.
+
+Added the test coverage decisions/0035's Consequences enumerated:
+`run_honors_a_conflict_resolved_by_hand_inside_a_merge_commit` (the
+regression — confirmed failing before the fix with a genuine `shared.txt`
+merge-tree conflict hard-stop, exactly as 0035 predicted, then passing
+after); `run_applies_a_clean_two_parent_merge_without_replaying_the_side_branchs_own_commit`
+(asserts dest's own commit count, since the two pre-existing merge tests
+assert only final content and can't tell the two walks apart);
+`pending_commits_still_hides_a_boundary_reachable_only_via_a_merges_second_parent`
+(a direct unit test on `pending_commits` confirming `hide()`'s own ancestor
+exclusion still reaches a boundary's non-first parent);
+`run_applies_a_squash_merged_source_commit_as_a_single_dest_commit` and
+`run_applies_a_rebased_linear_source_history_commit_by_commit` (regression
+cases, named and commented as such — both single-parent, unaffected);
+`run_carries_a_real_two_parent_merge_on_dest_into_source_as_one_net_change`
+(dest→source's first real-merge coverage, since `pending_commits` is
+shared); and `run_correctly_merges_a_new_source_merge_onto_a_dest_tip_shaped_by_the_old_full_dag_walk`
+(the migration case — dest hand-built to match the old full-DAG walk's
+three-commit output, then a new merge processed under the new walk against
+it). All seven passed without needing to weaken or alter any pre-existing
+test.
+
+Also corrected the test comment this entry's own claim was about: it
+actually lives in `run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`
+(not `run_does_not_duplicate_a_no_ff_merges_content_on_dest`, as both this
+entry and decisions/0035 itself misattributed it) — rewritten to record that
+decisions/0035 removed the interleaved-branch churn, instead of describing
+it as an open design question.
+
+`cargo test`: 197 passed, 0 failed (up from 190). `cargo clippy --all-targets
+-- -D warnings`: clean. `cargo fmt --check`: clean.

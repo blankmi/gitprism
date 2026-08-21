@@ -881,6 +881,9 @@ pub(crate) fn pending_commits(repo: &Repository, boundary: Oid, tip: Oid) -> Res
         .hide(boundary)
         .context("excluding already-synced history")?;
     revwalk
+        .simplify_first_parent()
+        .context("restricting the pending-commit walk to first-parent history (decisions/0035)")?;
+    revwalk
         .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
         .context("ordering pending commits oldest-first")?;
 
@@ -2352,6 +2355,51 @@ mod tests {
             .unwrap()
     }
 
+    /// Builds a dest commit stamped exactly as `build_dest_commit` would
+    /// have — a `Gitprism-Source-Commit` trailer naming `source_oid` — for
+    /// hand-constructing a dest history shaped like a prior sync run's
+    /// output (decisions/0035's migration case) without going through `run`.
+    fn add_source_marker_commit_on_dest(
+        dest_repo: &Repository,
+        branch: &str,
+        parent: Oid,
+        file: (&str, &str),
+        source_oid: Oid,
+    ) -> Oid {
+        let parent_commit = dest_repo.find_commit(parent).unwrap();
+        let mut builder = dest_repo
+            .treebuilder(Some(&parent_commit.tree().unwrap()))
+            .unwrap();
+        let blob = dest_repo.blob(file.1.as_bytes()).unwrap();
+        builder
+            .insert(file.0, blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let message = marker::build_message(
+            "gitprism sync: source -> dest",
+            MarkerDirection::SourceToDest,
+            branch,
+            source_oid,
+            "Gitprism-Source-Commit",
+            &[parent],
+            tree.id(),
+            &signature,
+            &signature,
+            &marker::load_key().unwrap(),
+        );
+        dest_repo
+            .commit(
+                Some(&format!("refs/heads/{branch}")),
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap()
+    }
+
     #[test]
     fn run_pushes_a_new_source_commit_to_dest_filtered() {
         let dest_dir = tempdir().unwrap();
@@ -3278,14 +3326,11 @@ mod tests {
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         run(source_dir.path(), config.path()).expect("first sync should succeed");
 
-        // Intermediate dest commits are a linearization artifact: whichever
-        // branch the revwalk (TOPOLOGICAL|REVERSE) emits second yields a dest
-        // commit whose diff (against the cursor, the previously examined
-        // pending commit on the *other* branch) temporarily removes that
-        // other branch's file — restored again by the merge commit's own
-        // diff. That's an accepted, recorded design question for the project
-        // owner, not something this test asserts on or tries to fix — only
-        // the tip is checked here.
+        // decisions/0035 removed the interleaved-branch churn this comment
+        // used to describe: feature's own commit (f1) is no longer emitted
+        // by the first-parent-only walk, so dest never gets an intermediate
+        // commit temporarily missing the other branch's file. Only the tip
+        // is checked here regardless.
         let dest_tip_commit = dest_repo
             .find_branch("main", git2::BranchType::Local)
             .unwrap()
@@ -3323,6 +3368,635 @@ mod tests {
             tip_before_second, tip_after_second,
             "a second, no-op sync must not move dest's tip"
         );
+    }
+
+    #[test]
+    fn run_honors_a_conflict_resolved_by_hand_inside_a_merge_commit() {
+        // decisions/0035: R0 -> R1 -> R2 on main, R0 -> F1 on feature, both
+        // R1 and F1 edit shared.txt differently, and M merges feature into
+        // main with the conflict resolved by hand in M's own tree. Under the
+        // full-DAG walk this hard-stops on a genuine merge-tree conflict
+        // when F1 is replayed on its own; under the first-parent walk only
+        // M itself is applied, carrying the human's resolution.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "base\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        add_commit(&source_repo, "main", &[("shared.txt", "landing\n")]);
+        let r2 = add_commit(&source_repo, "main", &[("other.txt", "r2\n")]);
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        let f1 = add_commit(&source_repo, "feature", &[("shared.txt", "feature\n")]);
+
+        // M resolves the shared.txt conflict by hand: neither side's own
+        // content, main's r2 as first parent, feature's f1 as second.
+        let r2_commit = source_repo.find_commit(r2).unwrap();
+        let f1_commit = source_repo.find_commit(f1).unwrap();
+        let mut builder = source_repo
+            .treebuilder(Some(&r2_commit.tree().unwrap()))
+            .unwrap();
+        let resolved_blob = source_repo.blob(b"resolved-by-human\n").unwrap();
+        builder
+            .insert("shared.txt", resolved_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let merge_tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Merge branch 'feature'",
+                &merge_tree,
+                &[&r2_commit, &f1_commit],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect(
+            "a merge's own hand-resolved conflict must not be re-litigated against the \
+             feature branch's own diff",
+        );
+
+        let dest_tip_commit = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = dest_tip_commit.tree().unwrap();
+        let shared_blob = dest_repo
+            .find_blob(tree.get_name("shared.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(
+            shared_blob.content(),
+            b"resolved-by-human\n",
+            "dest's tip must carry the human's resolution recorded in the merge commit itself"
+        );
+        let other_blob = dest_repo
+            .find_blob(tree.get_name("other.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(other_blob.content(), b"r2\n");
+    }
+
+    #[test]
+    fn run_applies_a_clean_two_parent_merge_without_replaying_the_side_branchs_own_commit() {
+        // decisions/0035: unlike `run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`
+        // (which asserts only final content, identical under either walk),
+        // this counts dest's own history to show feature's own commit is no
+        // longer replayed onto dest individually — the merge is carried as
+        // one net change against its first parent.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let a1 = add_commit(&source_repo, "main", &[("main.txt", "m1\n")]);
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        let f1 = add_commit(&source_repo, "feature", &[("feature.txt", "f1\n")]);
+
+        let a1_commit = source_repo.find_commit(a1).unwrap();
+        let f1_commit = source_repo.find_commit(f1).unwrap();
+        let mut builder = source_repo
+            .treebuilder(Some(&a1_commit.tree().unwrap()))
+            .unwrap();
+        let feature_entry = f1_commit
+            .tree()
+            .unwrap()
+            .get_name("feature.txt")
+            .unwrap()
+            .id();
+        builder
+            .insert("feature.txt", feature_entry, git2::FileMode::Blob.into())
+            .unwrap();
+        let merge_tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Merge branch 'feature'",
+                &merge_tree,
+                &[&a1_commit, &f1_commit],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("a clean two-parent merge should sync");
+
+        let dest_tip_commit = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = dest_tip_commit.tree().unwrap();
+        assert!(tree.get_name("main.txt").is_some());
+        assert!(tree.get_name("feature.txt").is_some());
+
+        let mut revwalk = dest_repo.revwalk().unwrap();
+        revwalk.push(dest_tip_commit.id()).unwrap();
+        assert_eq!(
+            revwalk.count(),
+            3,
+            "dest history must be exactly: initial, one commit for a1, one for the merge — \
+             feature's own commit (f1) must never be applied to dest on its own"
+        );
+    }
+
+    #[test]
+    fn pending_commits_still_hides_a_boundary_reachable_only_via_a_merges_second_parent() {
+        // decisions/0035: hide()'s own ancestor-exclusion walks all of a
+        // hidden commit's parents regardless of simplify_first_parent, which
+        // only restricts what the walk *emits*. `boundary` here is a merge's
+        // second parent; the root beneath it is also a first-parent ancestor
+        // of `tip` and must still be excluded.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let empty_tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+
+        let root = repo
+            .commit(None, &signature, &signature, "root", &empty_tree, &[])
+            .unwrap();
+        let root_commit = repo.find_commit(root).unwrap();
+        let x = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "x",
+                &empty_tree,
+                &[&root_commit],
+            )
+            .unwrap();
+        let x_commit = repo.find_commit(x).unwrap();
+        let c = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "c",
+                &empty_tree,
+                &[&root_commit],
+            )
+            .unwrap();
+        let c_commit = repo.find_commit(c).unwrap();
+
+        let unrelated_root = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "unrelated-root",
+                &empty_tree,
+                &[],
+            )
+            .unwrap();
+        let unrelated_root_commit = repo.find_commit(unrelated_root).unwrap();
+        let y = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "y",
+                &empty_tree,
+                &[&unrelated_root_commit],
+            )
+            .unwrap();
+        let y_commit = repo.find_commit(y).unwrap();
+
+        // boundary: first parent y (unrelated to root), second parent x
+        // (root's own child) — root is reachable from boundary only via its
+        // second parent.
+        let boundary = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "boundary",
+                &empty_tree,
+                &[&y_commit, &x_commit],
+            )
+            .unwrap();
+        let boundary_commit = repo.find_commit(boundary).unwrap();
+
+        // merge: first parent c (root's other child, on tip's own
+        // first-parent line), second parent boundary (already synced).
+        let merge = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "merge",
+                &empty_tree,
+                &[&c_commit, &boundary_commit],
+            )
+            .unwrap();
+        let merge_commit = repo.find_commit(merge).unwrap();
+        let tip = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "tip",
+                &empty_tree,
+                &[&merge_commit],
+            )
+            .unwrap();
+
+        let pending = pending_commits(&repo, boundary, tip).unwrap();
+        assert_eq!(
+            pending,
+            vec![c, merge, tip],
+            "root must stay hidden even though it's only reachable from `boundary` via a \
+             merge's second parent, and is also a first-parent ancestor of tip via c"
+        );
+    }
+
+    #[test]
+    fn run_applies_a_squash_merged_source_commit_as_a_single_dest_commit() {
+        // Regression case, not a fix case: `git merge --squash` never
+        // records a second parent, so decisions/0035's
+        // `simplify_first_parent()` has no effect on it. Confirms the
+        // existing squash-merge shape still syncs unchanged.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+        let f2 = add_commit(
+            &source_repo,
+            "feature",
+            &[("feature.txt", "line1\nline2\n")],
+        );
+
+        // A single-parent squash commit on main, carrying feature's combined
+        // final tree with no second parent recorded.
+        let f2_commit = source_repo.find_commit(f2).unwrap();
+        let graft_commit = source_repo.find_commit(graft).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Squash merge branch 'feature'",
+                &f2_commit.tree().unwrap(),
+                &[&graft_commit],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("a squash-merged commit should sync");
+
+        let dest_tip_commit = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = dest_tip_commit.tree().unwrap();
+        let feature_blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(feature_blob.content(), b"line1\nline2\n");
+    }
+
+    #[test]
+    fn run_applies_a_rebased_linear_source_history_commit_by_commit() {
+        // Regression case, not a fix case: a rebase-and-fast-forward
+        // produces purely linear, single-parent history — decisions/0035's
+        // `simplify_first_parent()` has no effect on it. Confirms ordinary
+        // linear PR completion still syncs unchanged.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("a.txt", "a\n")]);
+        add_commit(&source_repo, "main", &[("b.txt", "b\n")]);
+        add_commit(&source_repo, "main", &[("c.txt", "c\n")]);
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect("linear history should sync");
+
+        let dest_tip_commit = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = dest_tip_commit.tree().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert!(tree.get_name(name).is_some(), "{name}");
+        }
+        let mut revwalk = dest_repo.revwalk().unwrap();
+        revwalk.push(dest_tip_commit.id()).unwrap();
+        assert_eq!(
+            revwalk.count(),
+            4,
+            "initial commit plus one dest commit per linear source commit"
+        );
+    }
+
+    #[test]
+    fn run_carries_a_real_two_parent_merge_on_dest_into_source_as_one_net_change() {
+        // decisions/0035: pending_commits is shared by both directions —
+        // dest's own two-parent merges must collapse to their first
+        // parent's diff on source too, not replay the merged-in branch's
+        // own commit before the merge restores it. No equivalent coverage
+        // existed for dest→source before this decision.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let source_remote = bare_source_remote_seeded_at(
+            &source_repo,
+            "main",
+            source_repo
+                .find_branch("main", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+        );
+
+        let a1 = add_independent_dest_commit(
+            &dest_repo,
+            dest_tip,
+            ("main.txt", "m1\n"),
+            "an independent main-side change",
+        );
+        let f1 = add_independent_dest_commit_on(
+            &dest_repo,
+            "feature",
+            dest_tip,
+            ("feature.txt", "f1\n"),
+            "an independent feature-side change",
+        );
+
+        // A real two-parent merge on dest: main stays first parent,
+        // feature's own commit is second — its own tree carries shared.txt,
+        // main.txt, and feature.txt.
+        let a1_commit = dest_repo.find_commit(a1).unwrap();
+        let f1_commit = dest_repo.find_commit(f1).unwrap();
+        let mut builder = dest_repo
+            .treebuilder(Some(&a1_commit.tree().unwrap()))
+            .unwrap();
+        let feature_entry = f1_commit
+            .tree()
+            .unwrap()
+            .get_name("feature.txt")
+            .unwrap()
+            .id();
+        builder
+            .insert("feature.txt", feature_entry, git2::FileMode::Blob.into())
+            .unwrap();
+        let merge_tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        dest_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Merge branch 'feature' into 'main'",
+                &merge_tree,
+                &[&a1_commit, &f1_commit],
+            )
+            .unwrap();
+
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+        run(source_dir.path(), config.path()).expect("dest's real merge should reach source");
+
+        let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+        let new_source_tip = source_remote_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = new_source_tip.tree().unwrap();
+        assert!(tree.get_name("main.txt").is_some());
+        assert!(
+            tree.get_name("feature.txt").is_some(),
+            "the merge's own content must reach source even though feature's own commit is \
+             only reachable via the merge's second parent"
+        );
+
+        let mut revwalk = source_remote_repo.revwalk().unwrap();
+        revwalk.push(new_source_tip.id()).unwrap();
+        revwalk.hide(dest_tip).unwrap();
+        assert_eq!(
+            revwalk.count(),
+            3,
+            "the graft commit, one commit for a1, and one for the merge — feature's own dest \
+             commit must never be applied to source on its own"
+        );
+    }
+
+    #[test]
+    fn run_correctly_merges_a_new_source_merge_onto_a_dest_tip_shaped_by_the_old_full_dag_walk() {
+        // decisions/0035's migration case: a dest history already containing
+        // a prior merge's side-branch commit individually — exactly what
+        // the old, full-DAG `pending_commits` would have produced — must
+        // still merge correctly once a later merge is processed under
+        // first-parent semantics.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip =
+            bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // The old merge, already fully processed by a hypothetical old-code
+        // sync: R1 on main, F1 on a feature branch, OM merging them with its
+        // own extra content so OM's own diff isn't a no-op.
+        let r1 = add_commit(&source_repo, "main", &[("main.txt", "m1\n")]);
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        let f1 = add_commit(&source_repo, "feature", &[("feature.txt", "f1\n")]);
+        let r1_commit = source_repo.find_commit(r1).unwrap();
+        let f1_commit = source_repo.find_commit(f1).unwrap();
+        let mut builder = source_repo
+            .treebuilder(Some(&r1_commit.tree().unwrap()))
+            .unwrap();
+        let feature_entry = f1_commit
+            .tree()
+            .unwrap()
+            .get_name("feature.txt")
+            .unwrap()
+            .id();
+        builder
+            .insert("feature.txt", feature_entry, git2::FileMode::Blob.into())
+            .unwrap();
+        let om_extra_blob = source_repo.blob(b"om-extra\n").unwrap();
+        builder
+            .insert("om-extra.txt", om_extra_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let om_tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let om = source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "Merge branch 'feature'",
+                &om_tree,
+                &[&r1_commit, &f1_commit],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        // Hand-build dest's history to match what the old, full-DAG
+        // `pending_commits` would actually have produced: R1's own commit,
+        // then F1's own commit (the side branch, replayed individually),
+        // then OM's own commit (non-empty because of om-extra.txt) — three
+        // dest commits, not the one net change the new walk would build.
+        let d1 = add_source_marker_commit_on_dest(
+            &dest_repo,
+            "main",
+            dest_tip,
+            ("main.txt", "m1\n"),
+            r1,
+        );
+        let d2 =
+            add_source_marker_commit_on_dest(&dest_repo, "main", d1, ("feature.txt", "f1\n"), f1);
+        add_source_marker_commit_on_dest(
+            &dest_repo,
+            "main",
+            d2,
+            ("om-extra.txt", "om-extra\n"),
+            om,
+        );
+
+        // A brand-new merge, to be processed under the new first-parent walk
+        // against this migrated dest state.
+        let r3 = add_commit(&source_repo, "main", &[("main.txt", "m2\n")]);
+        source_repo
+            .branch("feature2", &source_repo.find_commit(om).unwrap(), false)
+            .unwrap();
+        let f2 = add_commit(&source_repo, "feature2", &[("feature2.txt", "f2\n")]);
+        let r3_commit = source_repo.find_commit(r3).unwrap();
+        let f2_commit = source_repo.find_commit(f2).unwrap();
+        let mut builder2 = source_repo
+            .treebuilder(Some(&r3_commit.tree().unwrap()))
+            .unwrap();
+        let feature2_entry = f2_commit
+            .tree()
+            .unwrap()
+            .get_name("feature2.txt")
+            .unwrap()
+            .id();
+        builder2
+            .insert("feature2.txt", feature2_entry, git2::FileMode::Blob.into())
+            .unwrap();
+        let m2_tree = source_repo.find_tree(builder2.write().unwrap()).unwrap();
+        let signature2 = Signature::now("A Developer", "dev@example.com").unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature2,
+                &signature2,
+                "Merge branch 'feature2'",
+                &m2_tree,
+                &[&r3_commit, &f2_commit],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path())
+            .expect("a new merge must apply correctly against a dest tip shaped by the old walk");
+
+        let dest_tip_commit = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = dest_tip_commit.tree().unwrap();
+        for (name, expected) in [
+            ("shared.txt", "v1\n"),
+            ("main.txt", "m2\n"),
+            ("feature.txt", "f1\n"),
+            ("om-extra.txt", "om-extra\n"),
+            ("feature2.txt", "f2\n"),
+        ] {
+            let blob = dest_repo
+                .find_blob(tree.get_name(name).unwrap().id())
+                .unwrap();
+            assert_eq!(blob.content(), expected.as_bytes(), "{name}");
+        }
     }
 
     #[test]
