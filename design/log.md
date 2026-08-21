@@ -1232,3 +1232,21 @@ anywhere in a message. It was stale:
 that loose scan with a single canonical final state block that resume and
 loop-prevention only trust once its HMAC verifies, closing the exposure described.
 No code changed.
+
+**Update**: An external security review found the README's "Mapping state key"
+section overstated a secrecy guarantee: it said `GITPRISM_SOURCE_URL` /
+`GITPRISM_DEST_URL` fallback values are "scrubbed" from Git subprocesses
+alongside `GITPRISM_STATE_KEY`, implying the resolved URL is unavailable to
+them. It isn't — `fetch`, `remote_ref_exists`, and `push` in `src/git.rs` all
+pass the resolved URL to Git as a command-line argument, visible to any
+same-user process (`ps`, `/proc/<pid>/cmdline`) and capturable in CI logs or
+crash reports, regardless of the environment scrubbing. Corrected the README
+to state that plainly, kept the true claim (the gitprism-specific env vars
+aren't inherited, so a hook can't read them out of the environment), and added
+guidance against embedding credentials in repository URLs at all. Also dropped
+the credential-bearing rationale from the `[source].url` / `[dest].url` bullet,
+which recommended the env-var fallback for exactly the URLs this now warns
+against; the per-environment rationale stays.
+[decisions/0013](decisions/0013-repo-urls-optional-fall-back-to-env-vars.md)
+states the same credential-bearing rationale in its Context section and was
+left unchanged — flagged for separate handling. No code changed.
