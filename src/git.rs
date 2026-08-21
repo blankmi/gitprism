@@ -194,7 +194,14 @@ fn redact_bytes(raw: &[u8], secret: &[u8]) -> Vec<u8> {
     redacted
 }
 
-fn is_non_fast_forward_rejection(raw: &[u8]) -> bool {
+/// Whether `raw` (a `git push --porcelain` byte stream) reports a ref update
+/// rejected because the remote ref had moved since gitprism last looked at
+/// it — the porcelain status field `!` plus a last field starting
+/// `[rejected]`. This covers both a plain non-fast-forward rejection
+/// (decisions/0009) and a stale `--force-with-lease` rejection
+/// (decisions/0040: reason `(stale info)`), which git reports with the exact
+/// same status/reason shape — verified against real git, not assumed.
+fn is_ref_moved_rejection(raw: &[u8]) -> bool {
     raw.split(|byte| *byte == b'\n').any(|line| {
         let mut fields = line.split(|byte| *byte == b'\t');
         let status = fields.next();
@@ -479,49 +486,74 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
 }
 
 /// What happened to a [`push`] attempt: either it landed, or it was
-/// rejected specifically for being a non-fast-forward update — the one
-/// failure decisions/0009 says is worth refetching dest and recomputing for.
-/// Every other failure (auth, hooks, network, ...) is a plain `Err`.
+/// rejected because the remote ref had moved since gitprism last looked at
+/// it — a plain non-fast-forward rejection (decisions/0009) or a stale
+/// `--force-with-lease` compare-and-swap (decisions/0040), the two failures
+/// worth refetching dest and recomputing for. Every other failure (auth,
+/// hooks, network, ...) is a plain `Err`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushOutcome {
     Accepted,
-    RejectedNotFastForward,
+    RejectedRefMoved,
 }
 
-/// Required at every [`push`] call site (decisions/0038, decisions/0039) so
-/// intent is declared where the push happens, not inferred from which
-/// function got called or from how many times a push was retried.
-/// `FastForwardOnly` is today's only behavior, unchanged: no `--force`, no
-/// `--force-with-lease`, no `+`-prefixed refspec. `ForceMirrorOnly` performs
-/// an outright force of that one refspec — never a lease — and is only ever
-/// requested by `sync_pair_to_dest` after positively detecting a rewritten
-/// mirror-only source branch (decisions/0039); every other call site stays
-/// `FastForwardOnly` permanently.
+/// Required at every [`push`] call site (decisions/0038, decisions/0039,
+/// decisions/0040) so intent is declared where the push happens, not
+/// inferred from which function got called or from how many times a push was
+/// retried. `FastForwardOnly` is today's only behavior, unchanged: no
+/// `--force`, no `--force-with-lease`, no `+`-prefixed refspec.
+/// `ForceMirrorOnly { expected_dest }` performs a compare-and-swap force via
+/// `--force-with-lease=refs/heads/<branch>:<expected_dest>` — never an
+/// unconditional force — so `expected_dest` must be the dest tip actually
+/// fetched this run, not a stale or recomputed value (decisions/0040's
+/// "Consequences"). Only ever requested by `sync_pair_to_dest` after
+/// positively detecting a rewritten mirror-only source branch
+/// (decisions/0039); every other call site stays `FastForwardOnly`
+/// permanently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushMode {
     FastForwardOnly,
-    ForceMirrorOnly,
+    ForceMirrorOnly { expected_dest: git2::Oid },
 }
 
-/// The refspec [`push`] sends to git for `mode` — pulled out on its own so
-/// the two modes' exact wire shape (plain vs. `+`-prefixed) is unit-testable
-/// without a real remote.
-fn push_refspec(mode: PushMode, commit: git2::Oid, dest_branch: &str) -> String {
-    match mode {
-        PushMode::FastForwardOnly => format!("{commit}:refs/heads/{dest_branch}"),
-        PushMode::ForceMirrorOnly => format!("+{commit}:refs/heads/{dest_branch}"),
+/// The `<new-tip>:<ref>` refspec [`push`] sends to git — always plain, never
+/// `+`-prefixed, regardless of `mode`: an authorized mirror force is now
+/// expressed entirely by [`push_args`]'s `--force-with-lease` flag
+/// (decisions/0040), not by a `+`-prefixed refspec layered on top of it.
+fn push_refspec(commit: git2::Oid, dest_branch: &str) -> String {
+    format!("{commit}:refs/heads/{dest_branch}")
+}
+
+/// The arguments [`push`] passes to `git push` after `--porcelain` for
+/// `mode` — pulled out on its own so the exact wire shape (whether a
+/// `--force-with-lease` flag is present, and that the refspec itself is
+/// never `+`-prefixed) is unit-testable without a real remote. Any
+/// `--force-with-lease` flag must precede the `--` operand separator: `--`
+/// tells git everything after it is positional, so a flag placed after it
+/// would be parsed as a literal refspec instead of an option.
+fn push_args(mode: PushMode, url: &str, commit: git2::Oid, dest_branch: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if let PushMode::ForceMirrorOnly { expected_dest } = mode {
+        args.push(format!(
+            "--force-with-lease=refs/heads/{dest_branch}:{expected_dest}"
+        ));
     }
+    args.push("--".to_string());
+    args.push(url.to_string());
+    args.push(push_refspec(commit, dest_branch));
+    args
 }
 
 /// Push `commit` (a local oid already in `repo_dir`'s object database) to
 /// `dest_branch` on `url` — same as `git push <url> <commit>:<dest_branch>`
-/// by hand, or `git push <url> +<commit>:<dest_branch>` for
-/// [`PushMode::ForceMirrorOnly`]. `PushMode::FastForwardOnly` passes no
-/// `--force`/`--force-with-lease` flag and no `+`-prefixed refspec: git's own
-/// default refuses a non-fast-forward update, which is exactly the
-/// fast-forward-only constraint requirements/0001 and decisions/0009 require
-/// for every push except a positively detected mirror-only rewrite
-/// (decisions/0038, decisions/0039).
+/// by hand, or, for [`PushMode::ForceMirrorOnly`], `git push
+/// --force-with-lease=refs/heads/<dest_branch>:<expected_dest> <url>
+/// <commit>:<dest_branch>` (decisions/0040). `PushMode::FastForwardOnly`
+/// passes no `--force`/`--force-with-lease` flag and no `+`-prefixed
+/// refspec: git's own default refuses a non-fast-forward update, which is
+/// exactly the fast-forward-only constraint requirements/0001 and
+/// decisions/0009 require for every push except a positively detected
+/// mirror-only rewrite (decisions/0038, decisions/0039).
 pub fn push(
     repo_dir: &Path,
     url: &str,
@@ -531,16 +563,14 @@ pub fn push(
 ) -> Result<PushOutcome> {
     validate_remote(url)?;
     validate_branch_name(dest_branch)?;
-    let refspec = push_refspec(mode, commit, dest_branch);
+    let args = push_args(mode, url, commit, dest_branch);
     let mut command = git_command();
     command
         .arg("-C")
         .arg(repo_dir)
         .arg("push")
         .arg("--porcelain")
-        .arg("--")
-        .arg(url)
-        .arg(&refspec)
+        .args(&args)
         .env("GIT_TERMINAL_PROMPT", "0");
     let output =
         run_git_output(command, PARSE_OUTPUT).context("running git push to configured remote")?;
@@ -550,11 +580,12 @@ pub fn push(
     }
 
     // git's own wording for "the ref moved since we last looked" — the only
-    // case decisions/0009 wants recomputed and retried. Everything else
-    // (bad credentials, a rejecting pre-receive hook, a dropped connection,
-    // ...) must surface immediately instead of being silently retried.
-    if is_non_fast_forward_rejection(&output.stdout) {
-        return Ok(PushOutcome::RejectedNotFastForward);
+    // case decisions/0009 and decisions/0040 want recomputed and retried.
+    // Everything else (bad credentials, a rejecting pre-receive hook, a
+    // dropped connection, ...) must surface immediately instead of being
+    // silently retried.
+    if is_ref_moved_rejection(&output.stdout) {
+        return Ok(PushOutcome::RejectedRefMoved);
     }
 
     let diagnostic = git_diagnostic(
@@ -1431,7 +1462,7 @@ mod tests {
             PushMode::FastForwardOnly,
         )
         .expect("a lost fast-forward race is a reported outcome, not an error");
-        assert_eq!(outcome, PushOutcome::RejectedNotFastForward);
+        assert_eq!(outcome, PushOutcome::RejectedRefMoved);
 
         let dest_repo = Repository::open(dest_dir.path()).unwrap();
         let still = dest_repo
@@ -1448,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn push_force_mirror_only_overwrites_a_diverged_dest_branch_outright() {
+    fn push_force_mirror_only_uses_a_correct_lease_to_force_a_non_fast_forward_update() {
         let dest_dir = tempdir().unwrap();
         let dest_tip = repo_with_a_commit_on(dest_dir.path(), "main");
         let dest_repo = Repository::open(dest_dir.path()).unwrap();
@@ -1457,9 +1488,8 @@ mod tests {
         let source_dir = tempdir().unwrap();
         Repository::init(source_dir.path()).unwrap();
         let source_repo = Repository::open(source_dir.path()).unwrap();
-        // Unrelated to dest_tip, exactly like the rejected-race test above —
-        // the only difference is the mode, so this pair isolates what
-        // `ForceMirrorOnly` alone changes about the outcome.
+        // Unrelated to dest_tip, so pushing it plainly would be refused —
+        // isolates that the lease alone is what authorizes the force.
         let tree_oid = source_repo.treebuilder(None).unwrap().write().unwrap();
         let tree = source_repo.find_tree(tree_oid).unwrap();
         let signature = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -1467,17 +1497,16 @@ mod tests {
             .commit(None, &signature, &signature, "rewritten", &tree, &[])
             .unwrap();
 
-        // No expected-old-value is ever passed in — there is nothing here
-        // for a `--force-with-lease` compare-and-swap to check against, so
-        // this is structurally an outright force, not a lease.
         let outcome = push(
             source_dir.path(),
             &dest_dir.path().display().to_string(),
             rewritten,
             "main",
-            PushMode::ForceMirrorOnly,
+            PushMode::ForceMirrorOnly {
+                expected_dest: dest_tip,
+            },
         )
-        .expect("ForceMirrorOnly must overwrite a diverged dest branch outright");
+        .expect("a lease matching dest's actual tip must force a non-fast-forward update");
         assert_eq!(outcome, PushOutcome::Accepted);
 
         let dest_repo = Repository::open(dest_dir.path()).unwrap();
@@ -1490,24 +1519,105 @@ mod tests {
         assert_eq!(
             now.id(),
             rewritten,
-            "a force-mirror push must move dest's branch to the new tip even though it discards dest_tip"
+            "a correct lease must move dest's branch to the new tip even though it discards dest_tip"
         );
         assert_ne!(now.id(), dest_tip);
     }
 
     #[test]
-    fn push_refspec_fast_forward_only_never_carries_a_force_prefix() {
-        let commit = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
-        let refspec = push_refspec(PushMode::FastForwardOnly, commit, "main");
-        assert_eq!(refspec, format!("{commit}:refs/heads/main"));
-        assert!(!refspec.starts_with('+'));
+    fn push_force_mirror_only_rejects_a_stale_lease_and_leaves_the_remote_untouched() {
+        let dest_dir = tempdir().unwrap();
+        let stale_expected = repo_with_a_commit_on(dest_dir.path(), "main");
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        dest_repo.set_head("refs/heads/unrelated").unwrap();
+        // Stands in for another writer advancing dest between gitprism's
+        // fetch (which observed `stale_expected`) and its push.
+        let advanced = commit_on(&dest_repo, stale_expected, ("advance.txt", "x"));
+        dest_repo
+            .reference("refs/heads/main", advanced, true, "advance")
+            .unwrap();
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        let source_repo = Repository::open(source_dir.path()).unwrap();
+        let tree_oid = source_repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = source_repo.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let rewritten = source_repo
+            .commit(None, &signature, &signature, "rewritten", &tree, &[])
+            .unwrap();
+
+        let outcome = push(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            rewritten,
+            "main",
+            PushMode::ForceMirrorOnly {
+                expected_dest: stale_expected,
+            },
+        )
+        .expect("a stale lease is a reported rejection, not an error");
+        assert_eq!(outcome, PushOutcome::RejectedRefMoved);
+
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        let still = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            still.id(),
+            advanced,
+            "a rejected lease must not move dest's branch — the whole point of the compare-and-swap"
+        );
     }
 
     #[test]
-    fn push_refspec_force_mirror_only_is_plus_prefixed_a_bare_force_not_a_lease() {
+    fn push_args_fast_forward_only_carries_neither_a_lease_flag_nor_a_force_prefix() {
         let commit = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
-        let refspec = push_refspec(PushMode::ForceMirrorOnly, commit, "main");
-        assert_eq!(refspec, format!("+{commit}:refs/heads/main"));
+        let args = push_args(PushMode::FastForwardOnly, "the-url", commit, "main");
+        assert_eq!(
+            args,
+            vec![
+                "--".to_string(),
+                "the-url".to_string(),
+                format!("{commit}:refs/heads/main")
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with('+')));
+        assert!(!args.iter().any(|arg| arg.contains("force")));
+    }
+
+    #[test]
+    fn push_args_force_mirror_only_is_a_lease_against_expected_dest_with_a_plain_refspec() {
+        let commit = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let expected_dest =
+            git2::Oid::from_str("fedcba9876543210fedcba9876543210fedcba98").unwrap();
+        let args = push_args(
+            PushMode::ForceMirrorOnly { expected_dest },
+            "the-url",
+            commit,
+            "main",
+        );
+        assert_eq!(
+            args,
+            vec![
+                format!("--force-with-lease=refs/heads/main:{expected_dest}"),
+                "--".to_string(),
+                "the-url".to_string(),
+                format!("{commit}:refs/heads/main"),
+            ]
+        );
+        assert!(
+            !args.iter().any(|arg| arg.starts_with('+')),
+            "the lease flag alone must force the update, not a `+`-prefixed refspec: {args:?}"
+        );
+        assert_eq!(
+            args.iter().position(|arg| arg == "--"),
+            Some(1),
+            "the force-with-lease flag must precede `--`, or git parses it as a literal positional refspec instead of an option: {args:?}"
+        );
     }
 
     #[test]
@@ -1532,17 +1642,25 @@ mod tests {
     }
 
     #[test]
-    fn push_porcelain_rejection_parser_distinguishes_non_fast_forward() {
-        assert!(is_non_fast_forward_rejection(
+    fn push_porcelain_rejection_parser_distinguishes_ref_moved_rejections() {
+        assert!(is_ref_moved_rejection(
             b"!\tHEAD:refs/heads/main\t[rejected] (fetch first)\nDone\n"
         ));
-        assert!(is_non_fast_forward_rejection(
+        assert!(is_ref_moved_rejection(
             b"!\tHEAD:refs/heads/main\t[rejected] (non-fast-forward)\n"
         ));
-        assert!(is_non_fast_forward_rejection(
+        assert!(is_ref_moved_rejection(
             b"!\tHEAD:refs/heads/main\t[rejected] (razlog lokalizovan)\n"
         ));
-        assert!(!is_non_fast_forward_rejection(
+        // decisions/0040: a stale `--force-with-lease` reports the same `!` /
+        // `[rejected]` porcelain shape as a plain non-fast-forward rejection,
+        // just with a different human-readable reason — this is what lets a
+        // stale lease already route into decisions/0009's retry loop with no
+        // new plumbing.
+        assert!(is_ref_moved_rejection(
+            b"!\tHEAD:refs/heads/main\t[rejected] (stale info)\n"
+        ));
+        assert!(!is_ref_moved_rejection(
             b"!\tHEAD:refs/heads/main\t[remote rejected] (hook declined)\n"
         ));
     }

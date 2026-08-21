@@ -353,7 +353,12 @@ fn sync_pair_to_dest_with_key(
             git::fetch(source_root, &dest_url, branch).with_context(|| {
                 format!("fetching dest branch {branch:?} from configured remote")
             })?;
-            let dest_tip = repo
+            // decisions/0040: this is the OID a `ForceMirrorOnly` lease must
+            // be built from — the dest tip as actually fetched this run, not
+            // the graft-derived rebuild base the rewrite arm below binds
+            // `dest_tip` to after this `match`. Named distinctly so that
+            // substitution can't happen by accident.
+            let fetched_dest_tip = repo
                 .find_reference("FETCH_HEAD")
                 .context("reading FETCH_HEAD after fetch")?
                 .peel_to_commit()
@@ -372,8 +377,14 @@ fn sync_pair_to_dest_with_key(
             // for this branch). Either way, proceeding could silently drop
             // content some other commit already contributed, even though the
             // ref update itself would be a legitimate fast-forward.
-            match dest_resume_point_for_branch(repo, source_tip, dest_tip, branch, state_key)? {
-                Some(boundary) => (dest_tip, boundary),
+            match dest_resume_point_for_branch(
+                repo,
+                source_tip,
+                fetched_dest_tip,
+                branch,
+                state_key,
+            )? {
+                Some(boundary) => (fetched_dest_tip, boundary),
                 // decisions/0039: `round_tripped` is the authority invariant
                 // itself — a mirror-only branch's dest ref is a projection
                 // nothing ever imports back (decisions/0017), so nothing on
@@ -385,7 +396,11 @@ fn sync_pair_to_dest_with_key(
                 // refusal below instead.
                 None if !round_tripped
                     && mirror_only_rewrite_detected(
-                        repo, source_tip, dest_tip, branch, state_key,
+                        repo,
+                        source_tip,
+                        fetched_dest_tip,
+                        branch,
+                        state_key,
                     )? =>
                 {
                     reporter.step(
@@ -405,7 +420,14 @@ fn sync_pair_to_dest_with_key(
                             "gitprism sync: detected a rewritten mirror-only branch {branch:?} but found no Gitprism-Dest-Commit trailer to rebuild from — has `gitprism setup` been run for this pair?"
                         )
                     };
-                    push_mode = PushMode::ForceMirrorOnly;
+                    // The lease is a compare-and-swap against dest's actual
+                    // fetched tip, never against `rebuild_dest_tip` — a
+                    // concurrent advance past `fetched_dest_tip` is a race
+                    // this run hasn't seen yet, not part of the authorized
+                    // rewrite (decisions/0040).
+                    push_mode = PushMode::ForceMirrorOnly {
+                        expected_dest: fetched_dest_tip,
+                    };
                     (rebuild_dest_tip, boundary)
                 }
                 None => anyhow::bail!(
@@ -554,21 +576,23 @@ fn sync_pair_to_dest_with_key(
         if let Some(new_dest_tip) = new_dest_tip {
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
                 git::PushOutcome::Accepted => {}
-                git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
+                git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
                     // dest's tip moved between fetch and push — refetch and
                     // recompute against its new state rather than rebasing
-                    // what was already built (decisions/0009). This is
-                    // decisions/0009's own, narrower race handling, unrelated
-                    // to `push_mode`: an outright `ForceMirrorOnly` push
-                    // shouldn't itself be rejected as non-fast-forward, but
-                    // if it somehow is, a rewritten mirror-only branch is
-                    // re-detected fresh next iteration rather than assumed
-                    // from this rejection — force is never escalated to from
-                    // a retry count.
+                    // what was already built (decisions/0009). A
+                    // `ForceMirrorOnly` push routinely lands here too: its
+                    // `--force-with-lease` is a compare-and-swap against the
+                    // dest tip this run actually fetched (decisions/0040), so
+                    // another writer advancing dest in the fetch-to-push
+                    // window reports the identical rejection, not a silently
+                    // overwritten ref. Either way, a rewritten mirror-only
+                    // branch is re-detected fresh next iteration rather than
+                    // assumed from this rejection — force is never escalated
+                    // to from a retry count.
                     attempt += 1;
                     continue;
                 }
-                git::PushOutcome::RejectedNotFastForward => {
+                git::PushOutcome::RejectedRefMoved => {
                     anyhow::bail!(divergence_after_exhausted_retries_message(branch, "dest"))
                 }
             }
@@ -1612,11 +1636,11 @@ fn sync_pair_from_dest_with_key(
                         )
                     })?;
                 }
-                git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES => {
+                git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
                     attempt += 1;
                     continue;
                 }
-                git::PushOutcome::RejectedNotFastForward => {
+                git::PushOutcome::RejectedRefMoved => {
                     anyhow::bail!(divergence_after_exhausted_retries_message(branch, "source"))
                 }
             }

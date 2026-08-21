@@ -346,7 +346,7 @@ fn start_source_to_dest(
             PushMode::FastForwardOnly,
         )? {
             git::PushOutcome::Accepted => {}
-            git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
+            git::PushOutcome::RejectedRefMoved => anyhow::bail!(
                 "gitprism resolve: clean source-to-dest commits before {source_oid} lost a fast-forward race; run sync again"
             ),
         }
@@ -627,7 +627,7 @@ fn finish_source_to_dest(
             }
             Ok(())
         }
-        git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
+        git::PushOutcome::RejectedRefMoved => anyhow::bail!(
             "gitprism resolve: source-to-dest resolution committed locally as {new_dest}, but dest moved; copy or save the staged resolution from {}, remove that linked worktree, rerun `gitprism resolve <branch> --direction source-to-dest` against the new destination, then reapply the resolution",
             operation.worktree.display()
         ),
@@ -1353,7 +1353,7 @@ fn finish(
         PushMode::FastForwardOnly,
     )? {
         git::PushOutcome::Accepted => Ok(()),
-        git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
+        git::PushOutcome::RejectedRefMoved => anyhow::bail!(
             "gitprism resolve: {branch:?} was resolved and committed locally, but pushing it to the configured source remote was rejected as a non-fast-forward — fetch/rebase source and push {branch:?} manually"
         ),
     }
