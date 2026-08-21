@@ -1318,3 +1318,44 @@ it as an open design question.
 
 `cargo test`: 197 passed, 0 failed (up from 190). `cargo clippy --all-targets
 -- -D warnings`: clean. `cargo fmt --check`: clean.
+
+## 2026-08-21 — branch-additive exclusions
+
+**Update**: Added [decisions/0036](decisions/0036-branch-additive-exclusions.md).
+An external security review found a real disclosure path: decisions/0026
+loads one verified `ExcludeList` from the working tree per `sync` run and
+never loads a branch-tip version, confirmed in `src/commands/sync.rs::run`
+(~lines 101-103). A feature branch that adds sensitive content and
+correctly adds its own `.gitprismignore` entry excluding it has that
+instruction discarded — the content is mirrored to dest anyway — and per
+this file's own still-open "a file that already reached dest and is later
+added to `.gitprismignore` stays on dest forever" item, that disclosure is
+irreversible.
+
+Decided: effective source→dest exclusion becomes `trusted.is_excluded(path)
+|| branch.is_excluded(path)`, two independent `ExcludeList` matchers rather
+than one concatenated file — concatenation would let a branch's own `!`
+negation un-exclude trusted content, while independent matchers keep the
+branch list monotone (add-only). `branch` is the union of every
+`.gitprismignore` found across the commits being replayed for that branch
+this run, not the branch tip alone, so an exclusion added in an earlier
+commit can't be undone by a later one deleting the line — replayed content
+already reached dest by then. `branch` is deliberately outside
+`GITPRISM_POLICY_SHA256`: the digest is one static value with no per-branch
+dimension, and extending it to branch tips would just reproduce today's bug
+rather than fix it.
+
+Also records the amendment's own limits: a branch whose entire remaining
+content becomes covered by its own new exclusions filters to a no-op against
+a landing branch, so decisions/0018's `already_merged_into_a_landing_branch`
+classifies it as already-merged-and-cleaned-up and it is never created on
+dest — the leak moves rather than disappears, and 0018 already accepted this
+shape of tradeoff for a different cause. A branch that never adds an
+exclusion for sensitive content it introduces is still exported unchanged;
+gitprism cannot infer sensitivity. Checked `design/references/` for
+per-branch or additive-filtering precedent: none found among josh, Copybara,
+git-subtree, git-filter-repo, or jujutsu.
+
+No code changed in this commit. Implementation (an `ExcludeList` holding
+more than one matcher, reading `.gitprismignore` per replayed commit, and
+the enumerated test list) is a follow-up.
