@@ -565,13 +565,25 @@ fn sync_pair_to_dest_with_key(
             state_key,
         )?;
 
-        // `build.new_tip` is `None` both when the branch has nothing new to
-        // merge onto an existing dest ref (a genuine no-op) *and* when it's a
+        // `build.new_tip` is `None` in three cases: the branch has nothing
+        // new to merge onto an existing dest ref (a genuine no-op); it's a
         // brand-new branch with no commits of its own beyond whatever
         // graft/marker point it shares with dest (decisions/0017: still has
-        // to be created on dest). Only the latter needs `dest_tip` itself
-        // pushed — it's already the right content, just missing a ref name.
-        let new_dest_tip = build.new_tip.or((!dest_ref_exists).then_some(dest_tip));
+        // to be created on dest); or a detected rewrite's replacement
+        // commits built nothing at all — either `pending_commits` was empty
+        // (source was reset straight back to a commit already carrying a
+        // marker) or every pending commit filtered to no change against the
+        // rebuild base. The first case alone is a genuine no-op; the other
+        // two still need `dest_tip` pushed — for a fresh branch it's already
+        // the right content, just missing a ref name, and for a detected
+        // rewrite `dest_tip` here is `rebuild_dest_tip`, the graft-derived
+        // base dest must be rewound to (decisions/0039's addendum: a rewrite
+        // that rebuilds to the base is still a rewrite, not a no-op, even
+        // when the base and the built chain happen to coincide).
+        let force_rebuild = matches!(push_mode, PushMode::ForceMirrorOnly { .. });
+        let new_dest_tip = build
+            .new_tip
+            .or((force_rebuild || !dest_ref_exists).then_some(dest_tip));
 
         if let Some(new_dest_tip) = new_dest_tip {
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
@@ -630,7 +642,16 @@ fn sync_pair_to_dest_with_key(
             branch,
             Direction::SourceToDest,
             round_tripped,
-            (new_dest_tip.is_none()).then_some("up to date, nothing to sync"),
+            if new_dest_tip.is_none() {
+                Some("up to date, nothing to sync")
+            } else if force_rebuild && build.new_tip.is_none() {
+                // Honest about what actually happened: dest's ref moved, but
+                // to the shared rebuild base, not to a newly built commit —
+                // must not read as "N new commits pushed" when none were.
+                Some("rebuilt from the shared graft; no new commits were needed")
+            } else {
+                None
+            },
         );
         return Ok(false);
     }
@@ -7479,6 +7500,199 @@ mod tests {
         assert!(
             tree.get_name("extra.txt").is_none(),
             "content only reachable through the discarded branch state must not survive"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_rewinds_a_mirror_only_branch_reset_all_the_way_back_to_the_shared_graft() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "one\n")]);
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "two\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror both commits to dest");
+        assert!(
+            dest_repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_name("feature.txt")
+                .is_some()
+        );
+
+        // The commonest rewrite shape: `git reset --hard` straight back to a
+        // commit that already carries a Gitprism-Dest-Commit trailer (here,
+        // the shared graft itself), with no new commit of its own. Source's
+        // own graft-derived rebuild boundary now equals source's own tip, so
+        // `pending_commits` finds nothing to build — the bug this test
+        // guards against is `build_pending_dest_tip` reporting `new_tip:
+        // None` and the caller then pushing nothing at all, leaving dest
+        // silently holding the discarded history forever.
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+            .unwrap();
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("a rewrite that rebuilds to the shared base must still be pushed");
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            rebuilt.id(),
+            dest_tip,
+            "dest must be rewound to the graft-derived rebuild base even though no commit was constructed"
+        );
+        assert!(
+            rebuilt.tree().unwrap().get_name("feature.txt").is_none(),
+            "the discarded commits' content must not survive on dest"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_rewinds_a_mirror_only_branch_when_the_rewrite_filters_to_no_changes() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(
+            dest_dir.path(),
+            "main",
+            &[("shared.txt", "v1"), (exclude::FILENAME, "secret.txt\n")],
+        );
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("feature.txt", "original\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror feature.txt to dest");
+        assert!(
+            dest_repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_name("feature.txt")
+                .is_some()
+        );
+
+        // Reset back to the shared graft and replace the discarded commit
+        // with one that only touches an already-excluded path. `pending` is
+        // non-empty this time, but the one pending commit filters to no
+        // change against the rebuild base (requirements/0001's "must not
+        // push an empty commit"), so `build_pending_dest_tip` still
+        // constructs no commit — a second, distinct way to reach `new_tip:
+        // None` from the first test's.
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+            .unwrap();
+        add_commit(&source_repo, "feature-x", &[("secret.txt", "ignored\n")]);
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter).expect(
+            "a rewrite whose replacement commits all filter to no changes must still rewind dest",
+        );
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            rebuilt.id(),
+            dest_tip,
+            "dest must be rewound to the graft-derived rebuild base even though no commit was constructed"
+        );
+        assert!(rebuilt.tree().unwrap().get_name("feature.txt").is_none());
+        assert!(
+            rebuilt.tree().unwrap().get_name("secret.txt").is_none(),
+            "an excluded path must never reach dest"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_pushes_nothing_for_a_round_tripped_branch_already_up_to_date() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let _source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        // A round-tripped branch, no rewrite involved at all — this is
+        // `FastForwardOnly`'s own `(!dest_ref_exists).then_some(dest_tip)`
+        // fallback, which must stay byte-identical: `dest_ref_exists` is
+        // `true` here, so nothing pending must mean nothing pushed.
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "main", &reporter)
+            .expect("a fresh graft with no source-side commits of its own has nothing to sync");
+
+        let still = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            still.id(),
+            dest_tip,
+            "a round-tripped branch with nothing pending must not have its dest ref touched"
         );
     }
 

@@ -1684,3 +1684,53 @@ Oid` field. Revises decisions/0038's blanket "no lease mechanism anywhere"
 conclusion for mirror-only force only — a lease still must never enable
 force on a round-tripped branch — annotated in place the same way `119c16b`
 annotated 0038's retry-escalation passages. No code changed.
+
+## 2026-08-21 — mirror-only force implemented as a compare-and-swap lease
+
+**Update**: Implemented [decisions/0040](decisions/0040-mirror-only-force-is-a-compare-and-swap-lease.md).
+`PushMode::ForceMirrorOnly` now carries a required `expected_dest: Oid` and
+`git::push` sends it as `--force-with-lease=refs/heads/<branch>:<expected_dest>`
+with a plain, non-`+`-prefixed refspec, instead of the old unconditional `+`
+force. `expected_dest` is the dest tip `sync_pair_to_dest_with_key` actually
+fetched, captured before the `match` that later rebinds `dest_tip` to the
+graft-derived rebuild base — using the post-match value would have made
+every lease compare against the wrong OID and force would never fire.
+Verified against real git that a stale lease is rejected with the same `!`
+/ `[rejected]` porcelain shape a plain non-fast-forward rejection uses, so
+it already routes into decisions/0009's retry loop with no new plumbing —
+also caught, only by testing against a real local remote, that the lease
+flag must precede the `--` operand separator or git parses it as a literal
+positional refspec instead of an option. `PushOutcome::RejectedNotFastForward`
+and `is_non_fast_forward_rejection` are renamed to `RejectedRefMoved` and
+`is_ref_moved_rejection`, since a stale lease is not literally a
+non-fast-forward rejection and the old names would read as proof the retry
+arm is dead code for a forced push.
+
+Verification: `cargo test` — 218 passed, 0 failed (baseline 217 plus 1 net
+new: one unit-like `ForceMirrorOnly` test replaced by two lease tests, two
+`push_refspec` tests replaced by two `push_args` tests). `cargo clippy
+--all-targets -- -D warnings` — clean. `cargo fmt --check` — clean.
+
+## 2026-08-21 — a rewrite that rebuilds to the base is still pushed
+
+**Update**: Fixed `sync_pair_to_dest_with_key` computing `new_dest_tip` as
+`build.new_tip.or((!dest_ref_exists).then_some(dest_tip))` unconditionally,
+including in decisions/0039's detected-rewrite arm, where `dest_ref_exists`
+is always `true` — the expression there reduced to `build.new_tip.or(None)`,
+so whenever `build_pending_dest_tip` constructed no commit (a `git reset
+--hard` back to a commit that already carries a `Gitprism-Dest-Commit`
+trailer, or a rewrite whose replacement commits all filter to no change
+against the rebuild base — the commonest rewrite shape, not an edge case),
+nothing was pushed at all and dest silently kept the discarded pre-rewrite
+history while the run reported success. The fallback to `dest_tip` (in this
+arm, the graft-derived `rebuild_dest_tip`) now also applies whenever the
+push mode is `ForceMirrorOnly`, regardless of whether a commit was built;
+`FastForwardOnly`'s own fallback, which only ever covers a genuinely
+brand-new branch, is untouched. The reporter's completion note for this
+specific case now says dest was rebuilt from the shared graft with no new
+commits needed, rather than reusing generic done/skip wording that could
+read as commits having been pushed. Addendum recorded in decisions/0039.
+
+Verification: `cargo test` — 221 passed, 0 failed (baseline 218 plus 3 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
+clean.

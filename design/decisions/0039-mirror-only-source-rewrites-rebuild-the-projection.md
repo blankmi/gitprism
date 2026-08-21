@@ -289,3 +289,50 @@ force path described in Context — the investigation stopped 0038's
 implementation and produced this decision instead of a workaround. 0038's
 `PushMode` enum, its call-site classification, and this decision's rewrite
 detection and rebuild path are all still to be implemented together.
+
+# Addendum: the rebuild base is pushed even when no commit is constructed
+
+An external review found that `sync_pair_to_dest`'s original implementation
+computed `new_dest_tip` as `build.new_tip.or((!dest_ref_exists).then_some(dest_tip))`
+unconditionally, including in the detected-rewrite arm. In that arm
+`dest_ref_exists` is always `true`, so the expression reduces to
+`build.new_tip.or(None)`: whenever `build_pending_dest_tip` didn't actually
+construct a commit, nothing was pushed at all, and dest silently kept the
+discarded pre-rewrite history while the run still reported success.
+
+This is not a rare edge case. It is the shape of the single commonest
+rewrite there is — `git reset --hard` to an earlier commit, then a
+force-push with no new commit of its own. When the branch is reset straight
+back to a commit that already carries a `Gitprism-Dest-Commit` trailer (the
+shared graft, most often), the rebuild's own boundary
+(`newest_dest_marker_opt_for_branch`) equals source's new tip exactly, so
+`pending_commits(boundary, source_tip)` is empty and `build_pending_dest_tip`
+never enters its loop. A second, distinct way to reach the same `new_tip:
+None` result: `pending` is non-empty, but every pending commit's merge, once
+filtered, nets to no tree change against the rebuild base (the loop's own
+`if merged == parent_commit.tree_id() { continue; }`, kept from
+requirements/0001's "must not push an empty commit") — e.g. a rewrite whose
+replacement commits touch only excluded paths.
+
+The fix: when the push mode is `ForceMirrorOnly` (i.e. this arm's detected
+rewrite, not the ordinary `!dest_ref_exists` no-op case this decision's
+`(!dest_ref_exists).then_some(dest_tip)` fallback already handled), the same
+fallback to `dest_tip` — which in this arm is the graft-derived
+`rebuild_dest_tip`, not dest's stale fetched tip — applies regardless of
+whether `build_pending_dest_tip` constructed anything. A detected rewrite
+with nothing to build is still a rewrite: dest's projection must be rewound
+to the shared base source's current history now supports, not left pointing
+at history source itself has disowned. `FastForwardOnly`'s own fallback is
+untouched — it only ever applies to a genuinely brand-new branch, per this
+decision's original text, and stays exactly `(!dest_ref_exists).then_some(dest_tip)`.
+
+The reporter's completion line for this specific case (dest's ref moved, but
+to the rebuild base, not to a newly built commit) says so plainly — "rebuilt
+from the shared graft; no new commits were needed" — rather than the
+ordinary done/skip wording, so a rewind is never misread as new commits
+having been pushed.
+
+No condition, boundary computation, or rewrite-detection logic changes;
+this addendum only corrects what happens with the boundary and rebuild base
+this decision already established once `build_pending_dest_tip` reports
+nothing to build from them.
