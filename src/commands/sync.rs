@@ -526,9 +526,7 @@ fn sync_pair_to_dest_with_key(
                 // conveys round-trip vs. mirror-only (decisions/0020) — the
                 // note is for the reason, not a restatement of what the
                 // color already showed.
-                Some(&format!(
-                    "already merged into {landing:?}, cleaned up there"
-                )),
+                Some(&mirror_only_skip_note(&landing)),
             );
             return Ok(false);
         }
@@ -719,6 +717,17 @@ fn policy_mismatch_message(branch: &str, mismatch: &PolicyMismatch) -> String {
          or reconcile the branch so its {} matches exactly",
         mismatch.commit, mismatch.filename, mismatch.filename
     )
+}
+
+/// decisions/0018 Case 2's skip note: `already_merged_into_a_landing_branch`
+/// only ever tells us the branch's filtered content is already fully present
+/// in `landing` — it cannot tell a branch genuinely merged via a PR and
+/// cleaned up on dest apart from one that never had a dest ref at all
+/// (decisions/0018's own "indistinguishable by ref/ancestry alone"). The note
+/// must therefore state only that observation, not assert deletion or prior
+/// existence on dest.
+fn mirror_only_skip_note(landing: &str) -> String {
+    format!("its filtered content is already fully present in {landing:?}")
 }
 
 /// The first commit in a direction's pending list that couldn't be merged
@@ -7519,6 +7528,22 @@ mod tests {
                     "must not prescribe a specific reconciliation method ({method}): {message}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mirror_only_skip_note_names_the_landing_branch_and_asserts_no_deletion_or_prior_existence() {
+        let note = mirror_only_skip_note("main");
+        assert!(
+            note.contains("\"main\""),
+            "must name the landing branch: {note}"
+        );
+        let lower = note.to_lowercase();
+        for claim in ["delet", "clean", "existed", "existing", "recreat"] {
+            assert!(
+                !lower.contains(claim),
+                "must not claim deletion, cleanup, or prior existence on dest ({claim}): {note}"
+            );
         }
     }
 }

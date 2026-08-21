@@ -1613,3 +1613,31 @@ exercises the new `PushMode` API.
 Verification: `cargo test` — 213 passed, 0 failed (baseline 203 plus 10 new:
 3 in `git.rs`, 7 in `sync.rs`). `cargo clippy --all-targets -- -D warnings` —
 clean. `cargo fmt --check` — clean after `cargo fmt`.
+
+## 2026-08-21 — mirror-only skip message states what was observed
+
+**Update**: `sync_pair_to_dest_with_key`'s decisions/0018 Case 2 skip note
+read "already merged into {landing:?}, cleaned up there" — asserting a
+deletion that may never have happened, since the same note fires for a
+branch that never had a dest ref at all (its filtered content simply
+coincides with the landing branch's). Replaced with a new pure function,
+`mirror_only_skip_note(landing)` (`src/commands/sync.rs`), returning "its
+filtered content is already fully present in {landing:?}" — true in both
+cases the classification covers, with no claim of deletion, cleanup, or
+prior existence on dest. Unit-tested directly
+(`mirror_only_skip_note_names_the_landing_branch_and_asserts_no_deletion_or_prior_existence`),
+following the precedent already set by `policy_mismatch_message` and
+`divergence_after_exhausted_retries_message`: extract the note, test the
+pure function, since the reporter has no capturing sink. No existing test
+asserted the old wording as a behavioral expectation, so none needed
+updating. `decisions/0037`'s note that this correction was "a separate,
+still-open item" is updated to record it as resolved; `decisions/0018`
+itself never quoted the old string verbatim, so it needed no change.
+`decisions/0020`'s two verbatim quotes of the pre-indicatif `eprintln!`
+output (its own historical "today's call sites" example, dated before this
+fix) were left as-is — they document what the code said at the time that
+decision was written, not a claim about current wording.
+
+Verification: `cargo test` — 214 passed, 0 failed (baseline 213 plus 1 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
+clean.

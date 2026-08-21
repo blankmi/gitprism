@@ -171,10 +171,12 @@ file still differs from the pin. Once the operator has updated
 `GITPRISM_POLICY_SHA256` and the working tree carries the approved policy, a
 branch holding that same new file matches the pin, does not halt, and — since
 both control files are self-excluded (`src/exclude.rs`) — still filters to a
-no-op and is still reported as "already merged into … , cleaned up there"
-despite never having existed on dest. Correcting that message is a separate,
-still-open item; this decision fixes the variant where safety could not be
-established, not the wording of the benign one.
+no-op and was, at the time this decision was written, still reported as
+"already merged into … , cleaned up there" despite never having existed on
+dest. Correcting that message was a separate item, since resolved (the note
+no longer claims deletion or prior existence); this decision fixes the
+variant where safety could not be established, not the wording of the benign
+one.
 
 # Consequences
 
