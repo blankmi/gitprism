@@ -231,3 +231,30 @@ directly: no per-branch or per-commit additive/consistency filtering
 precedent exists among josh, Copybara, git-subtree, git-filter-repo, or
 jujutsu. Where 0036 read that absence as license to invent one, this decision
 reads the same absence, under the new `AGENTS.md` rule, as the reason not to.
+
+# Addendum: an unreadable control-file entry is that branch's mismatch, not the whole run's
+
+`read_control_file_blob` (`src/commands/sync.rs`) originally only handled two
+outcomes for a tree entry: absent, or a blob whose bytes it returned for
+comparison. A pending commit whose `.gitprismignore`/`.gitprism.toml` entry
+was a directory or a submodule gitlink made `repo.find_blob` fail, and a blob
+over `MAX_CONTROL_FILE_BYTES` hit an `anyhow::bail!` — both propagated via `?`
+straight out of `find_control_file_policy_mismatch`, `sync_pair_to_dest_with_key`,
+and `run` itself, aborting the entire invocation before any later branch got
+its turn.
+
+That contradicted this decision's own per-branch guarantee: safety not being
+establishable for one branch's pending commit is exactly the shape this
+decision already classifies as *that branch's* mismatch (`Outcome::Error`,
+per-branch halt, run continues, non-zero exit at the end) — not a run-wide
+abort that lets one branch's malformed tree deny service to every other
+branch. A non-blob entry or an oversized blob is safety-not-established in
+the same sense a differing byte sequence is; neither can be compared against
+the pinned policy, so neither can be trusted.
+
+`read_control_file_blob` now returns a classification (`ControlFileRead`:
+absent, blob, not-a-regular-file, too-large) instead of erroring on the
+latter two, and `find_control_file_policy_mismatch` maps them onto a
+`PolicyMismatchReason` so the operator-facing message states what was
+actually wrong instead of always claiming a byte mismatch. Absence is
+unaffected — still not a mismatch.

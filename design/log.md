@@ -1642,6 +1642,14 @@ Verification: `cargo test` — 214 passed, 0 failed (baseline 213 plus 1 new).
 `cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
 clean.
 
+## 2026-08-21 — unreadable control-file entry stays a per-branch mismatch
+
+**Update**: Fixed `read_control_file_blob` (`src/commands/sync.rs`) aborting the whole `run` — instead of just that branch (decisions/0037) — when a pending commit's `.gitprismignore`/`.gitprism.toml` was a directory/gitlink (`find_blob` failing) or over `MAX_CONTROL_FILE_BYTES` (`anyhow::bail!`); both now classify as that branch's `PolicyMismatch` via a new `PolicyMismatchReason`, and `policy_mismatch_message` states the actual reason. Addendum recorded in `decisions/0037`.
+
+Verification: `cargo test` — 217 passed, 0 failed (baseline 214 plus 3 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
+clean.
+
 ## 2026-08-21 — 0038 amended to flag its own overturned retry-escalation framing
 
 **Update**: [decisions/0038](decisions/0038-branch-authority-determines-whether-history-may-be-rewritten.md)

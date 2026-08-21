@@ -619,17 +619,27 @@ fn sync_pair_to_dest_with_key(
 struct PolicyMismatch {
     commit: Oid,
     filename: &'static str,
+    reason: PolicyMismatchReason,
+}
+
+enum PolicyMismatchReason {
+    DiffersFromPinnedPolicy,
+    NotARegularFile,
+    ExceedsSizeLimit,
 }
 
 /// Whether any commit in `pending` — already filtered the same way
 /// [`build_pending_dest_tip`] filters its own loop-prevented commits, so this
 /// only ever inspects commits that would actually be replayed — carries a
-/// `.gitprismignore` or `.gitprism.toml` whose bytes differ from the
-/// digest-verified pinned policy (decisions/0037). A commit whose tree has no
-/// entry for a filename is never a mismatch: the trusted policy already
-/// governs that commit regardless of what its own tree contains, so absence
-/// can't weaken anything. Only a present-and-different file halts, reported
-/// for the first such commit found (oldest first, matching replay order).
+/// `.gitprismignore` or `.gitprism.toml` that either can't be read and
+/// compared at all (a non-blob entry, or a blob over the size limit) or
+/// whose bytes differ from the digest-verified pinned policy (decisions/0037,
+/// with an addendum: safety not being establishable is classified the same
+/// way as bytes actively disagreeing). A commit whose tree has no entry for a
+/// filename is never a mismatch: the trusted policy already governs that
+/// commit regardless of what its own tree contains, so absence can't weaken
+/// anything. Only the first such commit found (oldest first, matching replay
+/// order) is reported.
 fn find_control_file_policy_mismatch(
     repo: &Repository,
     pending: &[Oid],
@@ -666,44 +676,64 @@ fn find_control_file_policy_mismatch(
             (exclude::FILENAME, ignore_raw.as_bytes()),
             (crate::config::FILENAME, config_raw.as_bytes()),
         ] {
-            if let Some(bytes) = read_control_file_blob(repo, &tree, filename, commit_oid)?
-                && bytes != pinned
-            {
-                return Ok(Some(PolicyMismatch {
-                    commit: commit_oid,
-                    filename,
-                }));
-            }
+            let reason = match read_control_file_blob(repo, &tree, filename, commit_oid)? {
+                ControlFileRead::Absent => continue,
+                ControlFileRead::Blob(bytes) if bytes == pinned => continue,
+                ControlFileRead::Blob(_) => PolicyMismatchReason::DiffersFromPinnedPolicy,
+                ControlFileRead::NotARegularFile => PolicyMismatchReason::NotARegularFile,
+                ControlFileRead::TooLarge => PolicyMismatchReason::ExceedsSizeLimit,
+            };
+            return Ok(Some(PolicyMismatch {
+                commit: commit_oid,
+                filename,
+                reason,
+            }));
         }
     }
     Ok(None)
 }
 
-/// Reads `filename`'s blob straight from `tree`'s root, bounded by
+/// What [`read_control_file_blob`] found at a tree entry: whether it's
+/// missing, a comparable blob, or something safety can't be established for
+/// at all. The latter two cases (a non-blob entry, or a blob over the size
+/// limit) are still this branch's problem to report, not this function's —
+/// it never errors for them, since an unreadable entry in one pending
+/// commit's tree must not abort every other branch's sync (decisions/0037's
+/// addendum).
+enum ControlFileRead {
+    Absent,
+    Blob(Vec<u8>),
+    NotARegularFile,
+    TooLarge,
+}
+
+/// Reads `filename`'s entry straight from `tree`'s root, bounded by
 /// decisions/0032's existing `MAX_CONTROL_FILE_BYTES` — the same limit every
-/// other control-file read in gitprism already respects — or `None` if the
-/// tree has no entry for it at all. Absence is the caller's concern, not
-/// this function's: decisions/0037 treats a missing control file as "not a
-/// mismatch," never as an empty one.
+/// other control-file read in gitprism already respects. Absence is the
+/// caller's concern, not this function's: decisions/0037 treats a missing
+/// control file as "not a mismatch," never as an empty one. An entry that
+/// isn't a blob (a directory or a submodule gitlink) is reported rather than
+/// passed to `find_blob`, which would otherwise fail with an ODB type
+/// mismatch for a condition that isn't actually an I/O error.
 fn read_control_file_blob(
     repo: &Repository,
     tree: &git2::Tree,
     filename: &str,
     commit: Oid,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<ControlFileRead> {
     let Some(entry) = tree.get_name(filename) else {
-        return Ok(None);
+        return Ok(ControlFileRead::Absent);
     };
+    if entry.kind() != Some(git2::ObjectType::Blob) {
+        return Ok(ControlFileRead::NotARegularFile);
+    }
     let blob = repo
         .find_blob(entry.id())
         .with_context(|| format!("reading {filename}'s blob at commit {commit}"))?;
     if blob.size() > limits::MAX_CONTROL_FILE_BYTES {
-        anyhow::bail!(
-            "{filename} at commit {commit} exceeds the {} byte limit",
-            limits::MAX_CONTROL_FILE_BYTES
-        );
+        return Ok(ControlFileRead::TooLarge);
     }
-    Ok(Some(blob.content().to_vec()))
+    Ok(ControlFileRead::Blob(blob.content().to_vec()))
 }
 
 /// The operator-facing message for a halted branch (decisions/0037): names
@@ -711,11 +741,27 @@ fn read_control_file_blob(
 /// the remedy — update the pinned digest to the approved policy, or
 /// reconcile the branch.
 fn policy_mismatch_message(branch: &str, mismatch: &PolicyMismatch) -> String {
+    let problem = match mismatch.reason {
+        PolicyMismatchReason::DiffersFromPinnedPolicy => {
+            format!(
+                "carries a {} that differs from the pinned policy",
+                mismatch.filename
+            )
+        }
+        PolicyMismatchReason::NotARegularFile => {
+            format!("carries a {} that is not a regular file", mismatch.filename)
+        }
+        PolicyMismatchReason::ExceedsSizeLimit => format!(
+            "carries a {} that exceeds the {} byte limit",
+            mismatch.filename,
+            limits::MAX_CONTROL_FILE_BYTES
+        ),
+    };
     format!(
-        "{branch:?} halted — commit {} carries a {} that differs from the pinned policy; \
+        "{branch:?} halted — commit {} {problem}; \
          update GITPRISM_POLICY_SHA256 to the approved policy (via `gitprism policy-hash`) \
          or reconcile the branch so its {} matches exactly",
-        mismatch.commit, mismatch.filename, mismatch.filename
+        mismatch.commit, mismatch.filename
     )
 }
 
@@ -6991,6 +7037,193 @@ mod tests {
         );
     }
 
+    /// Builds a pending commit on `branch` whose `.gitprismignore` entry is a
+    /// directory rather than a blob — deliberately not run through
+    /// `refresh_checked_out_branch`, so the working tree keeps reflecting
+    /// whichever control file was pinned by the last real commit. Only the
+    /// git history, not the checkout, needs to carry the malformed tree for
+    /// the pending-commit scan to find it; checking it out would also break
+    /// `policy::load`'s own read of the pin before any branch is ever
+    /// replayed.
+    fn add_commit_with_gitprismignore_as_a_directory(repo: &Repository, branch: &str) -> Oid {
+        let tip = repo
+            .find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut subtree_builder = repo.treebuilder(None).unwrap();
+        let blob = repo.blob(b"unexpected\n").unwrap();
+        subtree_builder
+            .insert("unexpected.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let subtree = subtree_builder.write().unwrap();
+
+        let mut builder = repo.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+        builder
+            .insert(exclude::FILENAME, subtree, git2::FileMode::Tree.into())
+            .unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &signature,
+            &signature,
+            "replace the control file with a directory",
+            &tree,
+            &[&tip],
+        )
+        .unwrap()
+    }
+
+    /// Same shape as [`add_commit_with_gitprismignore_as_a_directory`], but
+    /// the entry stays a blob and instead grows past
+    /// `limits::MAX_CONTROL_FILE_BYTES`.
+    fn add_commit_with_oversized_gitprismignore(repo: &Repository, branch: &str) -> Oid {
+        let tip = repo
+            .find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let oversized = vec![b'a'; limits::MAX_CONTROL_FILE_BYTES + 1];
+        let blob = repo.blob(&oversized).unwrap();
+        let mut builder = repo.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+        builder
+            .insert(exclude::FILENAME, blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &signature,
+            &signature,
+            "grow the control file past the size limit",
+            &tree,
+            &[&tip],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_continues_other_branches_and_fails_overall_when_one_branchs_control_file_is_a_directory()
+    {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A healthy mirror-only branch with no control files at all — must
+        // still sync even though "main" (sorted before it) is about to halt.
+        source_repo
+            .branch("other", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "other", &[("other.txt", "content\n")]);
+
+        // "main" pins a normal policy via its own tip content, then a pending
+        // commit replaces the control file with a directory — unreadable as a
+        // blob at all, let alone comparable to the pin.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.log\n")]);
+        add_commit_with_gitprismignore_as_a_directory(&source_repo, "main");
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let err = run(source_dir.path(), config.path()).expect_err(
+            "a branch whose pending commit turns the control file into a directory must fail the overall run",
+        );
+        assert!(
+            format!("{err:#}").to_lowercase().contains("polic"),
+            "the run's own error should mention the policy mismatch: {err:#}"
+        );
+
+        assert!(
+            dest_repo
+                .find_branch("other", git2::BranchType::Local)
+                .is_ok(),
+            "other branches must still sync when one branch halts because its control file isn't a regular file"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "nothing must be pushed to dest for the halted branch"
+        );
+    }
+
+    #[test]
+    fn run_continues_other_branches_and_fails_overall_when_one_branchs_control_file_exceeds_the_size_limit()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A healthy mirror-only branch with no control files at all — must
+        // still sync even though "main" (sorted before it) is about to halt.
+        source_repo
+            .branch("other", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "other", &[("other.txt", "content\n")]);
+
+        // "main" pins a normal policy via its own tip content, then a pending
+        // commit grows the control file past the byte limit.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.log\n")]);
+        add_commit_with_oversized_gitprismignore(&source_repo, "main");
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let err = run(source_dir.path(), config.path()).expect_err(
+            "a branch whose pending commit's control file exceeds the size limit must fail the overall run",
+        );
+        assert!(
+            format!("{err:#}").to_lowercase().contains("polic"),
+            "the run's own error should mention the policy mismatch: {err:#}"
+        );
+
+        assert!(
+            dest_repo
+                .find_branch("other", git2::BranchType::Local)
+                .is_ok(),
+            "other branches must still sync when one branch halts because its control file exceeds the size limit"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "nothing must be pushed to dest for the halted branch"
+        );
+    }
+
     // decisions/0039: a rewritten mirror-only source branch rebuilds its dest
     // projection instead of being refused. Three distinct fixtures below —
     // rebase, amend, hard reset — all reduce to the same underlying shape
@@ -7543,6 +7776,73 @@ mod tests {
             assert!(
                 !lower.contains(claim),
                 "must not claim deletion, cleanup, or prior existence on dest ({claim}): {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_mismatch_message_states_the_actual_reason_for_each_variant() {
+        let commit = Oid::from_str("0000000000000000000000000000000000000abc").unwrap();
+
+        let differs = policy_mismatch_message(
+            "main",
+            &PolicyMismatch {
+                commit,
+                filename: exclude::FILENAME,
+                reason: PolicyMismatchReason::DiffersFromPinnedPolicy,
+            },
+        );
+        assert!(
+            differs.contains("\"main\""),
+            "must name the branch: {differs}"
+        );
+        assert!(
+            differs.contains(&format!("{commit}")),
+            "must name the commit: {differs}"
+        );
+        assert!(
+            differs.contains("that differs from the pinned policy"),
+            "existing differing-bytes wording must survive unchanged: {differs}"
+        );
+
+        let not_regular = policy_mismatch_message(
+            "main",
+            &PolicyMismatch {
+                commit,
+                filename: exclude::FILENAME,
+                reason: PolicyMismatchReason::NotARegularFile,
+            },
+        );
+        assert!(
+            not_regular.contains("is not a regular file"),
+            "must state the entry could not be read as a control file: {not_regular}"
+        );
+        assert!(
+            !not_regular.contains("differs from the pinned policy"),
+            "must not claim a byte comparison that never happened: {not_regular}"
+        );
+
+        let too_large = policy_mismatch_message(
+            "main",
+            &PolicyMismatch {
+                commit,
+                filename: crate::config::FILENAME,
+                reason: PolicyMismatchReason::ExceedsSizeLimit,
+            },
+        );
+        assert!(
+            too_large.contains("exceeds"),
+            "must state the size limit was exceeded: {too_large}"
+        );
+        assert!(
+            !too_large.contains("differs from the pinned policy"),
+            "must not claim a byte comparison that never happened: {too_large}"
+        );
+
+        for message in [&differs, &not_regular, &too_large] {
+            assert!(
+                message.contains("GITPRISM_POLICY_SHA256"),
+                "every variant must still point to the remedy: {message}"
             );
         }
     }
