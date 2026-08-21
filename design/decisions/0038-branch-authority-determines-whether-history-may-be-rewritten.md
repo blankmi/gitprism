@@ -1,11 +1,28 @@
 ---
 type: Decision
 title: Branch authority, not push direction, determines whether history may be rewritten
-description: Round-tripped branches (config.branches) are shared history, fast-forward-only in both directions; persistent divergence is an operator boundary. Mirror-only branches are a one-way projection of source and may be force-updated to match a deliberately rewritten source branch, but only after decisions/0009's bounded refetch-and-recompute is exhausted. No lease mechanism (--force-with-lease) is adopted for any branch type. Formalizes requirements/0001 step 3 as amended in cdac783.
+description: Round-tripped branches (config.branches) are shared history, fast-forward-only in both directions; persistent divergence is an operator boundary. Mirror-only branches are a one-way projection of source and may be force-updated to match a deliberately rewritten source branch (trigger condition superseded by decisions/0039). No lease mechanism (--force-with-lease) is adopted for any branch type. Formalizes requirements/0001 step 3 as amended in cdac783.
 tags: [architecture, push, concurrency, branches]
 status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
 ---
+
+> **Superseded in part by [decisions/0039](0039-mirror-only-source-rewrites-rebuild-the-projection.md).**
+> This decision's retry-escalation framing for mirror-only force — "force
+> only once decisions/0009's bounded refetch-and-recompute is exhausted" —
+> is overturned. 0039 requires a rewritten mirror-only branch to be
+> **positively detected** by four direct conditions, checked before any push
+> is attempted; retry count never licenses force, and 0039 explicitly warns
+> against reading "force after exhausted retries" as a general escalation
+> policy. Passages below that still frame force that way are marked inline.
+>
+> **What this decision still decides, unedited by 0039:** branch authority
+> itself. Round-tripped branches (`config.branches`) remain shared history,
+> fast-forward-only in both directions, with persistent divergence handed to
+> the operator rather than resolved automatically. Mirror-only branches
+> remain a one-way projection of source that may be force-updated to reflect
+> a deliberate source-side rewrite. That table and its reasoning stand;
+> only the trigger for reaching the force path changed.
 
 # Context
 
@@ -105,6 +122,11 @@ is pushing.**
   does today, and force never triggers. Decisions/0009's mechanism is
   unchanged; this decision only defines what happens once its retries are
   exhausted, for mirror-only branches specifically.
+  **[Superseded by decisions/0039: this whole bullet's "exhaust retries,
+  then force" trigger is overturned. 0039 positively detects a rewrite via
+  four direct conditions before any push is attempted; a benign race is
+  still told apart from a real rewrite, but not by counting failed
+  attempts. See the supersession note at the top of this document.]**
 * **Force is opt-in and visible at the call site, not a separate helper.**
   `git::push` gains an explicit two-variant mode, e.g.:
   ```rust
@@ -125,6 +147,8 @@ is pushing.**
   * `sync.rs:509` (source→dest) — mode depends on whether `branch` is in
     `config.branches` at the time of this run: `FastForwardOnly` if so,
     `ForceMirrorOnly`-eligible (after retries exhaust) if not.
+    **[Superseded by decisions/0039: eligibility is a positively detected
+    rewrite, not "after retries exhaust."]**
   * `sync.rs:1404` (dest→source) — always `FastForwardOnly`; never
     eligible for `ForceMirrorOnly`, since only round-tripped branches reach
     this path.
@@ -162,6 +186,8 @@ is pushing.**
   a `+`-prefixed refspec; a mirror-only source→dest push, once its retries
   are exhausted against a genuinely rewritten source branch, may use
   `PushMode::ForceMirrorOnly`.
+  **[Superseded by decisions/0039: the trigger is a positively detected
+  rewrite, not exhausted retries — see the supersession note above.]**
 
 # Why
 
@@ -178,6 +204,9 @@ is pushing.**
   applies just as much to the mirror-only case. Force only changes what
   happens after recompute has already had its bounded chances and still
   disagrees with dest.
+  **[Superseded by decisions/0039: force is triggered by positively
+  detecting a rewrite, not by recompute's retries running out. Decisions/0009's
+  recompute-first behavior for a genuine race is unaffected either way.]**
 * **Explicit `PushMode` over a second helper function**, for the same
   reason decisions/0009 preferred recompute over rebase: don't hand-build a
   parallel path that can silently diverge from the primary one. A required
@@ -213,7 +242,12 @@ is pushing.**
   round-tripped or mirror-only, remains fast-forward: `ForceMirrorOnly`
   fires only in the rare case a human deliberately rewrote a mirror-only
   branch on source, and only after recompute has confirmed the divergence
-  is real rather than a race. A dest clone tracking a mirror-only branch
+  is real rather than a race.
+  **[Superseded by decisions/0039: "only after recompute has confirmed" is
+  the retry-escalation framing 0039 overturns — the rewrite is positively
+  detected before any push or recompute is attempted. The surrounding point
+  about force not becoming the steady-state mechanism still holds.]**
+  A dest clone tracking a mirror-only branch
   still needs to reset after such an event, exactly as any git mirror does
   after an upstream rewrite — but that event is exceptional operator
   action on source, not something every sync invocation does. The
@@ -230,6 +264,9 @@ is pushing.**
   (its 2026-08-20 addendum) all stand exactly as written. This decision
   adds only what happens once those retries are exhausted, for mirror-only
   branches — it does not supersede 0009.
+  **[Superseded by decisions/0039: what force is added *for* is a
+  positively detected rewrite, not "once retries are exhausted." 0009's own
+  mechanism is still unchanged, as stated.]**
 * **No lease mechanism anywhere.** `--force-with-lease` is not adopted for
   round-tripped pushes (would remove the fast-forward backstop they
   require) or for mirror-only force (where the force is already outright
@@ -246,6 +283,11 @@ is pushing.**
   existing call site to be touched and classified (enumerated in Decision)
   rather than defaulting silently.
 * **Tests the implementation commit must add:**
+  **[Superseded by decisions/0039: the two mirror-only cases below are
+  described here as "retries exhaust" / "within the retry bound," but 0039
+  requires them to exercise its four-condition positive detection instead —
+  see 0039's own, more detailed test list, which is what was actually
+  implemented.]**
   * a mirror-only source→dest branch whose source history was genuinely
     rewritten: retries exhaust with the same non-fast-forward each time,
     then `ForceMirrorOnly` succeeds and dest ends at source's rewritten

@@ -1641,3 +1641,21 @@ decision was written, not a claim about current wording.
 Verification: `cargo test` — 214 passed, 0 failed (baseline 213 plus 1 new).
 `cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
 clean.
+
+## 2026-08-21 — 0038 amended to flag its own overturned retry-escalation framing
+
+**Update**: [decisions/0038](decisions/0038-branch-authority-determines-whether-history-may-be-rewritten.md)
+still framed mirror-only force as "escalate after decisions/0009's retries
+are exhausted" throughout its front-matter description and body, despite
+[decisions/0039](decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md)
+explicitly overturning that framing as load-bearing (0039: "force is not an
+escalation after failed retries"). Left as-is, a `status: stable` record
+reads as current guidance and could lead a future reader to implement the
+rejected escalation shape without ever reaching 0039. Corrected the
+front-matter description, added a supersession note before `# Context`
+naming what 0039 overturned (the retry-escalation trigger) and what still
+stands (the branch-authority rule itself), and annotated every stale
+in-body passage inline with a bracketed pointer to 0039 rather than
+deleting or rewriting the original reasoning. `--force-with-lease` passages
+were left completely untouched — that question is under separate active
+review. No code changed.
