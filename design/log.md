@@ -1259,3 +1259,25 @@ Git as a command-line argument, so env-scrubbing does not make it secret. The
 decision itself — `[source].url`/`[dest].url` optional with env-var fallback —
 is unchanged; only the withdrawn rationale is superseded. Updated 0013's
 `design/decisions/index.md` entry to match. No code changed.
+
+## 2026-08-21 — pending history is first-parent
+
+**Update**: Added [decisions/0035](decisions/0035-pending-history-is-first-parent.md).
+An external review found, and this decision confirms by reproduction, that
+`pending_commits` walks the full DAG while `build_pending_dest_tip` and
+`build_pending_source_tip` derive their three-way-merge base from
+`parent(0)` — so a merge's own side-branch commits get replayed against a
+base tree the dest/source chain was never at, and a conflict a human already
+resolved inside the merge commit gets hard-stopped again on the side
+branch's own diff. `pending_commits` gains `Revwalk::simplify_first_parent()`,
+the same idiom decisions/0019 applied to the marker scans, closing the gap
+0019's own Consequences explicitly left open ("no change to
+`pending_commits` ... or `build_pending_dest_tip`/`build_pending_source_tip`'s
+own walks"). Also corrects this file's earlier claim, in the entry
+documenting decisions/0016, that the interleaved-branch churn had
+"disappear[ed]" — it hadn't; the test comment in
+`run_does_not_duplicate_a_no_ff_merges_content_on_dest`
+(`src/commands/sync.rs`, ~lines 3281-3288) still records it as an open
+design question, and this decision is what actually removes it. No code
+changed in this commit; the implementation and its test coverage are a
+follow-up.
