@@ -1359,3 +1359,39 @@ git-subtree, git-filter-repo, or jujutsu.
 No code changed in this commit. Implementation (an `ExcludeList` holding
 more than one matcher, reading `.gitprismignore` per replayed commit, and
 the enumerated test list) is a follow-up.
+
+## 2026-08-21 — branch policy mismatch fails closed
+
+**Update**: Added [decisions/0037](decisions/0037-branch-policy-mismatch-fails-closed.md),
+superseding [decisions/0036](decisions/0036-branch-additive-exclusions.md).
+`AGENTS.md` (commit `e213f72`) added a working-style rule preferring operator
+intervention over novel automation, defaulting to "stop and involve the
+operator" when Git has no safe primitive for the recovery and resolution
+would require guessing intent. 0036's own Prior art section already found no
+precedent for its proposed per-branch additive-exclusion union among josh,
+Copybara, git-subtree, git-filter-repo, or jujutsu, which makes it exactly
+the novel automation the new rule defaults against. The project owner chose
+fail-closed over the union.
+
+Decided: a source→dest branch replaying a commit whose `.gitprismignore` or
+`.gitprism.toml` is present and byte-differs from the digest-pinned,
+already-verified working-tree policy (decisions/0026) halts that branch —
+`Outcome::Error`, naming the branch, commit, offending file, and remedy
+(update `GITPRISM_POLICY_SHA256` or reconcile the branch) — while other
+branches keep syncing and the overall `sync` exit status is non-zero. Absence
+of a control file is not a mismatch, since the trusted policy already applies
+regardless of a commit's own content; only present-and-different is
+ambiguous. No second policy source is introduced: decisions/0026's one
+verified `ExcludeList` for every branch stands unchanged, and
+`already_merged_into_a_landing_branch` (`src/commands/sync.rs`, ~line 641) is
+confirmed untouched, so 0036's leak-moves-to-silent-non-mirroring side effect
+does not recur — a mismatching branch now halts loudly instead of vanishing.
+Also notes the sanctioned `GITPRISM_POLICY_SHA256`-change workflow (a
+control-file-only branch) now halts with an explicit message rather than
+risking silent already-merged classification, an improvement, and states
+plainly that every legitimate branch-level control-file change now needs
+operator action first — the cost the new rule accepts.
+
+No code changed in this commit. Implementation (threading
+`VerifiedPolicy.config_raw`/`ignore_raw` into `sync_pair_to_dest_with_key`,
+the per-commit comparison, and the enumerated test list) is a follow-up.

@@ -186,3 +186,14 @@ externally supplied path set for the whole rewrite. jujutsu doesn't do
 cross-repo filtering at all. No precedent found among the tools already
 reviewed for a second, untrusted, per-commit-additive exclusion source
 layered on top of a trusted one.
+
+## Superseded (2026-08-21): see decisions/0037
+
+**[decisions/0037](0037-branch-policy-mismatch-fails-closed.md)** replaces
+this decision's union with a fail-closed halt: a mismatching control file
+stops the branch instead of being merged into policy. This file's own Prior
+art section found no precedent for the union it proposed, and `AGENTS.md`
+(commit `e213f72`, added after this decision) now defaults novel automation
+of exactly that shape to "stop and involve the operator." The Context above
+— the disclosure path this decision diagnoses — is still correct and is
+referenced, not repeated, by 0037.
