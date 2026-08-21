@@ -320,11 +320,15 @@ three-way merge, and three-way merging an identical change is idempotent.
   another can hand a pair the other pair's marker.~~ — resolved, see
   [decisions/0019](decisions/0019-marker-scans-are-first-parent-only.md), which makes
   both scans first-parent-only rather than pair-qualifying the trailer itself.
-* `trailer_value` matches `Key: value` anywhere in a message rather than only in the
+* ~~`trailer_value` matches `Key: value` anywhere in a message rather than only in the
   final trailer block, so a commit message that merely *quotes* a trailer (a squash
   merge concatenating bodies, say) can poison the resume scan — verified: it stops the
   pair with "isn't an ancestor of dest's current tip", and that commit's content never
-  reaches dest.
+  reaches dest.~~ — resolved, see
+  [decisions/0025](decisions/0025-authenticated-mapping-markers.md), which makes resume
+  and loop-prevention trust only the single canonical final state block, authenticated
+  by an HMAC over the commit itself; a quoted trailer can't produce a valid MAC, so it
+  parses as ordinary text rather than a trusted marker.
 * A file that already reached dest and is *later* added to `.gitprismignore` stays on
   dest forever; the diff model has no delta to filter. decisions/0004's "apply the
   current list at processing time" reads as though it should be scrubbed, which would
@@ -1219,3 +1223,12 @@ on failure. The mutex is gone; no test anywhere else needed to change to
 stay correct. See 0034's Consequences section for detail. `cargo test`:
 190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
 --check`: clean.
+
+## 2026-08-21 — housekeeping
+
+**Update**: Struck the open question on `trailer_value` matching a quoted trailer
+anywhere in a message. It was stale:
+[decisions/0025](decisions/0025-authenticated-mapping-markers.md) already replaced
+that loose scan with a single canonical final state block that resume and
+loop-prevention only trust once its HMAC verifies, closing the exposure described.
+No code changed.
