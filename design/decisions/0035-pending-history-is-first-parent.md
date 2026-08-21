@@ -65,8 +65,9 @@ shape that actually reproduces the bug.
 
 `design/log.md` (the entry documenting decisions/0016) states that
 decision made the interleaved-branch churn "disappear". It didn't, fully:
-the test comment at `src/commands/sync.rs` around lines 3281-3288, in
-`run_does_not_duplicate_a_no_ff_merges_content_on_dest`, still records
+the test comment at `src/commands/sync.rs`, in
+`run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`,
+still records
 that "whichever branch the revwalk ... emits second yields a dest commit
 whose diff ... temporarily removes that other branch's file — restored
 again by the merge commit's own diff", calling it "an accepted, recorded
@@ -125,7 +126,8 @@ doesn't produce merges that way.
   every source branch is mirrored to dest under its own name regardless, so
   those commits still reach dest, just on their own branch rather than
   replayed a second time inside the landing branch's history.
-* Removes the interleaved-branch churn `run_does_not_duplicate_a_no_ff_merges_content_on_dest`'s
+* Removes the interleaved-branch churn
+  `run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`'s
   own comment still records as unresolved: a merge is now carried as one
   net change against its first parent instead of as a side branch's
   commits followed by a merge restoring what they temporarily removed.
@@ -139,7 +141,8 @@ doesn't produce merges that way.
 * **The interleaved-branch churn is resolved**, correcting `design/log.md`'s
   "disappear" claim about decisions/0016: that decision fixed duplication
   by changing *how* a commit is applied, not *which* commits are emitted,
-  so the churn described in `run_does_not_duplicate_a_no_ff_merges_content_on_dest`'s
+  so the churn described in
+  `run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`'s
   comment survived it. This decision removes the side-branch commits from
   the emitted set, which is what actually removes the churn.
 * **Side-branch commits no longer appear inside a landing branch's dest
