@@ -80,3 +80,31 @@ The committed configuration rejects unknown fields, empty committer identity,
 and empty, option-like, or control-bearing explicit URL values. Environment
 URLs remain lazy because they are intentionally resolved only when a direction
 needs its remote.
+
+## Addendum (2026-08-21): the env-var fallback is not a credential-secrecy mechanism
+
+**What this decision originally implied.** The Context section frames
+`GITPRISM_SOURCE_URL`/`GITPRISM_DEST_URL` as an appropriate home for
+credential-bearing URLs (`https://gitlab-ci-token:$TOKEN@...`), on the theory
+that committing such a URL into source's history is wrong "for the same reason
+secrets don't belong in a git repo at all."
+
+**Why that's wrong.** `fetch`, `remote_ref_exists`, and `push` in `src/git.rs`
+all pass the resolved URL to Git as a command-line argument. Scrubbing
+gitprism's own env vars from Git subprocess environments does not make that
+argument secret: argv is visible to any other process running as the same
+user (`ps`, `/proc/<pid>/cmdline` on Linux) and can end up captured in CI logs
+or crash reports. Env-var fallback keeps a URL out of source's *committed
+history*; it does not keep the URL confidential at runtime.
+
+**What still stands.** The decision itself is unchanged: `[source].url` and
+`[dest].url` remain optional, falling back to the env vars, resolved in the
+order this file already specifies. Only the credential-secrecy rationale is
+withdrawn. The surviving rationale is per-environment/per-deployment URLs
+(staging vs. a developer's own fork) that shouldn't be committed into source's
+history — nothing else about the mechanism changes.
+
+**Resulting guidance.** Repository URLs, whether in `.gitprism.toml` or in
+either env var, should never carry embedded credentials. Authentication
+belongs in an SSH key/agent, a Git credential helper, `GIT_ASKPASS`, or the CI
+platform's native Git authentication.

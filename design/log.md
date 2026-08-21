@@ -1250,3 +1250,12 @@ against; the per-environment rationale stays.
 [decisions/0013](decisions/0013-repo-urls-optional-fall-back-to-env-vars.md)
 states the same credential-bearing rationale in its Context section and was
 left unchanged — flagged for separate handling. No code changed.
+
+**Update**: Added a 2026-08-21 addendum to
+[decisions/0013](decisions/0013-repo-urls-optional-fall-back-to-env-vars.md)
+withdrawing its credential-secrecy rationale, the item flagged above:
+`fetch`/`remote_ref_exists`/`push` in `src/git.rs` pass the resolved URL to
+Git as a command-line argument, so env-scrubbing does not make it secret. The
+decision itself — `[source].url`/`[dest].url` optional with env-var fallback —
+is unchanged; only the withdrawn rationale is superseded. Updated 0013's
+`design/decisions/index.md` entry to match. No code changed.
