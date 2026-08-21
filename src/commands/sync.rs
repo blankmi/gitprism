@@ -2492,6 +2492,17 @@ mod tests {
         }
         repo.set_head(&format!("refs/heads/{branch}")).unwrap();
         repo.checkout_head(None).unwrap();
+        // decisions/0034: a real `setup` run restores the two control files
+        // byte-exact right after this same checkout, so a graft this helper
+        // fabricates must too — otherwise a host with `core.autocrlf=true`
+        // (Windows CI's default) mangles a checked-out `.gitprismignore`'s
+        // line endings, and a later `sync_pair_to_dest` call sees that
+        // mangled copy disagree with the identical blob it inherited,
+        // failing decisions/0037's policy check for a reason that has
+        // nothing to do with an actual content change.
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        policy::restore_control_files_exact(&repo, &head_tree).unwrap();
+        drop(head_tree);
         repo
     }
 
