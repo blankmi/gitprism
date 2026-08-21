@@ -18,7 +18,13 @@ finalized — see open questions).
    in source.
 3. Ongoing: changes made on **source** are synced to **dest**, filtered so that
    source-only files/folders never appear in dest. This push to dest must be
-   **fast-forward only** — never a force-push.
+   **fast-forward only** — never a force-push — for every branch whose dest-side
+   changes flow back into source (step 4's round-tripped branches). Those are
+   shared histories, and a non-fast-forward means they diverged: an operator
+   reconciles it, gitprism does not. A branch that only ever flows source→dest
+   is different: its dest history is a projection of source's, never imported
+   back, so it may be force-updated when source's own branch was deliberately
+   rewritten. Authority over the history decides, not the direction of the push.
 4. Independently, one or more branches on **dest** receive updates (e.g. when PRs are
    merged directly against dest). Those updates must sync **back** into source's
    corresponding branch(es).

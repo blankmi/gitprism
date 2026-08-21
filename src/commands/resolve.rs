@@ -39,7 +39,7 @@ use crate::commands::sync::{
 };
 use crate::config::Config;
 use crate::exclude;
-use crate::git::{self, CherryPickOutcome};
+use crate::git::{self, CherryPickOutcome, PushMode};
 use crate::limits;
 use crate::marker;
 use crate::policy;
@@ -332,9 +332,21 @@ fn start_source_to_dest(
         )
     };
     if dest_base != dest_tip {
-        match git::push(source_root, &dest_url, dest_base, branch)? {
+        // decisions/0039 narrows 0038's resolve.rs guidance: force here
+        // would require positively detecting a source-side rewrite, which
+        // only `sync_pair_to_dest`'s fresh resume-point computation ever
+        // does. `resolve` resumes an already-open conflict instead, so
+        // every resolve.rs push — round-tripped or mirror-only — stays
+        // fast-forward-only, unconditionally.
+        match git::push(
+            source_root,
+            &dest_url,
+            dest_base,
+            branch,
+            PushMode::FastForwardOnly,
+        )? {
             git::PushOutcome::Accepted => {}
-            git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
+            git::PushOutcome::RejectedRefMoved => anyhow::bail!(
                 "gitprism resolve: clean source-to-dest commits before {source_oid} lost a fast-forward race; run sync again"
             ),
         }
@@ -576,7 +588,16 @@ fn finish_source_to_dest(
         branch,
         state_key,
     )?;
-    match git::push(source_root, &config.dest_url()?, new_dest, branch).with_context(|| {
+    // decisions/0039: `resolve` never runs `sync_pair_to_dest`'s rewrite
+    // detection, so this stays fast-forward-only regardless of branch role.
+    match git::push(
+        source_root,
+        &config.dest_url()?,
+        new_dest,
+        branch,
+        PushMode::FastForwardOnly,
+    )
+    .with_context(|| {
         format!(
             "source-to-dest push failed; resolution worktree and authenticated state remain at {}",
             operation.worktree.display()
@@ -606,7 +627,7 @@ fn finish_source_to_dest(
             }
             Ok(())
         }
-        git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
+        git::PushOutcome::RejectedRefMoved => anyhow::bail!(
             "gitprism resolve: source-to-dest resolution committed locally as {new_dest}, but dest moved; copy or save the staged resolution from {}, remove that linked worktree, rerun `gitprism resolve <branch> --direction source-to-dest` against the new destination, then reapply the resolution",
             operation.worktree.display()
         ),
@@ -1321,9 +1342,18 @@ fn finish(
     crate::policy::restore_control_files_exact(repo, &new_commit.tree()?)?;
 
     let source_url = config.source_url()?;
-    match git::push(source_root, &source_url, new_oid, branch)? {
+    // Always round-tripped (only `Direction::DestToSource` reaches `finish`,
+    // and that direction only ever operates on `config.branches` entries) —
+    // fast-forward-only per decisions/0038, unconditionally.
+    match git::push(
+        source_root,
+        &source_url,
+        new_oid,
+        branch,
+        PushMode::FastForwardOnly,
+    )? {
         git::PushOutcome::Accepted => Ok(()),
-        git::PushOutcome::RejectedNotFastForward => anyhow::bail!(
+        git::PushOutcome::RejectedRefMoved => anyhow::bail!(
             "gitprism resolve: {branch:?} was resolved and committed locally, but pushing it to the configured source remote was rejected as a non-fast-forward — fetch/rebase source and push {branch:?} manually"
         ),
     }
@@ -1743,6 +1773,7 @@ mod tests {
             &dir.path().display().to_string(),
             tip,
             branch,
+            PushMode::FastForwardOnly,
         )
         .unwrap();
         assert_eq!(outcome, git::PushOutcome::Accepted);

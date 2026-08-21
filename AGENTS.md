@@ -46,6 +46,10 @@ recording the chronological history of what was added/decided and when.
   that makes it pass. Rust's built-in `#[test]` + `cargo test` is the framework;
   reach for an added dev-dependency (e.g. `tempfile`) only when the built-in tools
   can't express the test cleanly.
+* Prefer operator intervention over novel automation. Automate only when the safe behavior is deterministic and established by Git or credible prior art. 
+  If resolution requires guessing intent or weakening a Git safety invariant, fail clearly and let the operator resolve it.
+* When evaluating a proposed automatic recovery, first ask whether Git already provides a safe primitive for it. 
+  If not, the default decision is to stop and involve the operator, unless the project owner explicitly decides the added automation is necessary.
 
 # Response style
 

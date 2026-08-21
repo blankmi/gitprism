@@ -163,8 +163,9 @@ url = "git@example.com:group/dest.git"
 * **`[source].url`** / **`[dest].url`** *(optional)* — where gitprism pushes
   each side. Omit either (or both) to fall back to the `GITPRISM_SOURCE_URL`
   / `GITPRISM_DEST_URL` environment variables instead — useful for
-  credential-bearing or per-environment URLs you don't want committed into
-  source's history.
+  per-environment URLs (staging vs. a developer's own fork) you don't want
+  committed into source's history. Neither form is a place for embedded
+  credentials; see "Mapping state key" below.
 
 ### Protected policy digest
 
@@ -191,13 +192,21 @@ and store it in your CI secret manager. Gitprism keeps the
 normal `Gitprism-Source-Commit` / `Gitprism-Dest-Commit` trailers readable, but
 trusts them only when the commit also has a final authenticated state block.
 The key is never committed and is removed from Git subprocess environments so
-repository hooks and helpers cannot read it. Resolved `GITPRISM_SOURCE_URL` and
-`GITPRISM_DEST_URL` fallback values are scrubbed from those children too;
-normal Git authentication variables such as `GIT_ASKPASS` remain available.
-Git's executable, global/local configuration, credential helpers, and
-repository hooks are still a trusted boundary. User-supplied `Gitprism-*` lines
-are stripped from generated messages to prevent a second trusted marker; use
-ordinary prose for literal documentation of those names.
+repository hooks and helpers cannot read it. Resolved `GITPRISM_SOURCE_URL`
+and `GITPRISM_DEST_URL` fallback values are scrubbed from those children's
+environment the same way, so a hook or helper cannot read either straight out
+of the environment. That scrubbing is not URL secrecy, though: gitprism still
+passes the resolved URL to Git as a command-line argument, where it is
+visible to any other process running as the same user (`ps`, or
+`/proc/<pid>/cmdline` on Linux) and can end up captured in CI logs or crash
+reports. Do not put credentials in a repository URL. Gitprism scrubs only its
+own variables, leaving Git's ordinary authentication mechanisms untouched — use
+an SSH key/agent, a Git credential helper, `GIT_ASKPASS`, or the CI platform's
+native Git authentication instead. Git's executable, global/local
+configuration, credential helpers, and repository hooks are still a trusted
+boundary. User-supplied `Gitprism-*` lines are stripped from generated messages
+to prevent a second trusted marker; use ordinary prose for literal
+documentation of those names.
 
 ## Excluding paths: `.gitprismignore`
 

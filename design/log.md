@@ -320,11 +320,15 @@ three-way merge, and three-way merging an identical change is idempotent.
   another can hand a pair the other pair's marker.~~ — resolved, see
   [decisions/0019](decisions/0019-marker-scans-are-first-parent-only.md), which makes
   both scans first-parent-only rather than pair-qualifying the trailer itself.
-* `trailer_value` matches `Key: value` anywhere in a message rather than only in the
+* ~~`trailer_value` matches `Key: value` anywhere in a message rather than only in the
   final trailer block, so a commit message that merely *quotes* a trailer (a squash
   merge concatenating bodies, say) can poison the resume scan — verified: it stops the
   pair with "isn't an ancestor of dest's current tip", and that commit's content never
-  reaches dest.
+  reaches dest.~~ — resolved, see
+  [decisions/0025](decisions/0025-authenticated-mapping-markers.md), which makes resume
+  and loop-prevention trust only the single canonical final state block, authenticated
+  by an HMAC over the commit itself; a quoted trailer can't produce a valid MAC, so it
+  parses as ordinary text rather than a trusted marker.
 * A file that already reached dest and is *later* added to `.gitprismignore` stays on
   dest forever; the diff model has no delta to filter. decisions/0004's "apply the
   current list at processing time" reads as though it should be scrubbed, which would
@@ -1219,3 +1223,514 @@ on failure. The mutex is gone; no test anywhere else needed to change to
 stay correct. See 0034's Consequences section for detail. `cargo test`:
 190 passed, 0 failed. `cargo clippy --all-targets`: clean. `cargo fmt
 --check`: clean.
+
+## 2026-08-21 — housekeeping
+
+**Update**: Struck the open question on `trailer_value` matching a quoted trailer
+anywhere in a message. It was stale:
+[decisions/0025](decisions/0025-authenticated-mapping-markers.md) already replaced
+that loose scan with a single canonical final state block that resume and
+loop-prevention only trust once its HMAC verifies, closing the exposure described.
+No code changed.
+
+**Update**: An external security review found the README's "Mapping state key"
+section overstated a secrecy guarantee: it said `GITPRISM_SOURCE_URL` /
+`GITPRISM_DEST_URL` fallback values are "scrubbed" from Git subprocesses
+alongside `GITPRISM_STATE_KEY`, implying the resolved URL is unavailable to
+them. It isn't — `fetch`, `remote_ref_exists`, and `push` in `src/git.rs` all
+pass the resolved URL to Git as a command-line argument, visible to any
+same-user process (`ps`, `/proc/<pid>/cmdline`) and capturable in CI logs or
+crash reports, regardless of the environment scrubbing. Corrected the README
+to state that plainly, kept the true claim (the gitprism-specific env vars
+aren't inherited, so a hook can't read them out of the environment), and added
+guidance against embedding credentials in repository URLs at all. Also dropped
+the credential-bearing rationale from the `[source].url` / `[dest].url` bullet,
+which recommended the env-var fallback for exactly the URLs this now warns
+against; the per-environment rationale stays.
+[decisions/0013](decisions/0013-repo-urls-optional-fall-back-to-env-vars.md)
+states the same credential-bearing rationale in its Context section and was
+left unchanged — flagged for separate handling. No code changed.
+
+**Update**: Added a 2026-08-21 addendum to
+[decisions/0013](decisions/0013-repo-urls-optional-fall-back-to-env-vars.md)
+withdrawing its credential-secrecy rationale, the item flagged above:
+`fetch`/`remote_ref_exists`/`push` in `src/git.rs` pass the resolved URL to
+Git as a command-line argument, so env-scrubbing does not make it secret. The
+decision itself — `[source].url`/`[dest].url` optional with env-var fallback —
+is unchanged; only the withdrawn rationale is superseded. Updated 0013's
+`design/decisions/index.md` entry to match. No code changed.
+
+## 2026-08-21 — pending history is first-parent
+
+**Update**: Added [decisions/0035](decisions/0035-pending-history-is-first-parent.md).
+An external review found, and this decision confirms by reproduction, that
+`pending_commits` walks the full DAG while `build_pending_dest_tip` and
+`build_pending_source_tip` derive their three-way-merge base from
+`parent(0)` — so a merge's own side-branch commits get replayed against a
+base tree the dest/source chain was never at, and a conflict a human already
+resolved inside the merge commit gets hard-stopped again on the side
+branch's own diff. `pending_commits` gains `Revwalk::simplify_first_parent()`,
+the same idiom decisions/0019 applied to the marker scans, closing the gap
+0019's own Consequences explicitly left open ("no change to
+`pending_commits` ... or `build_pending_dest_tip`/`build_pending_source_tip`'s
+own walks"). Also corrects this file's earlier claim, in the entry
+documenting decisions/0016, that the interleaved-branch churn had
+"disappear[ed]" — it hadn't; the test comment in
+`run_does_not_duplicate_a_no_ff_merges_content_on_dest`
+(`src/commands/sync.rs`, ~lines 3281-3288) still records it as an open
+design question, and this decision is what actually removes it. No code
+changed in this commit; the implementation and its test coverage are a
+follow-up.
+
+**Update**: Implemented. `pending_commits` (`src/commands/sync.rs`) gained
+`revwalk.simplify_first_parent()` between `hide()` and `set_sorting()` — the
+one-line change decisions/0035 specified, following the same
+`.context(...)` idiom as the two `simplify_first_parent()` calls decisions/0019
+already added. No other production code changed.
+
+Added the test coverage decisions/0035's Consequences enumerated:
+`run_honors_a_conflict_resolved_by_hand_inside_a_merge_commit` (the
+regression — confirmed failing before the fix with a genuine `shared.txt`
+merge-tree conflict hard-stop, exactly as 0035 predicted, then passing
+after); `run_applies_a_clean_two_parent_merge_without_replaying_the_side_branchs_own_commit`
+(asserts dest's own commit count, since the two pre-existing merge tests
+assert only final content and can't tell the two walks apart);
+`pending_commits_still_hides_a_boundary_reachable_only_via_a_merges_second_parent`
+(a direct unit test on `pending_commits` confirming `hide()`'s own ancestor
+exclusion still reaches a boundary's non-first parent);
+`run_applies_a_squash_merged_source_commit_as_a_single_dest_commit` and
+`run_applies_a_rebased_linear_source_history_commit_by_commit` (regression
+cases, named and commented as such — both single-parent, unaffected);
+`run_carries_a_real_two_parent_merge_on_dest_into_source_as_one_net_change`
+(dest→source's first real-merge coverage, since `pending_commits` is
+shared); and `run_correctly_merges_a_new_source_merge_onto_a_dest_tip_shaped_by_the_old_full_dag_walk`
+(the migration case — dest hand-built to match the old full-DAG walk's
+three-commit output, then a new merge processed under the new walk against
+it). All seven passed without needing to weaken or alter any pre-existing
+test.
+
+Also corrected the test comment this entry's own claim was about: it
+actually lives in `run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`
+(not `run_does_not_duplicate_a_no_ff_merges_content_on_dest`, as both this
+entry and decisions/0035 itself misattributed it) — rewritten to record that
+decisions/0035 removed the interleaved-branch churn, instead of describing
+it as an open design question.
+
+`cargo test`: 197 passed, 0 failed (up from 190). `cargo clippy --all-targets
+-- -D warnings`: clean. `cargo fmt --check`: clean.
+
+## 2026-08-21 — branch-additive exclusions
+
+**Update**: Added [decisions/0036](decisions/0036-branch-additive-exclusions.md).
+An external security review found a real disclosure path: decisions/0026
+loads one verified `ExcludeList` from the working tree per `sync` run and
+never loads a branch-tip version, confirmed in `src/commands/sync.rs::run`
+(~lines 101-103). A feature branch that adds sensitive content and
+correctly adds its own `.gitprismignore` entry excluding it has that
+instruction discarded — the content is mirrored to dest anyway — and per
+this file's own still-open "a file that already reached dest and is later
+added to `.gitprismignore` stays on dest forever" item, that disclosure is
+irreversible.
+
+Decided: effective source→dest exclusion becomes `trusted.is_excluded(path)
+|| branch.is_excluded(path)`, two independent `ExcludeList` matchers rather
+than one concatenated file — concatenation would let a branch's own `!`
+negation un-exclude trusted content, while independent matchers keep the
+branch list monotone (add-only). `branch` is the union of every
+`.gitprismignore` found across the commits being replayed for that branch
+this run, not the branch tip alone, so an exclusion added in an earlier
+commit can't be undone by a later one deleting the line — replayed content
+already reached dest by then. `branch` is deliberately outside
+`GITPRISM_POLICY_SHA256`: the digest is one static value with no per-branch
+dimension, and extending it to branch tips would just reproduce today's bug
+rather than fix it.
+
+Also records the amendment's own limits: a branch whose entire remaining
+content becomes covered by its own new exclusions filters to a no-op against
+a landing branch, so decisions/0018's `already_merged_into_a_landing_branch`
+classifies it as already-merged-and-cleaned-up and it is never created on
+dest — the leak moves rather than disappears, and 0018 already accepted this
+shape of tradeoff for a different cause. A branch that never adds an
+exclusion for sensitive content it introduces is still exported unchanged;
+gitprism cannot infer sensitivity. Checked `design/references/` for
+per-branch or additive-filtering precedent: none found among josh, Copybara,
+git-subtree, git-filter-repo, or jujutsu.
+
+No code changed in this commit. Implementation (an `ExcludeList` holding
+more than one matcher, reading `.gitprismignore` per replayed commit, and
+the enumerated test list) is a follow-up.
+
+## 2026-08-21 — branch policy mismatch fails closed
+
+**Update**: Added [decisions/0037](decisions/0037-branch-policy-mismatch-fails-closed.md),
+superseding [decisions/0036](decisions/0036-branch-additive-exclusions.md).
+`AGENTS.md` (commit `e213f72`) added a working-style rule preferring operator
+intervention over novel automation, defaulting to "stop and involve the
+operator" when Git has no safe primitive for the recovery and resolution
+would require guessing intent. 0036's own Prior art section already found no
+precedent for its proposed per-branch additive-exclusion union among josh,
+Copybara, git-subtree, git-filter-repo, or jujutsu, which makes it exactly
+the novel automation the new rule defaults against. The project owner chose
+fail-closed over the union.
+
+Decided: a source→dest branch replaying a commit whose `.gitprismignore` or
+`.gitprism.toml` is present and byte-differs from the digest-pinned,
+already-verified working-tree policy (decisions/0026) halts that branch —
+`Outcome::Error`, naming the branch, commit, offending file, and remedy
+(update `GITPRISM_POLICY_SHA256` or reconcile the branch) — while other
+branches keep syncing and the overall `sync` exit status is non-zero. Absence
+of a control file is not a mismatch, since the trusted policy already applies
+regardless of a commit's own content; only present-and-different is
+ambiguous. No second policy source is introduced: decisions/0026's one
+verified `ExcludeList` for every branch stands unchanged, and
+`already_merged_into_a_landing_branch` (`src/commands/sync.rs`, ~line 641) is
+confirmed untouched, so 0036's leak-moves-to-silent-non-mirroring side effect
+does not recur — a mismatching branch now halts loudly instead of vanishing.
+Also notes the sanctioned `GITPRISM_POLICY_SHA256`-change workflow (a
+control-file-only branch) now halts with an explicit message rather than
+risking silent already-merged classification, an improvement, and states
+plainly that every legitimate branch-level control-file change now needs
+operator action first — the cost the new rule accepts.
+
+No code changed in this commit. Implementation (threading
+`VerifiedPolicy.config_raw`/`ignore_raw` into `sync_pair_to_dest_with_key`,
+the per-commit comparison, and the enumerated test list) is a follow-up.
+
+**Update**: Implemented decisions/0037. `run()` now binds
+`verified_policy.ignore_raw`/`config_raw` (previously unconsumed) alongside
+`config`/`exclude_list`, and threads both into `sync_pair_to_dest_with_key`.
+The check is a pre-pass: for each branch, after `dest_tip`/`boundary` are
+resolved (either from a real dest fetch or, for a not-yet-mirrored branch,
+`newest_dest_marker_opt_for_branch`) but *before* `decisions/0018`'s
+"already merged into a landing branch" classification and before
+`build_pending_dest_tip` builds or pushes anything, `pending_commits(boundary,
+source_tip)` is walked (skipping the same `Setup`/`DestToSource`
+loop-prevented commits `build_pending_dest_tip` itself never replays) and
+each commit's root-tree `.gitprismignore`/`.gitprism.toml` entry is read
+(bounded by `limits::MAX_CONTROL_FILE_BYTES`, `src/commands/sync.rs`'s new
+`read_control_file_blob`) and compared byte-for-byte against the pinned raw
+bytes. Absence is skipped (not a mismatch); a present-and-different file
+returns a `PolicyMismatch { commit, filename }` and the branch reports
+`Outcome::Error` (via `policy_mismatch_message`, naming the branch, commit,
+and offending filename, and telling the operator to re-run
+`gitprism policy-hash` or reconcile the branch) with **nothing pushed** —
+`sync_pair_to_dest_with_key` returns `Ok(true)` instead of erroring, so
+`run()`'s branch loop moves on to the next branch rather than aborting
+(decisions/0024's precedent). Moving the mismatch check ahead of the
+"already merged" classification is what makes the sanctioned
+`GITPRISM_POLICY_SHA256`-change workflow (a branch whose only diff is an
+unapproved control file) halt loudly instead of being silently read as
+already-merged-and-cleaned-up. `run()` accumulates an
+`any_branch_halted_for_policy_mismatch` flag across the branch loop, calls
+`reporter.finish()` once every branch is processed (same as the clean-exit
+path), and only then `anyhow::bail!`s if any branch halted — so the pinned
+bar always ends cleanly and the run's exit status is non-zero without
+cutting any other branch's sync short.
+
+Chose not to add a new `Outcome` variant: reused `Outcome::Error` (already
+distinct from `Outcome::Warning` since decisions/0024) plus the mandatory
+non-zero `run()` exit, which decisions/0037 itself accepts as sufficient —
+a mismatch already can't be mistaken for `Outcome::Warning`'s benign,
+run-still-succeeds shape, and a new variant would only duplicate
+`Outcome::Error`'s existing color/label without changing behavior.
+
+Six tests added to `src/commands/sync.rs`: a differing `.gitprismignore`
+halts the branch with nothing pushed; same for `.gitprism.toml`; a commit
+with no control file at all replays normally; a commit whose control file
+matches the pin byte-for-byte syncs normally; one branch halting still lets
+another branch sync while `run()` itself returns an error (asserting both
+halves); and a control-file-only branch (the sanctioned policy-change
+workflow) halts with the mismatch message rather than being classified
+already-merged-and-cleaned-up. Pre-implementation, tests 1/2/3/4/6 (written
+against the wrapper's new `Result<bool>` signature) failed to compile against
+the old `Result<()>` signature (`cannot apply unary operator '!' to type
+'()'`); isolating test 5 alone against the unmodified code showed the real
+behavioral gap directly: `run()` returned `Ok(())` and printed `main: skipped
+(source -> dest) — up to date, nothing to sync` — the differing
+`.gitprismignore` was silently absorbed since it filters to no visible tree
+change, exactly the disclosure risk decisions/0037 closes.
+
+Verification: `cargo test` — 203 passed (197 baseline + 6 new), 0 failed;
+`cargo clippy --all-targets -- -D warnings` — clean; `cargo fmt --check` —
+clean.
+
+## 2026-08-21 — branch authority determines history rewriting
+
+**Update**: Added [decisions/0038](decisions/0038-branch-authority-determines-whether-history-may-be-rewritten.md),
+formalizing `requirements/0001` step 3 as amended separately in `cdac783`:
+force semantics depend on which branch authority owns the history, not on
+push direction. Round-tripped branches (`config.branches`) stay
+fast-forward-only both ways, with persistent divergence handed to the
+operator without a prescribed reconciliation method. Mirror-only branches
+may be force-updated on source→dest to mirror a deliberately rewritten
+source branch, but only after decisions/0009's bounded refetch-and-recompute
+is exhausted — decisions/0009 itself is unchanged, this only defines what
+happens after its retries run out. Force is made opt-in and visible via an
+explicit two-variant `PushMode` every push call site must declare, rather
+than a separate force helper. Classified the four existing `git::push` call
+sites by branch authority: `src/commands/sync.rs:509` (source→dest, role
+depends on current `config.branches` membership), `src/commands/sync.rs:1404`
+(dest→source, always round-tripped), `src/commands/resolve.rs:335` and
+`:579` (dest pushes in source→dest resolve — must be classified by
+`config.branches` membership too, since `Direction::SourceToDest` accepts
+any local branch, not just round-tripped ones), and `src/commands/resolve.rs:1324`
+(source push in dest→source resolve, always round-tripped). Recorded a
+standing operator hazard: branch authority is decided by current
+`config.branches` membership, so editing that list silently changes which
+branches gitprism may rewrite. Rejected `--force-with-lease` for any branch
+type, verified directly against real git: a lease with a correct expected
+value still force-pushed a divergent history and the remote reported
+`(forced update)`; separately, plain push already rejects every race that
+could lose a concurrent writer's work, and the one race a lease adds
+detection for (remote moved to a commit gitprism already had) is harmless.
+Reconciled with `requirements/0001`'s unchanged git-filter-repo objection:
+that objection is to force-push as the permanent steady-state sync
+mechanism, which this decision does not create — the steady state stays
+fast-forward, and force fires only as an exceptional response to a
+deliberate source-side rewrite. Prior art: GitLab push mirroring (already
+cited in decisions/0018 as the closest analogue) force-updates a diverged
+mirror by default, confirmed directly from GitLab's docs; no other
+already-reviewed tool (josh, Copybara, git-subtree, jujutsu, git-filter-repo)
+was found to force-update a mirror to match an authoritative upstream. No
+code changed in this commit; `requirements/0001` was amended separately in
+`cdac783`.
+
+## 2026-08-21 — mirror-only source rewrites rebuild the projection
+
+**Update**: Added [decisions/0039](decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md),
+extending decisions/0038. Starting 0038's implementation surfaced that its
+force path is unreachable as written: `dest_resume_point_for_branch`
+(`src/commands/sync.rs`) refuses a rewritten mirror-only branch — rebase,
+amend, or reset — before any push is attempted, because
+`dest_tip_is_accounted_for`'s Case 1 still recognizes the old, pre-rewrite
+dest tip via gitprism's own stale marker, `newest_source_marker` returns the
+pre-rewrite source tip as the boundary, and `source_tip` no longer descends
+from it. This investigation is what stopped 0038's implementation and
+produced this decision instead of a workaround.
+
+Decided: a rewritten mirror-only branch is a positively identified state —
+mirror-only (absent from `config.branches`), a dest ref exists, a prior
+gitprism marker is found, and source no longer descends from the previous
+boundary — checked directly, not reached by exhausting decisions/0009's
+retries. Explicitly rejected framing this as "force after failed retries":
+that reads as a general escalation policy a future contributor could extend
+to a round-tripped branch's persistent divergence, which is exactly the
+operator boundary 0038 draws and `AGENTS.md`'s operator-intervention rule
+protects. Decisions/0009's refetch-and-recompute keeps its existing,
+narrower meaning — handling a genuine concurrent race — unchanged in both
+push modes. On a detected rewrite, the projection rebuilds from the same
+`(boundary, dest_tip)` `newest_dest_marker_opt_for_branch` already reads off
+source's own graft-derived first-parent history for the `!dest_ref_exists`
+case (decisions/0006) — no second rebuild mechanism — then force-pushes via
+0038's `ForceMirrorOnly`. Named the authority invariant explicitly:
+independent dest advancement on a mirror-only branch may be discarded only
+because the branch is currently absent from `config.branches`
+(decisions/0017 guarantees dest→source never touches such a branch, so
+nothing on its dest ref is dest's own independent contribution). Narrows
+0038's `resolve.rs` guidance: `resolve` never runs this fresh resume-point
+detection, so every `resolve.rs` push stays fast-forward-only regardless of
+branch authority, refining rather than contradicting 0038's own table.
+Restates, without re-deriving, 0038's config-role hazard (branch authority
+is decided by current `config.branches` membership, re-evaluated every run).
+
+Checked `design/references/` for prior art on rebuilding a projection from a
+shared base after a detected rewrite, as distinct from simply force-updating
+a ref: found nothing — GitLab's push-mirror docs (already cited in
+decisions/0018/0038) describe the force-update outcome but not a rebuild
+step, since a plain mirror push has no filtering stage to rebuild in the
+first place.
+
+No code changed in this commit — decisions/0038's `PushMode` enum and this
+decision's rewrite-detection/rebuild path are still to be implemented
+together.
+
+**Update**: Implemented decisions/0038's `PushMode` together with 0039's
+rewrite detection and rebuild.
+
+`git::push` (`src/git.rs`) now takes a required `PushMode` (`FastForwardOnly`
+| `ForceMirrorOnly`) at every call site; the refspec construction itself is
+pulled into a small `push_refspec` helper so the two modes' exact wire shape
+(plain vs. `+`-prefixed) is unit-tested directly. Per-call-site
+classification: `sync.rs`'s source→dest push (`sync_pair_to_dest_with_key`)
+is the only site that can select `ForceMirrorOnly`, and only after
+establishing both that `branch` is absent from `config.branches` and that
+`mirror_only_rewrite_detected` positively identified a rewrite; `sync.rs`'s
+dest→source push, the round-tripped `resolve.rs` source-to-dest paths
+(`start_source_to_dest`, `finish_source_to_dest`), and `resolve.rs`'s
+dest-to-source `finish` all stay `FastForwardOnly` unconditionally, matching
+0039's narrowing of 0038's `resolve.rs` guidance. The two test-only call
+sites (`resolve.rs`'s and `sync.rs`'s `bare_source_remote_seeded_at`
+fixtures) were mechanically updated to `FastForwardOnly`.
+
+Rewrite detection is `mirror_only_rewrite_detected` (`src/commands/sync.rs`),
+called only from the arm where `dest_resume_point_for_branch` has already
+returned `Ok(None)` for a branch absent from `config.branches` — the four
+conditions are checked directly there, not by counting retries:
+`dest_tip_accounted_for` (a new three-way split of the old boolean
+`dest_tip_is_accounted_for`, distinguishing "a prior gitprism sync landed
+here" from "dest is still sitting at the graft") must say
+`ViaPriorGitprismSync`; `newest_source_marker` must find a boundary; that
+boundary must exist in this clone's odb; and `source_tip` must fail
+`graph_descendant_of` against it. Decisions/0009's retry loop is untouched —
+it still only fires on an actual push rejection, and a rewrite is
+re-detected fresh on every loop iteration rather than assumed from a retry
+count. On a detected rewrite, the rebuild target comes from the existing
+`newest_dest_marker_opt_for_branch(repo, source_tip, ...)` call the
+`!dest_ref_exists` arm already uses — no second base-finding path.
+
+The exhausted-retries message (`sync.rs:519`, `sync.rs:1404` before this
+change) is now built by one pure function,
+`divergence_after_exhausted_retries_message(branch, ff_target)`: names the
+branch, says the two sides diverged, and defers to the operator via
+"ordinary git" — verified by a direct unit test to never contain "merge",
+"rebase", or "cherry-pick".
+
+Tests added (`src/git.rs`, `src/commands/sync.rs`): `push_refspec`'s two
+wire-shape unit tests; `push_force_mirror_only_overwrites_a_diverged_dest_branch_outright`
+(an outright force, no lease semantics — no expected-old-value is ever
+passed to `push`); three rewrite fixtures —
+`sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_a_rebase`,
+`..._by_an_amend`, and
+`..._reset_to_an_earlier_commit_plus_a_new_commit` — each confirming the old
+mirror history is replaced and dest ends at the rewritten content;
+`sync_pair_to_dest_incorporates_a_benign_race_on_a_mirror_only_branch_via_recompute_not_force`,
+which pre-pushes a gitprism-shaped dest commit naming exactly the source tip
+already being synced (`boundary == source_tip`, so rewrite detection is
+never even reached) and confirms the next sync extends it by ordinary
+fast-forward rather than replacing it; the authority-invariant pair
+`sync_pair_to_dest_discards_a_mirror_only_branchs_content_naming_an_unrelated_source_commit`
+and `..._stops_..._instead`, built from one shared fixture that gives dest a
+*validly marked* gitprism commit naming a sibling source commit this clone
+never had — identical dest-side state, differing only in `feature-x`'s
+`config.branches` membership, proving that membership alone licenses the
+discard; and the message unit test above. Pre-implementation, the rebase
+test failed with the old refusal ("isn't at a point this clone can safely
+build on..."), reproduced by temporarily disabling the new detection arm;
+the benign-race test failed to compile at all against the pre-task `git::push`
+signature (13 errors, including its own call site), since it directly
+exercises the new `PushMode` API.
+
+Verification: `cargo test` — 213 passed, 0 failed (baseline 203 plus 10 new:
+3 in `git.rs`, 7 in `sync.rs`). `cargo clippy --all-targets -- -D warnings` —
+clean. `cargo fmt --check` — clean after `cargo fmt`.
+
+## 2026-08-21 — mirror-only skip message states what was observed
+
+**Update**: `sync_pair_to_dest_with_key`'s decisions/0018 Case 2 skip note
+read "already merged into {landing:?}, cleaned up there" — asserting a
+deletion that may never have happened, since the same note fires for a
+branch that never had a dest ref at all (its filtered content simply
+coincides with the landing branch's). Replaced with a new pure function,
+`mirror_only_skip_note(landing)` (`src/commands/sync.rs`), returning "its
+filtered content is already fully present in {landing:?}" — true in both
+cases the classification covers, with no claim of deletion, cleanup, or
+prior existence on dest. Unit-tested directly
+(`mirror_only_skip_note_names_the_landing_branch_and_asserts_no_deletion_or_prior_existence`),
+following the precedent already set by `policy_mismatch_message` and
+`divergence_after_exhausted_retries_message`: extract the note, test the
+pure function, since the reporter has no capturing sink. No existing test
+asserted the old wording as a behavioral expectation, so none needed
+updating. `decisions/0037`'s note that this correction was "a separate,
+still-open item" is updated to record it as resolved; `decisions/0018`
+itself never quoted the old string verbatim, so it needed no change.
+`decisions/0020`'s two verbatim quotes of the pre-indicatif `eprintln!`
+output (its own historical "today's call sites" example, dated before this
+fix) were left as-is — they document what the code said at the time that
+decision was written, not a claim about current wording.
+
+Verification: `cargo test` — 214 passed, 0 failed (baseline 213 plus 1 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
+clean.
+
+## 2026-08-21 — unreadable control-file entry stays a per-branch mismatch
+
+**Update**: Fixed `read_control_file_blob` (`src/commands/sync.rs`) aborting the whole `run` — instead of just that branch (decisions/0037) — when a pending commit's `.gitprismignore`/`.gitprism.toml` was a directory/gitlink (`find_blob` failing) or over `MAX_CONTROL_FILE_BYTES` (`anyhow::bail!`); both now classify as that branch's `PolicyMismatch` via a new `PolicyMismatchReason`, and `policy_mismatch_message` states the actual reason. Addendum recorded in `decisions/0037`.
+
+Verification: `cargo test` — 217 passed, 0 failed (baseline 214 plus 3 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
+clean.
+
+## 2026-08-21 — 0038 amended to flag its own overturned retry-escalation framing
+
+**Update**: [decisions/0038](decisions/0038-branch-authority-determines-whether-history-may-be-rewritten.md)
+still framed mirror-only force as "escalate after decisions/0009's retries
+are exhausted" throughout its front-matter description and body, despite
+[decisions/0039](decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md)
+explicitly overturning that framing as load-bearing (0039: "force is not an
+escalation after failed retries"). Left as-is, a `status: stable` record
+reads as current guidance and could lead a future reader to implement the
+rejected escalation shape without ever reaching 0039. Corrected the
+front-matter description, added a supersession note before `# Context`
+naming what 0039 overturned (the retry-escalation trigger) and what still
+stands (the branch-authority rule itself), and annotated every stale
+in-body passage inline with a bracketed pointer to 0039 rather than
+deleting or rewriting the original reasoning. `--force-with-lease` passages
+were left completely untouched — that question is under separate active
+review. No code changed.
+
+## 2026-08-21 — mirror-only force becomes a compare-and-swap lease
+
+**Update**: Decided [decisions/0040](decisions/0040-mirror-only-force-is-a-compare-and-swap-lease.md)
+— an external review found `PushMode::ForceMirrorOnly`'s unconditional
+`+<oid>:refs/heads/<branch>` refspec silently overwrites a concurrent dest
+advance between fetch and push, making decisions/0009's refetch-and-recompute
+retry loop unreachable for that race. Fixed by pushing with an explicit
+`--force-with-lease=refs/heads/<branch>:<fetched-dest-oid>` instead, verified
+against real git: a stale lease is rejected with the same `!`/`[rejected]`
+porcelain shape `is_non_fast_forward_rejection` already matches, so the
+existing retry loop already routes it into decisions/0009's mechanism with no
+new plumbing. `PushMode::ForceMirrorOnly` gains a required `expected_dest:
+Oid` field. Revises decisions/0038's blanket "no lease mechanism anywhere"
+conclusion for mirror-only force only — a lease still must never enable
+force on a round-tripped branch — annotated in place the same way `119c16b`
+annotated 0038's retry-escalation passages. No code changed.
+
+## 2026-08-21 — mirror-only force implemented as a compare-and-swap lease
+
+**Update**: Implemented [decisions/0040](decisions/0040-mirror-only-force-is-a-compare-and-swap-lease.md).
+`PushMode::ForceMirrorOnly` now carries a required `expected_dest: Oid` and
+`git::push` sends it as `--force-with-lease=refs/heads/<branch>:<expected_dest>`
+with a plain, non-`+`-prefixed refspec, instead of the old unconditional `+`
+force. `expected_dest` is the dest tip `sync_pair_to_dest_with_key` actually
+fetched, captured before the `match` that later rebinds `dest_tip` to the
+graft-derived rebuild base — using the post-match value would have made
+every lease compare against the wrong OID and force would never fire.
+Verified against real git that a stale lease is rejected with the same `!`
+/ `[rejected]` porcelain shape a plain non-fast-forward rejection uses, so
+it already routes into decisions/0009's retry loop with no new plumbing —
+also caught, only by testing against a real local remote, that the lease
+flag must precede the `--` operand separator or git parses it as a literal
+positional refspec instead of an option. `PushOutcome::RejectedNotFastForward`
+and `is_non_fast_forward_rejection` are renamed to `RejectedRefMoved` and
+`is_ref_moved_rejection`, since a stale lease is not literally a
+non-fast-forward rejection and the old names would read as proof the retry
+arm is dead code for a forced push.
+
+Verification: `cargo test` — 218 passed, 0 failed (baseline 217 plus 1 net
+new: one unit-like `ForceMirrorOnly` test replaced by two lease tests, two
+`push_refspec` tests replaced by two `push_args` tests). `cargo clippy
+--all-targets -- -D warnings` — clean. `cargo fmt --check` — clean.
+
+## 2026-08-21 — a rewrite that rebuilds to the base is still pushed
+
+**Update**: Fixed `sync_pair_to_dest_with_key` computing `new_dest_tip` as
+`build.new_tip.or((!dest_ref_exists).then_some(dest_tip))` unconditionally,
+including in decisions/0039's detected-rewrite arm, where `dest_ref_exists`
+is always `true` — the expression there reduced to `build.new_tip.or(None)`,
+so whenever `build_pending_dest_tip` constructed no commit (a `git reset
+--hard` back to a commit that already carries a `Gitprism-Dest-Commit`
+trailer, or a rewrite whose replacement commits all filter to no change
+against the rebuild base — the commonest rewrite shape, not an edge case),
+nothing was pushed at all and dest silently kept the discarded pre-rewrite
+history while the run reported success. The fallback to `dest_tip` (in this
+arm, the graft-derived `rebuild_dest_tip`) now also applies whenever the
+push mode is `ForceMirrorOnly`, regardless of whether a commit was built;
+`FastForwardOnly`'s own fallback, which only ever covers a genuinely
+brand-new branch, is untouched. The reporter's completion note for this
+specific case now says dest was rebuilt from the shared graft with no new
+commits needed, rather than reusing generic done/skip wording that could
+read as commits having been pushed. Addendum recorded in decisions/0039.
+
+Verification: `cargo test` — 221 passed, 0 failed (baseline 218 plus 3 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
+clean.
