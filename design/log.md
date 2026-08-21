@@ -1395,3 +1395,61 @@ operator action first — the cost the new rule accepts.
 No code changed in this commit. Implementation (threading
 `VerifiedPolicy.config_raw`/`ignore_raw` into `sync_pair_to_dest_with_key`,
 the per-commit comparison, and the enumerated test list) is a follow-up.
+
+**Update**: Implemented decisions/0037. `run()` now binds
+`verified_policy.ignore_raw`/`config_raw` (previously unconsumed) alongside
+`config`/`exclude_list`, and threads both into `sync_pair_to_dest_with_key`.
+The check is a pre-pass: for each branch, after `dest_tip`/`boundary` are
+resolved (either from a real dest fetch or, for a not-yet-mirrored branch,
+`newest_dest_marker_opt_for_branch`) but *before* `decisions/0018`'s
+"already merged into a landing branch" classification and before
+`build_pending_dest_tip` builds or pushes anything, `pending_commits(boundary,
+source_tip)` is walked (skipping the same `Setup`/`DestToSource`
+loop-prevented commits `build_pending_dest_tip` itself never replays) and
+each commit's root-tree `.gitprismignore`/`.gitprism.toml` entry is read
+(bounded by `limits::MAX_CONTROL_FILE_BYTES`, `src/commands/sync.rs`'s new
+`read_control_file_blob`) and compared byte-for-byte against the pinned raw
+bytes. Absence is skipped (not a mismatch); a present-and-different file
+returns a `PolicyMismatch { commit, filename }` and the branch reports
+`Outcome::Error` (via `policy_mismatch_message`, naming the branch, commit,
+and offending filename, and telling the operator to re-run
+`gitprism policy-hash` or reconcile the branch) with **nothing pushed** —
+`sync_pair_to_dest_with_key` returns `Ok(true)` instead of erroring, so
+`run()`'s branch loop moves on to the next branch rather than aborting
+(decisions/0024's precedent). Moving the mismatch check ahead of the
+"already merged" classification is what makes the sanctioned
+`GITPRISM_POLICY_SHA256`-change workflow (a branch whose only diff is an
+unapproved control file) halt loudly instead of being silently read as
+already-merged-and-cleaned-up. `run()` accumulates an
+`any_branch_halted_for_policy_mismatch` flag across the branch loop, calls
+`reporter.finish()` once every branch is processed (same as the clean-exit
+path), and only then `anyhow::bail!`s if any branch halted — so the pinned
+bar always ends cleanly and the run's exit status is non-zero without
+cutting any other branch's sync short.
+
+Chose not to add a new `Outcome` variant: reused `Outcome::Error` (already
+distinct from `Outcome::Warning` since decisions/0024) plus the mandatory
+non-zero `run()` exit, which decisions/0037 itself accepts as sufficient —
+a mismatch already can't be mistaken for `Outcome::Warning`'s benign,
+run-still-succeeds shape, and a new variant would only duplicate
+`Outcome::Error`'s existing color/label without changing behavior.
+
+Six tests added to `src/commands/sync.rs`: a differing `.gitprismignore`
+halts the branch with nothing pushed; same for `.gitprism.toml`; a commit
+with no control file at all replays normally; a commit whose control file
+matches the pin byte-for-byte syncs normally; one branch halting still lets
+another branch sync while `run()` itself returns an error (asserting both
+halves); and a control-file-only branch (the sanctioned policy-change
+workflow) halts with the mismatch message rather than being classified
+already-merged-and-cleaned-up. Pre-implementation, tests 1/2/3/4/6 (written
+against the wrapper's new `Result<bool>` signature) failed to compile against
+the old `Result<()>` signature (`cannot apply unary operator '!' to type
+'()'`); isolating test 5 alone against the unmodified code showed the real
+behavioral gap directly: `run()` returned `Ok(())` and printed `main: skipped
+(source -> dest) — up to date, nothing to sync` — the differing
+`.gitprismignore` was silently absorbed since it filters to no visible tree
+change, exactly the disclosure risk decisions/0037 closes.
+
+Verification: `cargo test` — 203 passed (197 baseline + 6 new), 0 failed;
+`cargo clippy --all-targets -- -D warnings` — clean; `cargo fmt --check` —
+clean.

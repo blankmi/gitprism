@@ -101,6 +101,11 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let verified_policy = load_run_policy(&config_path, &source_root)?;
     let config = verified_policy.config;
     let exclude_list = verified_policy.exclude_list;
+    // Threaded into the source→dest loop below for decisions/0037's
+    // per-commit control-file consistency check — the same digest-verified
+    // bytes `exclude_list` was already built from, not a re-read.
+    let ignore_raw = verified_policy.ignore_raw;
+    let config_raw = verified_policy.config_raw;
     let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
 
     // Checked once per run, not once per merge (decisions/0016) — an
@@ -144,8 +149,16 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // branch needs no config entry to start mirroring. `source_branches` was
     // already listed (and sorted) above, before the dest→source loop, so
     // there's nothing left to (re-)discover here.
+    // decisions/0037: a branch whose replay hits a control-file policy
+    // mismatch halts (nothing is pushed for it) but doesn't stop the loop —
+    // every other branch still gets its turn, matching decisions/0024's
+    // precedent for not letting one branch's problem cost every other
+    // branch its sync. The failure is accumulated instead and turned into a
+    // non-zero exit only once every branch has been processed, so CI can't
+    // mistake a halted branch for a clean run.
+    let mut any_branch_halted_for_policy_mismatch = false;
     for branch in &source_branches {
-        sync_pair_to_dest_with_key(
+        let halted = sync_pair_to_dest_with_key(
             &repo,
             &source_root,
             &config,
@@ -153,16 +166,27 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             &reporter,
             &state_key,
             &exclude_list,
+            &ignore_raw,
+            &config_raw,
         )
         .with_context(|| format!("syncing {branch:?} source -> dest"))?;
+        any_branch_halted_for_policy_mismatch |= halted;
     }
 
     // Every branch is accounted for — clear the pinned bar rather than
     // leaving it frozen on whatever its last step message happened to be
     // (decisions/0020's own Context cites clearing transient UI once a step
     // is done). The completed lines already printed above it are the
-    // permanent record of the run, not the bar itself.
+    // permanent record of the run, not the bar itself. Done before the
+    // policy-mismatch bail below too, for the same reason the conflict
+    // hard-stop already clears it before its own `anyhow::bail!`.
     reporter.finish();
+
+    if any_branch_halted_for_policy_mismatch {
+        anyhow::bail!(
+            "gitprism sync: one or more branches halted because a replayed commit's control file disagreed with the pinned policy — see the branch lines above for the affected commit(s) and remedy"
+        );
+    }
 
     Ok(())
 }
@@ -219,7 +243,7 @@ fn sync_pair_to_dest(
     config: &Config,
     branch: &str,
     reporter: &Reporter,
-) -> Result<()> {
+) -> Result<bool> {
     let key = marker::load_key()?;
     let source_tip = repo
         .find_branch(branch, git2::BranchType::Local)?
@@ -227,6 +251,13 @@ fn sync_pair_to_dest(
         .peel_to_commit()?
         .id();
     let exclude_list = load_current_exclude_list(repo, source_tip)?;
+    // The working tree, not `branch`'s own tip — matching `run`'s real
+    // `policy::load` (decisions/0037's pinned policy is one value shared by
+    // every branch, never a per-branch read).
+    let ignore_raw =
+        std::fs::read_to_string(source_root.join(exclude::FILENAME)).unwrap_or_default();
+    let config_raw =
+        std::fs::read_to_string(source_root.join(crate::config::FILENAME)).unwrap_or_default();
     sync_pair_to_dest_with_key(
         repo,
         source_root,
@@ -235,9 +266,16 @@ fn sync_pair_to_dest(
         reporter,
         &key,
         &exclude_list,
+        &ignore_raw,
+        &config_raw,
     )
 }
 
+/// Returns `Ok(true)` if this branch halted with nothing pushed because a
+/// replayed commit's control file disagreed with the pinned policy
+/// (decisions/0037) — `Ok(false)` for every other outcome (done, skipped, or
+/// decisions/0024's warning).
+#[allow(clippy::too_many_arguments)]
 fn sync_pair_to_dest_with_key(
     repo: &Repository,
     source_root: &Path,
@@ -246,7 +284,9 @@ fn sync_pair_to_dest_with_key(
     reporter: &Reporter,
     state_key: &marker::StateKey,
     exclude_list: &ExcludeList,
-) -> Result<()> {
+    ignore_raw: &str,
+    config_raw: &str,
+) -> Result<bool> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating source branch {branch:?}"))?;
     // decisions/0020: cyan in a completed line iff round-tripped (named in
@@ -274,42 +314,6 @@ fn sync_pair_to_dest_with_key(
         // and treating "no such ref" as the same failure it would be for a
         // branch that's supposed to already exist.
         let dest_ref_exists = git::remote_ref_exists(source_root, &dest_url, branch)?;
-
-        // decisions/0018, Case 2: a mirror-only branch with no dest ref may
-        // never have been synced yet, or it may have been synced, merged into
-        // a round-tripped branch via an ordinary PR, and had its now-merged
-        // mirror deleted on dest as routine cleanup — indistinguishable from
-        // "never synced" by ref/ancestry alone. Checked content-first, with no
-        // persisted state, before ever rebuilding anything: if `branch`'s
-        // content is already fully present in one of `config.branches`'s
-        // current tips, its absence on dest is expected, not something to
-        // resurrect (GitLab's own push-mirror does the same for its mirrors).
-        if !dest_ref_exists
-            && !round_tripped
-            && let Some(landing) = already_merged_into_a_landing_branch(
-                repo,
-                config,
-                source_tip,
-                source_root,
-                exclude_list,
-            )?
-        {
-            reporter.complete(
-                Outcome::Skipped,
-                branch,
-                Direction::SourceToDest,
-                round_tripped,
-                // "(expected for a mirror-only branch)" used to be spelled
-                // out here, but the completed line's own color already
-                // conveys round-trip vs. mirror-only (decisions/0020) — the
-                // note is for the reason, not a restatement of what the
-                // color already showed.
-                Some(&format!(
-                    "already merged into {landing:?}, cleaned up there"
-                )),
-            );
-            return Ok(());
-        }
 
         let (dest_tip, boundary) = if dest_ref_exists {
             if round_tripped {
@@ -401,10 +405,80 @@ fn sync_pair_to_dest_with_key(
                         "{branch:?} has no shared history with anything `gitprism setup` or a prior sync ever produced — combining unrelated histories is a manual `git merge --allow-unrelated-histories` job, not something gitprism will do"
                     )),
                 );
-                return Ok(());
+                return Ok(false);
             };
             (dest_tip, boundary)
         };
+
+        // decisions/0037: before building or pushing anything for this
+        // branch, every commit the replay would actually apply — same
+        // boundary/tip `build_pending_dest_tip` below is about to use — is
+        // checked for a `.gitprismignore`/`.gitprism.toml` that's present but
+        // disagrees with the pinned policy. Absence isn't a mismatch (the
+        // trusted policy already governs the commit regardless of its own
+        // tree), and this runs *before* decisions/0018's "already merged"
+        // classification just below so a control-file-only branch that would
+        // otherwise filter to a no-op halts loudly instead of being silently
+        // read as already-merged-and-cleaned-up.
+        let pending_for_policy_check = pending_commits(repo, boundary, source_tip)?;
+        if let Some(mismatch) = find_control_file_policy_mismatch(
+            repo,
+            &pending_for_policy_check,
+            branch,
+            state_key,
+            ignore_raw,
+            config_raw,
+        )? {
+            reporter.complete(
+                Outcome::Error,
+                branch,
+                Direction::SourceToDest,
+                round_tripped,
+                Some(&policy_mismatch_message(branch, &mismatch)),
+            );
+            // Per-branch halt, not a run-wide one (decisions/0037 contrasts
+            // itself with decisions/0007's conflict hard-stop): nothing for
+            // this branch is pushed, but `run` still processes every other
+            // branch and only fails the overall invocation once all of them
+            // are done.
+            return Ok(true);
+        }
+
+        // decisions/0018, Case 2: a mirror-only branch with no dest ref may
+        // never have been synced yet, or it may have been synced, merged into
+        // a round-tripped branch via an ordinary PR, and had its now-merged
+        // mirror deleted on dest as routine cleanup — indistinguishable from
+        // "never synced" by ref/ancestry alone. Checked content-first, with no
+        // persisted state, before ever rebuilding anything: if `branch`'s
+        // content is already fully present in one of `config.branches`'s
+        // current tips, its absence on dest is expected, not something to
+        // resurrect (GitLab's own push-mirror does the same for its mirrors).
+        if !dest_ref_exists
+            && !round_tripped
+            && let Some(landing) = already_merged_into_a_landing_branch(
+                repo,
+                config,
+                source_tip,
+                source_root,
+                exclude_list,
+            )?
+        {
+            reporter.complete(
+                Outcome::Skipped,
+                branch,
+                Direction::SourceToDest,
+                round_tripped,
+                // "(expected for a mirror-only branch)" used to be spelled
+                // out here, but the completed line's own color already
+                // conveys round-trip vs. mirror-only (decisions/0020) — the
+                // note is for the reason, not a restatement of what the
+                // color already showed.
+                Some(&format!(
+                    "already merged into {landing:?}, cleaned up there"
+                )),
+            );
+            return Ok(false);
+        }
 
         let build = build_pending_dest_tip(
             repo,
@@ -477,8 +551,115 @@ fn sync_pair_to_dest_with_key(
             round_tripped,
             (new_dest_tip.is_none()).then_some("up to date, nothing to sync"),
         );
-        return Ok(());
+        return Ok(false);
     }
+}
+
+/// A replayed commit whose control file disagreed with the pinned policy
+/// (decisions/0037): which commit, and which of the two filenames — never
+/// both conflated into one report, since the operator needs to know exactly
+/// which file to look at.
+struct PolicyMismatch {
+    commit: Oid,
+    filename: &'static str,
+}
+
+/// Whether any commit in `pending` — already filtered the same way
+/// [`build_pending_dest_tip`] filters its own loop-prevented commits, so this
+/// only ever inspects commits that would actually be replayed — carries a
+/// `.gitprismignore` or `.gitprism.toml` whose bytes differ from the
+/// digest-verified pinned policy (decisions/0037). A commit whose tree has no
+/// entry for a filename is never a mismatch: the trusted policy already
+/// governs that commit regardless of what its own tree contains, so absence
+/// can't weaken anything. Only a present-and-different file halts, reported
+/// for the first such commit found (oldest first, matching replay order).
+fn find_control_file_policy_mismatch(
+    repo: &Repository,
+    pending: &[Oid],
+    branch: &str,
+    key: &marker::StateKey,
+    ignore_raw: &str,
+    config_raw: &str,
+) -> Result<Option<PolicyMismatch>> {
+    for &commit_oid in pending {
+        let commit = repo
+            .find_commit(commit_oid)
+            .context("resolving a pending commit to check its control files")?;
+
+        // Same loop-prevention `build_pending_dest_tip` itself applies: a
+        // commit that came from dest→source (or from `setup`'s own graft) is
+        // never replayed onto dest by this branch's sync, so it's not this
+        // check's business either.
+        if marker::verify(
+            &commit,
+            branch,
+            &[MarkerDirection::Setup, MarkerDirection::DestToSource],
+            None,
+            key,
+        )
+        .is_some()
+        {
+            continue;
+        }
+
+        let tree = commit
+            .tree()
+            .context("reading a pending commit's tree to check its control files")?;
+        for (filename, pinned) in [
+            (exclude::FILENAME, ignore_raw.as_bytes()),
+            (crate::config::FILENAME, config_raw.as_bytes()),
+        ] {
+            if let Some(bytes) = read_control_file_blob(repo, &tree, filename, commit_oid)?
+                && bytes != pinned
+            {
+                return Ok(Some(PolicyMismatch {
+                    commit: commit_oid,
+                    filename,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Reads `filename`'s blob straight from `tree`'s root, bounded by
+/// decisions/0032's existing `MAX_CONTROL_FILE_BYTES` — the same limit every
+/// other control-file read in gitprism already respects — or `None` if the
+/// tree has no entry for it at all. Absence is the caller's concern, not
+/// this function's: decisions/0037 treats a missing control file as "not a
+/// mismatch," never as an empty one.
+fn read_control_file_blob(
+    repo: &Repository,
+    tree: &git2::Tree,
+    filename: &str,
+    commit: Oid,
+) -> Result<Option<Vec<u8>>> {
+    let Some(entry) = tree.get_name(filename) else {
+        return Ok(None);
+    };
+    let blob = repo
+        .find_blob(entry.id())
+        .with_context(|| format!("reading {filename}'s blob at commit {commit}"))?;
+    if blob.size() > limits::MAX_CONTROL_FILE_BYTES {
+        anyhow::bail!(
+            "{filename} at commit {commit} exceeds the {} byte limit",
+            limits::MAX_CONTROL_FILE_BYTES
+        );
+    }
+    Ok(Some(blob.content().to_vec()))
+}
+
+/// The operator-facing message for a halted branch (decisions/0037): names
+/// the branch, the offending commit, exactly which control file differs, and
+/// the remedy — update the pinned digest to the approved policy, or
+/// reconcile the branch.
+fn policy_mismatch_message(branch: &str, mismatch: &PolicyMismatch) -> String {
+    format!(
+        "{branch:?} halted — commit {} carries a {} that differs from the pinned policy; \
+         update GITPRISM_POLICY_SHA256 to the approved policy (via `gitprism policy-hash`) \
+         or reconcile the branch so its {} matches exactly",
+        mismatch.commit, mismatch.filename, mismatch.filename
+    )
 }
 
 /// The first commit in a direction's pending list that couldn't be merged
@@ -6340,6 +6521,317 @@ mod tests {
             dest_main_tip_after, merge_commit,
             "dest's main already carries everything source has (via the real merge); a \
              correct resume must find nothing new to push, leaving dest's tip unmoved"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_halts_a_branch_whose_replayed_commit_has_a_differing_gitprismignore() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        // A replayed commit whose own .gitprismignore differs from what's
+        // currently pinned — main's later commit (and, since checkout keeps
+        // the working tree at HEAD, the working tree gitprism actually reads
+        // the policy from) sets it to something else.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.log\n")]);
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.secret\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let halted = sync_pair_to_dest(&repo, source_dir.path(), &config, "main", &reporter)
+            .expect("a policy mismatch halts the branch, it must not error the whole call");
+        assert!(
+            halted,
+            "a replayed commit's differing .gitprismignore must halt this branch"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "nothing must be pushed to dest for a branch that halts on a policy mismatch"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_halts_a_branch_whose_replayed_commit_has_a_differing_gitprism_toml() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        // A replayed commit whose own .gitprism.toml differs from what's
+        // currently pinned (main's later commit, and therefore the checked-
+        // out working tree, sets it to something else).
+        add_commit_bytes(
+            &source_repo,
+            "main",
+            &[(crate::config::FILENAME, b"old config\n")],
+        );
+        add_commit_bytes(
+            &source_repo,
+            "main",
+            &[(crate::config::FILENAME, b"new config\n")],
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let halted = sync_pair_to_dest(&repo, source_dir.path(), &config, "main", &reporter)
+            .expect("a policy mismatch halts the branch, it must not error the whole call");
+        assert!(
+            halted,
+            "a replayed commit's differing .gitprism.toml must halt this branch"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "nothing must be pushed to dest for a branch that halts on a policy mismatch"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_replays_a_commit_with_no_control_file_at_all_normally() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("normal.txt", "content\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let halted = sync_pair_to_dest(&repo, source_dir.path(), &config, "main", &reporter)
+            .expect("a commit with no control file at all must not error");
+        assert!(
+            !halted,
+            "a replayed commit carrying no control file at all must never halt the branch"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            dest_main_tip_after
+                .tree()
+                .unwrap()
+                .get_name("normal.txt")
+                .is_some(),
+            "a commit carrying no control file must still be pushed to dest"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_syncs_normally_when_a_replayed_commits_control_file_matches_the_pin() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        // Two pending commits, each explicitly setting the same
+        // .gitprismignore content — present, and byte-for-byte identical to
+        // what ends up pinned (main's own tip, mirrored to the working
+        // tree), at both of them.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.log\n")]);
+        add_commit(
+            &source_repo,
+            "main",
+            &[("other.txt", "content\n"), (exclude::FILENAME, "*.log\n")],
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let halted = sync_pair_to_dest(&repo, source_dir.path(), &config, "main", &reporter)
+            .expect("a control file matching the pin must not error");
+        assert!(
+            !halted,
+            "a replayed commit whose control file matches the pinned policy byte-for-byte \
+             must not halt the branch"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            dest_main_tip_after
+                .tree()
+                .unwrap()
+                .get_name("other.txt")
+                .is_some(),
+            "a branch whose control file matches the pin must still sync its ordinary content"
+        );
+    }
+
+    #[test]
+    fn run_continues_other_branches_and_fails_overall_when_one_branch_halts_for_a_policy_mismatch()
+    {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A healthy mirror-only branch with no control files at all — must
+        // still sync even though "main" (sorted before it) is about to
+        // halt.
+        source_repo
+            .branch("other", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "other", &[("other.txt", "content\n")]);
+
+        // "main" gets a replayed commit whose .gitprismignore disagrees with
+        // what main's own tip (and therefore the checked-out working tree)
+        // ends up pinning.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.log\n")]);
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.secret\n")]);
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let err = run(source_dir.path(), config.path())
+            .expect_err("a policy mismatch on one branch must fail the overall run");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("polic"),
+            "the run's own error should mention the policy mismatch: {err:#}"
+        );
+
+        assert!(
+            dest_repo
+                .find_branch("other", git2::BranchType::Local)
+                .is_ok(),
+            "other branches must still sync when one branch halts for a policy mismatch"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "nothing must be pushed to dest for the halted branch"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_halts_a_control_file_only_branch_instead_of_classifying_it_already_merged()
+    {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // "main" pins the approved policy via its own tip content, mirrored
+        // to the checked-out working tree.
+        add_commit(&source_repo, "main", &[(exclude::FILENAME, "*.secret\n")]);
+
+        // "policy-update": the sanctioned GITPRISM_POLICY_SHA256-change
+        // workflow (decisions/0037's own Context) — a branch whose sole diff
+        // from "main" is a *different*, not-yet-approved .gitprismignore.
+        // `add_commit_bytes` (unlike `add_commit`) never writes straight to
+        // the working tree, so this doesn't clobber the pin main just set.
+        source_repo
+            .branch(
+                "policy-update",
+                &source_repo.find_commit(graft).unwrap(),
+                false,
+            )
+            .unwrap();
+        add_commit_bytes(
+            &source_repo,
+            "policy-update",
+            &[(exclude::FILENAME, b"*.secret\n*.log\n")],
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let halted = sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "policy-update",
+            &reporter,
+        )
+        .expect("a policy mismatch halts the branch, it must not error the whole call");
+        assert!(
+            halted,
+            "a control-file-only branch that differs from the pinned policy must halt, not be \
+             classified already-merged-and-cleaned-up"
+        );
+
+        assert!(
+            dest_repo
+                .find_branch("policy-update", git2::BranchType::Local)
+                .is_err(),
+            "a halted branch must never be pushed to dest"
         );
     }
 }
