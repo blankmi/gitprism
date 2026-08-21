@@ -378,7 +378,7 @@ fn sync_pair_to_dest_with_key(
             // `config.branches` entry, nothing guarantees this discovered
             // branch (decisions/0017) shares any ancestry with dest at all —
             // handled below (decisions/0024) the same way
-            // `already_merged_into_a_landing_branch`'s skip just above
+            // `already_merged_into_a_landing_branch`'s skip further below
             // handles decisions/0018's Case 2, not decisions/0023's setup-time
             // hard-fail for the superficially similar "no merge-base"
             // shape: an operator never asked gitprism to manage a branch
@@ -393,9 +393,14 @@ fn sync_pair_to_dest_with_key(
                 // history — gitprism still won't guess at joining unrelated
                 // histories (decisions/0007), but reports it as a warning and
                 // continues rather than aborting the whole run. Distinct from
-                // `Outcome::Skipped` above: this branch will keep reappearing
-                // every run until an operator acts on it, unlike that genuinely
-                // benign, one-time no-op.
+                // the `Outcome::Skipped` below: this branch will keep
+                // reappearing every run until an operator acts on it, unlike
+                // that genuinely benign, one-time no-op. Note this check now
+                // precedes that skip (decisions/0037 moved the already-merged
+                // classification after boundary resolution so the policy
+                // pre-pass could use the same boundary), so a branch with no
+                // marker at all reports this warning even where the older
+                // ordering would have recognized it as already merged.
                 reporter.complete(
                     Outcome::Warning,
                     branch,
