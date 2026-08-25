@@ -54,6 +54,40 @@ Combining these isn't redundant effort — each covers a gap the others leave: p
 gives free coverage tied to source activity, manual gives immediacy on demand,
 schedule guarantees an upper bound on staleness regardless of either.
 
+# Known problems
+
+Symptoms specific to GitLab Runner's environment, not gitprism itself.
+
+## `fatal: unable to get password from user`
+
+GitLab Runner sets `credential.interactive=false` (or `never`) in the local
+config of checkouts it creates, to avoid ever hanging on a prompt. That makes
+Git refuse to invoke `GIT_ASKPASS` at all. gitprism already works around this
+for its own Git invocations (`-c credential.interactive=true`, see
+`src/git.rs`) — this entry is informational, in case the same symptom shows
+up from a different tool sharing the checkout.
+
+## `No user exists for uid <n>` / `fatal: Could not read from remote repository`
+
+Runner containers (Docker and Kubernetes executors) commonly run jobs as an
+arbitrary numeric UID with no matching `/etc/passwd` entry. OpenSSH's client
+calls `getpwuid()` on itself at startup to resolve the current user, and
+aborts immediately if that lookup fails — before it opens a connection or
+attempts authentication. Any `ssh` invocation in that container hits this,
+regardless of which repo or remote it's for; it is not a permissions problem
+with the repository or its access rights, and gitprism has no way to work
+around it from inside its own Git invocations.
+
+Fix at the image/job level, operator's choice:
+
+* give the running UID a `/etc/passwd` entry before the job runs (entrypoint
+  `echo "gitprism:x:$(id -u):$(id -g)::/tmp:/bin/sh" >> /etc/passwd`, or
+  `nss_wrapper` with `NSS_WRAPPER_PASSWD`/`NSS_WRAPPER_GROUP` — the same
+  approach GitLab's own helper images use), or
+* configure source's and/or dest's remote as HTTPS with a token/deploy-token
+  credential instead of SSH — this sidesteps `ssh` entirely and lands in the
+  same `GIT_ASKPASS`/credential-helper path the previous entry covers.
+
 # Open
 
 Concrete `.gitlab-ci.yml` job definitions are an implementation detail for later, not

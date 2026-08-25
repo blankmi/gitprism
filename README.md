@@ -325,7 +325,7 @@ leaves everything else unaffected, and prints how to resolve it.
 
 See [`design/playbooks/0001-gitlab-pipeline-triggers.md`](design/playbooks/0001-gitlab-pipeline-triggers.md)
 for a suggested GitLab CI trigger setup (gitprism itself doesn't care what
-triggers it).
+triggers it) and known GitLab Runner environment problems.
 
 ### `gitprism resolve <branch>`
 
