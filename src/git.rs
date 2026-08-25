@@ -55,6 +55,14 @@ fn git_command() -> Command {
     command.env_remove("GITPRISM_STATE_KEY");
     command.env_remove("GITPRISM_SOURCE_URL");
     command.env_remove("GITPRISM_DEST_URL");
+    // The repo we operate on (via -C) may be a CI checkout whose .git/config
+    // sets credential.interactive=false/never (GitLab Runner does this on its
+    // own clones to avoid hangs). That setting makes git refuse to invoke
+    // GIT_ASKPASS at all, failing with "unable to get password from user"
+    // before our credential helper ever gets a chance to run. Force it back
+    // on for our own invocations, overriding whatever the ambient repo config
+    // says -- command-line -c takes precedence over any file-level config.
+    command.arg("-c").arg("credential.interactive=true");
     command
 }
 
