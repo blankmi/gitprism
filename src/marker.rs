@@ -84,7 +84,7 @@ fn parse_key(raw: &str) -> Result<StateKey> {
         anyhow::bail!("{ENV_KEY} must contain exactly 64 hexadecimal characters")
     }
     let mut key = [0; KEY_BYTES];
-    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         key[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Ok(StateKey(key))
@@ -114,7 +114,7 @@ fn hex_decode_mac(raw: &str) -> Option<[u8; MAC_BYTES]> {
         return None;
     }
     let mut mac = [0; MAC_BYTES];
-    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         mac[index] = ((hex_value(pair[0]).ok()? << 4) | hex_value(pair[1]).ok()?) as u8;
     }
     Some(mac)

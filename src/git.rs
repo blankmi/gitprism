@@ -1078,7 +1078,7 @@ pub fn ensure_merge_tree_supported() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::io::{Read as _, Write};
+    use std::io::Write;
     use std::time::Duration;
 
     use git2::Repository;
