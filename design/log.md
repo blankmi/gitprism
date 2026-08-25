@@ -1734,3 +1734,26 @@ read as commits having been pushed. Addendum recorded in decisions/0039.
 Verification: `cargo test` — 221 passed, 0 failed (baseline 218 plus 3 new).
 `cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` —
 clean.
+
+## 2026-08-25
+
+**Update**: Decided [decisions/0041](decisions/0041-dest-to-source-fetches-its-own-configured-branch-when-absent-locally.md),
+surfaced by a real GitLab deployment: a pipeline triggered by a push to `feature-x`
+leaves that job's checkout with no local branch for `develop`, even though `develop`
+is in `config.branches` — GitLab CI's default git strategy only fetches the single
+ref that triggered the pipeline. `sync_pair_from_dest_with_key`'s first attempt
+silently assumed every `config.branches` entry was already a local branch; it now
+fetches a missing one from source's own remote and creates the local branch itself,
+reusing the exact fetch the push-race retry path already had. Not a trigger problem
+— playbooks/0001's push/manual/schedule triggers are unchanged.
+
+**Update**: Implemented decisions/0041. TDD: added
+`sync_pair_from_dest_fetches_the_local_branch_when_absent_from_the_checkout`
+(deletes the local `develop` branch after grafting, seeds an independent dest
+commit, and expects a clean sync instead of a NotFound failure), confirmed it failed
+against the old code, then changed `sync_pair_from_dest_with_key`'s `attempt == 0`
+arm to fetch and create the local branch on `find_branch`'s `NotFound` instead of
+propagating it.
+
+Verification: `cargo test` — 222 passed, 0 failed (baseline 221 plus 1 new).
+`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` — clean.

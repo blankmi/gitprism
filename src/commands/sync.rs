@@ -1574,22 +1574,68 @@ fn sync_pair_from_dest_with_key(
             .context("resolving fetched dest branch to a commit")?
             .id();
 
-        // On the first attempt, source's own tip is just this checkout's
-        // local branch — `sync` always runs inside a real checkout of source
-        // (decisions/0012), so there's nothing to fetch for it normally. A
-        // retry means the push below lost a fast-forward race against
-        // source's *remote*, which this checkout's local branch can't see by
-        // itself — so from then on, refetch source's own branch too and
-        // recompute against its actual current tip, the same
-        // refetch-and-recompute principle decisions/0009 already established
-        // for the source→dest direction.
+        // On the first attempt, source's own tip is normally just this
+        // checkout's local branch — no fetch needed. But `branch` is a
+        // `config.branches` entry, meant to round-trip on every run
+        // regardless of which branch actually triggered this run
+        // (decisions/0005, decisions/0017), so it can't be assumed present:
+        // a CI job whose default git strategy only fetches the ref that
+        // triggered the pipeline (e.g. GitLab CI) leaves every other
+        // configured branch absent from this checkout entirely
+        // (decisions/0041). When that happens, fetch it from source's own
+        // remote and create the local branch from the fetched tip — the
+        // same fetch already used below for a lost push-race retry, just
+        // reused at the point it's actually needed, and left as a real
+        // local ref so `preflight_local_source_branch`/
+        // `advance_local_source_branch` need no special-casing.
+        //
+        // A retry (attempt > 0) means the push below lost a fast-forward
+        // race against source's *remote* instead, which the local branch
+        // (now guaranteed to exist) can't see by itself — so from then on,
+        // refetch source's own branch too and recompute against its actual
+        // current tip, the same refetch-and-recompute principle
+        // decisions/0009 already established for the source→dest direction.
         let source_tip = if attempt == 0 {
-            repo.find_branch(branch, git2::BranchType::Local)
-                .with_context(|| format!("resolving source branch {branch:?}"))?
-                .get()
-                .peel_to_commit()
-                .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
-                .id()
+            match repo.find_branch(branch, git2::BranchType::Local) {
+                Ok(local_branch) => local_branch
+                    .get()
+                    .peel_to_commit()
+                    .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
+                    .id(),
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                    let source_url = config.source_url()?;
+                    reporter.step(
+                        branch,
+                        Direction::DestToSource,
+                        "fetching source (branch not present in this checkout)",
+                    );
+                    git::fetch(source_root, &source_url, branch).with_context(|| {
+                        format!("fetching source branch {branch:?} from configured remote")
+                    })?;
+                    let fetched_tip = repo
+                        .find_reference("FETCH_HEAD")
+                        .context("reading FETCH_HEAD after fetch")?
+                        .peel_to_commit()
+                        .context("resolving fetched source branch to a commit")?
+                        .id();
+                    repo.reference(
+                        &format!("refs/heads/{branch}"),
+                        fetched_tip,
+                        false,
+                        "gitprism sync: creating local branch from source's own remote",
+                    )
+                    .with_context(|| {
+                        format!(
+                            "creating local branch {branch:?} from source's own remote at {fetched_tip}"
+                        )
+                    })?;
+                    fetched_tip
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("resolving source branch {branch:?}"));
+                }
+            }
         } else {
             // Only resolved once actually needed — a config that omits
             // [source].url/GITPRISM_SOURCE_URL entirely (decisions/0013) is
@@ -5039,6 +5085,110 @@ mod tests {
             "a dest commit carrying Gitprism-Source-Commit must not be cherry-picked back onto source"
         );
         let _ = looped_dest_tip; // the authenticated marker, not the tip identity, is under test
+    }
+
+    #[test]
+    fn sync_pair_from_dest_fetches_the_local_branch_when_absent_from_the_checkout() {
+        // Reproduces a real GitLab CI shape: a pipeline triggered by a push
+        // to some other branch checks out only that branch, so a
+        // round-tripped `config.branches` entry (here "develop") has no
+        // local `refs/heads/develop` in this checkout at all, even though it
+        // exists on both dest and source's own remote.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        bare_repo_with_a_commit_on(dest_dir.path(), "develop", &[("shared.txt", "v1")]);
+        let dest_tip = dest_repo
+            .find_branch("develop", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "develop", dest_tip, &dest_repo);
+        let graft_tip = source_repo
+            .find_branch("develop", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        // Stands in for source's own hosted remote — already grafted, as if
+        // `gitprism setup` had run and pushed this branch there previously.
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "develop", graft_tip);
+
+        // A merged dest PR, independent of anything gitprism has reflected
+        // into source yet.
+        add_independent_dest_commit_on(
+            &dest_repo,
+            "develop",
+            dest_tip,
+            ("shared.txt", "merged PR content"),
+            "merged PR on dest",
+        );
+
+        // Simulate this checkout not having "develop" locally: detach HEAD
+        // (git2 refuses to delete the branch HEAD currently points at) and
+        // delete the local branch, without touching the object database — a
+        // fresh single-ref CI clone would never have created this ref in the
+        // first place, but the effect on `find_branch` is the same either
+        // way.
+        source_repo.set_head_detached(graft_tip).unwrap();
+        source_repo
+            .find_branch("develop", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let config = Config::load(
+            write_config(
+                &source_remote.path().display().to_string(),
+                &dest_dir.path().display().to_string(),
+                &["develop"],
+            )
+            .path(),
+        )
+        .unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+        sync_pair_from_dest(&source_repo, source_dir.path(), &config, "develop", &reporter)
+            .expect("a missing local branch should be fetched from source's own remote, not treated as a hard failure");
+
+        let local_tip = source_repo
+            .find_branch("develop", git2::BranchType::Local)
+            .expect("the local branch should have been created from the fetched tip")
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_ne!(
+            local_tip, graft_tip,
+            "dest's independent commit should have been merged onto the newly created local branch"
+        );
+
+        let upstream = Repository::open(source_remote.path()).unwrap();
+        let upstream_tip = upstream
+            .find_branch("develop", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            upstream_tip.id(),
+            local_tip,
+            "the pushed remote tip and the newly created local branch must agree"
+        );
+        let blob = upstream
+            .find_blob(
+                upstream_tip
+                    .tree()
+                    .unwrap()
+                    .get_name("shared.txt")
+                    .unwrap()
+                    .id(),
+            )
+            .unwrap();
+        assert_eq!(blob.content(), b"merged PR content");
     }
 
     #[test]
