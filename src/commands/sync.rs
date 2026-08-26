@@ -116,10 +116,12 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     let config = verified_policy.config;
     let exclude_list = verified_policy.exclude_list;
     // Threaded into the source→dest loop below for decisions/0037's
-    // per-commit control-file consistency check — the same digest-verified
-    // bytes `exclude_list` was already built from, not a re-read.
+    // per-commit `.gitprismignore` consistency check — the same
+    // digest-verified bytes `exclude_list` was already built from, not a
+    // re-read. `.gitprism.toml` has no equivalent per-commit check
+    // (decisions/0037's amendment): it's verified once, globally, right
+    // above by `load_run_policy`, and never re-read per branch or per commit.
     let ignore_raw = verified_policy.ignore_raw;
-    let config_raw = verified_policy.config_raw;
     let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
 
     // Checked once per run, not once per merge (decisions/0016) — an
@@ -181,7 +183,6 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             &state_key,
             &exclude_list,
             &ignore_raw,
-            &config_raw,
         )
         .with_context(|| format!("syncing {branch:?} source -> dest"))?;
         any_branch_halted_for_policy_mismatch |= halted;
@@ -270,8 +271,6 @@ fn sync_pair_to_dest(
     // every branch, never a per-branch read).
     let ignore_raw =
         std::fs::read_to_string(source_root.join(exclude::FILENAME)).unwrap_or_default();
-    let config_raw =
-        std::fs::read_to_string(source_root.join(crate::config::FILENAME)).unwrap_or_default();
     sync_pair_to_dest_with_key(
         repo,
         source_root,
@@ -281,7 +280,6 @@ fn sync_pair_to_dest(
         &key,
         &exclude_list,
         &ignore_raw,
-        &config_raw,
     )
 }
 
@@ -299,7 +297,6 @@ fn sync_pair_to_dest_with_key(
     state_key: &marker::StateKey,
     exclude_list: &ExcludeList,
     ignore_raw: &str,
-    config_raw: &str,
 ) -> Result<bool> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating source branch {branch:?}"))?;
@@ -488,13 +485,15 @@ fn sync_pair_to_dest_with_key(
         // decisions/0037: before building or pushing anything for this
         // branch, every commit the replay would actually apply — same
         // boundary/tip `build_pending_dest_tip` below is about to use — is
-        // checked for a `.gitprismignore`/`.gitprism.toml` that's present but
-        // disagrees with the pinned policy. Absence isn't a mismatch (the
-        // trusted policy already governs the commit regardless of its own
-        // tree), and this runs *before* decisions/0018's "already merged"
-        // classification just below so a control-file-only branch that would
-        // otherwise filter to a no-op halts loudly instead of being silently
-        // read as already-merged-and-cleaned-up.
+        // checked for a `.gitprismignore` that's present but disagrees with
+        // the pinned policy (its amendment excludes `.gitprism.toml` from
+        // this per-commit check; see `find_control_file_policy_mismatch`).
+        // Absence isn't a mismatch (the trusted policy already governs the
+        // commit regardless of its own tree), and this runs *before*
+        // decisions/0018's "already merged" classification just below so a
+        // control-file-only branch that would otherwise filter to a no-op
+        // halts loudly instead of being silently read as
+        // already-merged-and-cleaned-up.
         let pending_for_policy_check = pending_commits(repo, boundary, source_tip)?;
         if let Some(mismatch) = find_control_file_policy_mismatch(
             repo,
@@ -502,7 +501,6 @@ fn sync_pair_to_dest_with_key(
             branch,
             state_key,
             ignore_raw,
-            config_raw,
         )? {
             reporter.complete(
                 Outcome::Error,
@@ -676,22 +674,31 @@ enum PolicyMismatchReason {
 /// Whether any commit in `pending` — already filtered the same way
 /// [`build_pending_dest_tip`] filters its own loop-prevented commits, so this
 /// only ever inspects commits that would actually be replayed — carries a
-/// `.gitprismignore` or `.gitprism.toml` that either can't be read and
-/// compared at all (a non-blob entry, or a blob over the size limit) or
-/// whose bytes differ from the digest-verified pinned policy (decisions/0037,
-/// with an addendum: safety not being establishable is classified the same
-/// way as bytes actively disagreeing). A commit whose tree has no entry for a
-/// filename is never a mismatch: the trusted policy already governs that
-/// commit regardless of what its own tree contains, so absence can't weaken
-/// anything. Only the first such commit found (oldest first, matching replay
-/// order) is reported.
+/// `.gitprismignore` that either can't be read and compared at all (a
+/// non-blob entry, or a blob over the size limit) or whose bytes differ from
+/// the digest-verified pinned policy (decisions/0037, with an addendum:
+/// safety not being establishable is classified the same way as bytes
+/// actively disagreeing). A commit whose tree has no entry is never a
+/// mismatch: the trusted policy already governs that commit regardless of
+/// what its own tree contains, so absence can't weaken anything. Only the
+/// first such commit found (oldest first, matching replay order) is
+/// reported.
+///
+/// `.gitprism.toml` is deliberately not checked here (decisions/0037's later
+/// amendment): unlike `.gitprismignore`, it's self-excluded from dest and
+/// never consulted per replayed commit — decisions/0026 loads and verifies
+/// it exactly once, globally, before either sync phase runs — so an earlier
+/// pending commit's differing bytes can't leak content the way an
+/// unenforced exclusion can. Checking it per-commit only produced friction
+/// (an operator iterating on `.gitprism.toml` before the first successful
+/// sync accumulates several pending versions) with no matching security
+/// benefit.
 fn find_control_file_policy_mismatch(
     repo: &Repository,
     pending: &[Oid],
     branch: &str,
     key: &marker::StateKey,
     ignore_raw: &str,
-    config_raw: &str,
 ) -> Result<Option<PolicyMismatch>> {
     for &commit_oid in pending {
         let commit = repo
@@ -717,23 +724,19 @@ fn find_control_file_policy_mismatch(
         let tree = commit
             .tree()
             .context("reading a pending commit's tree to check its control files")?;
-        for (filename, pinned) in [
-            (exclude::FILENAME, ignore_raw.as_bytes()),
-            (crate::config::FILENAME, config_raw.as_bytes()),
-        ] {
-            let reason = match read_control_file_blob(repo, &tree, filename, commit_oid)? {
-                ControlFileRead::Absent => continue,
-                ControlFileRead::Blob(bytes) if bytes == pinned => continue,
-                ControlFileRead::Blob(_) => PolicyMismatchReason::DiffersFromPinnedPolicy,
-                ControlFileRead::NotARegularFile => PolicyMismatchReason::NotARegularFile,
-                ControlFileRead::TooLarge => PolicyMismatchReason::ExceedsSizeLimit,
-            };
-            return Ok(Some(PolicyMismatch {
-                commit: commit_oid,
-                filename,
-                reason,
-            }));
-        }
+        let filename = exclude::FILENAME;
+        let reason = match read_control_file_blob(repo, &tree, filename, commit_oid)? {
+            ControlFileRead::Absent => continue,
+            ControlFileRead::Blob(bytes) if bytes == ignore_raw.as_bytes() => continue,
+            ControlFileRead::Blob(_) => PolicyMismatchReason::DiffersFromPinnedPolicy,
+            ControlFileRead::NotARegularFile => PolicyMismatchReason::NotARegularFile,
+            ControlFileRead::TooLarge => PolicyMismatchReason::ExceedsSizeLimit,
+        };
+        return Ok(Some(PolicyMismatch {
+            commit: commit_oid,
+            filename,
+            reason,
+        }));
     }
     Ok(None)
 }
@@ -6976,7 +6979,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_pair_to_dest_halts_a_branch_whose_replayed_commit_has_a_differing_gitprism_toml() {
+    fn sync_pair_to_dest_replays_a_commit_with_a_differing_gitprism_toml_normally() {
         let dest_dir = tempdir().unwrap();
         let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
         let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -6984,9 +6987,15 @@ mod tests {
         let source_dir = tempdir().unwrap();
         let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
 
-        // A replayed commit whose own .gitprism.toml differs from what's
-        // currently pinned (main's later commit, and therefore the checked-
-        // out working tree, sets it to something else).
+        // Two pending commits, neither yet synced to dest, each setting a
+        // different .gitprism.toml — the setup-iteration shape: an operator
+        // edits the config more than once before the first successful sync.
+        // Unlike .gitprismignore, .gitprism.toml is never consulted per
+        // replayed commit (decisions/0026's config is loaded exactly once,
+        // globally) and is self-excluded from dest, so an earlier pending
+        // commit's differing bytes can't leak anything the later commit
+        // didn't already govern — decisions/0037's amendment: only
+        // .gitprismignore is checked per pending commit.
         add_commit_bytes(
             &source_repo,
             "main",
@@ -6995,7 +7004,10 @@ mod tests {
         add_commit_bytes(
             &source_repo,
             "main",
-            &[(crate::config::FILENAME, b"new config\n")],
+            &[
+                (crate::config::FILENAME, b"new config\n"),
+                ("normal.txt", b"content\n"),
+            ],
         );
 
         let config = Config::load(
@@ -7006,10 +7018,10 @@ mod tests {
         let reporter = Reporter::new(1, std::iter::empty());
 
         let halted = sync_pair_to_dest(&repo, source_dir.path(), &config, "main", &reporter)
-            .expect("a policy mismatch halts the branch, it must not error the whole call");
+            .expect("a differing .gitprism.toml must not error");
         assert!(
-            halted,
-            "a replayed commit's differing .gitprism.toml must halt this branch"
+            !halted,
+            "a replayed commit's differing .gitprism.toml must never halt the branch"
         );
 
         let dest_main_tip_after = dest_repo
@@ -7017,11 +7029,14 @@ mod tests {
             .unwrap()
             .get()
             .peel_to_commit()
-            .unwrap()
-            .id();
-        assert_eq!(
-            dest_main_tip_after, dest_tip,
-            "nothing must be pushed to dest for a branch that halts on a policy mismatch"
+            .unwrap();
+        assert!(
+            dest_main_tip_after
+                .tree()
+                .unwrap()
+                .get_name("normal.txt")
+                .is_some(),
+            "ordinary content alongside a differing .gitprism.toml must still reach dest"
         );
     }
 
@@ -8225,7 +8240,7 @@ mod tests {
             "main",
             &PolicyMismatch {
                 commit,
-                filename: crate::config::FILENAME,
+                filename: exclude::FILENAME,
                 reason: PolicyMismatchReason::ExceedsSizeLimit,
             },
         );
