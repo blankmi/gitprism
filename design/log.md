@@ -1819,3 +1819,60 @@ missing-object check (shared with round-tripped branches) is untouched.
 
 Verification: `cargo test` — 224 passed, 0 failed (222 + 2 new). `cargo clippy
 --all-targets` — clean.
+
+## 2026-08-26 — narrow the missing-object check to NotFound, document two limitations
+
+**Update**: A code review of `fb6763d` found `mirror_only_rewrite_detected`'s
+`repo.find_commit(boundary).is_err()` treats any libgit2 error as "object
+missing," which on a non-shallow clone now resolves to a confirmed rewrite
+and a force-push — a transient ODB error or corruption would be misread as a
+rewrite instead of failing loudly, against AGENTS.md's own "fail clearly and
+let the operator resolve it" default. Narrowed to `Err(error) if error.code()
+== git2::ErrorCode::NotFound`, the same guard already used at `sync.rs:1618`
+for an unrelated missing-object case; every other `Err` now propagates with
+context. Investigated empirically what `find_commit` actually returns for a
+present-but-wrong-type object (a tree/blob oid): also `ErrorCode::NotFound`
+(different `ErrorClass`, same code) — libgit2 doesn't distinguish "wrong
+type" from "absent" here, so that case stays on the missing-object path
+either way. A genuinely different code is realistic: a loose object file this
+process can't read reports `ErrorCode::Locked`, confirmed with a chmod'd
+object in a new test
+(`mirror_only_rewrite_detected_propagates_a_real_lookup_failure_instead_of_guessing`),
+which fails as `Ok(true)` against the pre-narrowing code. Updated
+`mirror_only_rewrite_detected`'s own doc comment, which still described the
+missing-object case as never counting as a detected rewrite — no longer true
+on a non-shallow clone — and trimmed the inline comment `fb6763d` added,
+which restated decisions/0039's addendum prose inline, to a short pointer at
+the addendum instead (AGENTS.md: no code comments duplicating existing
+documentation).
+
+Also recorded, per decisions/0039's addendum, as known accepted limitations
+rather than fixed: `Repository::is_shallow` is a whole-repository flag, not
+scoped to the branch under evaluation, so a shared `Repository` handle with
+any ref ever shallow-fetched reads `true` for every branch's check that
+`sync` run — a fully-fetched branch with a genuine rewrite falls back to
+refusal instead of rebuilding (fails safe, confirmed git/libgit2 expose no
+finer granularity: `.git/shallow` is a flat, non-branch-scoped list). And a
+non-shallow read doesn't strictly prove the odb holds everything reachable
+from `source_tip` for a clone made with `--reference`/`--shared`/alternates,
+never marked shallow but able to lose objects if the alternate store is
+independently pruned — gitprism doesn't create such clones itself but
+doesn't preclude one.
+
+Also fixed `fresh_clone_of_branch`'s shallow-clone test fixture: it hand-rolled
+a `std::process::Command` git invocation for `--depth=1`, bypassing
+`git::fetch`'s validation and diagnostics. `git.rs`'s `fetch` is now split
+into a shared `fetch_with_depth(..., depth: Option<u32>)` and a thin public
+`fetch` (`depth: None`); a `#[cfg(test)]`-only `fetch_shallow` exposes
+`Some(depth)` for the fixture, reusing the same validation and diagnostics —
+gitprism itself never calls it, only tests do.
+
+Also factored the amend rewrite test and the two new fresh-clone tests'
+~30-line-each duplicated setup (dest with one commit, source grafted onto
+it, a mirror-only `feature-x` branch synced once) into
+`mirror_only_feature_branch_synced_once`, the same precedent
+`repository_with_commits` already set in this file.
+
+Verification: `cargo test` — 227 passed, 0 failed (224 + 3 new: the lookup-
+failure test, plus 2 for `fetch_shallow` in `git.rs`). `cargo clippy
+--all-targets` — clean. Nothing committed; changes left in the working tree.

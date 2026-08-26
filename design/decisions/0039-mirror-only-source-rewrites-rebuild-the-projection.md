@@ -423,3 +423,69 @@ detect a rewrite" reasoning.
   is already its own bare repo in these fixtures) that never fetched the
   pre-rewrite tip, on both a shallow and a non-shallow clone of it — shallow
   keeps refusing, non-shallow rebuilds.
+
+# Addendum: narrow the missing-object branch to `NotFound`, and two
+documented limitations
+
+A review of the previous addendum's implementation found
+`repo.find_commit(boundary).is_err()` (`sync.rs:1281` at the time) treats
+*any* libgit2 error as "object missing," not just a genuinely absent object.
+On a non-shallow clone that misread now resolves to `Ok(true)` — a confirmed
+rewrite, force-pushed via `PushMode::ForceMirrorOnly` — for a transient ODB
+error or corruption gitprism should instead fail loudly on, per
+[AGENTS.md](../../AGENTS.md)'s "if resolution requires guessing intent...
+fail clearly and let the operator resolve it."
+
+**Decision.** `mirror_only_rewrite_detected` now matches on
+`repo.find_commit(boundary)` directly: `Err(error) if error.code() ==
+git2::ErrorCode::NotFound` is the only branch read as "missing," taking the
+same `!repo.is_shallow()` path this addendum already established; every
+other `Err` propagates via `.with_context(...)` as a real error instead of
+being guessed either way. This is the same `ErrorCode::NotFound` guard
+already used at `sync.rs:1618` for an unrelated missing-object case,
+narrowed here rather than introducing a new pattern.
+
+**Empirically, this rarely matters in practice but is still worth the
+narrowing.** `git2::Repository::find_commit` on an object that exists but
+isn't a commit (a tree or blob oid, tested directly) also reports
+`ErrorCode::NotFound` — libgit2 folds "wrong type" into the same code as
+"absent," just under `ErrorClass::Invalid` instead of `ErrorClass::Odb`, so
+that particular case is not actually distinguishable from a genuinely
+missing object this way and stays on the missing-object path either way. A
+non-`NotFound` error is realistic, though: a loose object file this process
+can't read (permission denied, corruption) reports `ErrorCode::Locked`
+(`ErrorClass::Os`), confirmed with a chmod'd loose object in a test — the
+new `mirror_only_rewrite_detected_propagates_a_real_lookup_failure_instead_of_guessing`
+test, which chmods a real boundary commit's own loose object file to `0o000`
+and asserts `Err`, confirmed to fail (as `Ok(true)`) against the
+pre-narrowing code.
+
+**Two known, accepted limitations, documented rather than fixed** — per
+AGENTS.md's default ("the default decision is to stop and involve the
+operator, unless the project owner explicitly decides the added automation
+is necessary"), neither is being solved here, both fail safe (refuse rather
+than wrongly force-push) or are already outside gitprism's control:
+
+* **`is_shallow()` is a whole-repository flag, not scoped to the branch
+  being evaluated.** One shared `Repository` handle serves every branch in a
+  `sync` run (`sync.rs`'s `run`); if any ref in that checkout was ever
+  shallow-fetched, `is_shallow()` reads `true` for every branch's check that
+  run, even a fully-fetched branch with a genuine rewrite — that branch
+  falls back to refusal instead of rebuilding. Git and libgit2 don't expose
+  finer granularity than this: `git_repository_is_shallow` is backed only by
+  whether `.git/shallow` exists and is non-empty (confirmed against the
+  git2-rs source), and `.git/shallow`'s own content is a flat list of
+  grafted shallow-boundary commit ids from the *current* shallow history, not
+  a per-branch or per-object record of what's missing — there is nothing to
+  scope the check to a single branch with. This fails safe: the outcome is
+  an unnecessary refusal, never a wrong force-push.
+* **A non-shallow read does not strictly prove the odb holds everything
+  reachable from `source_tip`.** `is_shallow()==false` is treated as proof
+  the object database holds everything reachable from `source_tip` — true
+  for every clone gitprism itself creates, but not strictly true for a clone
+  made with `git clone --reference`/`--shared`, or one relying on alternates
+  (`.git/objects/info/alternates`): such a clone is never marked shallow, yet
+  can lose objects if the alternate object store it depends on is
+  independently pruned or garbage-collected later. gitprism doesn't create
+  such clones itself and has no supported workflow that does, but doesn't
+  preclude an operator from pointing it at one.

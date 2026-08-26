@@ -415,25 +415,20 @@ fn kill_and_reap(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Fetch `branch` from `url` into `repo_dir`'s local object database,
-/// landing at `FETCH_HEAD` — same as running `git fetch <url> <refspec>` by
-/// hand inside `repo_dir`. Quiet: git's own "From <url> / * branch ... ->
-/// FETCH_HEAD" summary is raw plumbing output with no framing about which
-/// sync phase or branch it belongs to, and looks identical whether it's
-/// checking a round-tripped branch or a mirror-only one — callers print
-/// their own labeled progress line instead (see `sync.rs`). Real failures
-/// (bad ref, network, auth) still surface: `-q` only silences the progress
-/// summary, not errors.
-pub fn fetch(repo_dir: &Path, url: &str, branch: &str) -> Result<()> {
+/// Shared by [`fetch`] and [`fetch_shallow`]: validation, argument-building,
+/// and diagnostics for a `git fetch` landing at `FETCH_HEAD`. `depth` is
+/// `None` for an ordinary full fetch, `Some(n)` for a `--depth=n` truncated
+/// one.
+fn fetch_with_depth(repo_dir: &Path, url: &str, branch: &str, depth: Option<u32>) -> Result<()> {
     validate_remote(url)?;
     validate_branch_name(branch)?;
     let source_ref = format!("refs/heads/{branch}");
     let mut command = git_command();
+    command.arg("-C").arg(repo_dir).arg("fetch").arg("-q");
+    if let Some(depth) = depth {
+        command.arg(format!("--depth={depth}"));
+    }
     command
-        .arg("-C")
-        .arg(repo_dir)
-        .arg("fetch")
-        .arg("-q")
         .arg("--")
         .arg(url)
         .arg(&source_ref)
@@ -450,6 +445,29 @@ pub fn fetch(repo_dir: &Path, url: &str, branch: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Fetch `branch` from `url` into `repo_dir`'s local object database,
+/// landing at `FETCH_HEAD` — same as running `git fetch <url> <refspec>` by
+/// hand inside `repo_dir`. Quiet: git's own "From <url> / * branch ... ->
+/// FETCH_HEAD" summary is raw plumbing output with no framing about which
+/// sync phase or branch it belongs to, and looks identical whether it's
+/// checking a round-tripped branch or a mirror-only one — callers print
+/// their own labeled progress line instead (see `sync.rs`). Real failures
+/// (bad ref, network, auth) still surface: `-q` only silences the progress
+/// summary, not errors.
+pub fn fetch(repo_dir: &Path, url: &str, branch: &str) -> Result<()> {
+    fetch_with_depth(repo_dir, url, branch, None)
+}
+
+/// Same as [`fetch`], truncated to `depth` — a real `--depth`-limited `git
+/// fetch`, not a hand-rolled subprocess, so it goes through the same
+/// validation and diagnostics. gitprism itself never calls this: it exists
+/// so tests can produce a genuinely shallow clone (`Repository::is_shallow`)
+/// without bypassing [`fetch`]'s `validate_remote`/`validate_branch_name`.
+#[cfg(test)]
+pub(crate) fn fetch_shallow(repo_dir: &Path, url: &str, branch: &str, depth: u32) -> Result<()> {
+    fetch_with_depth(repo_dir, url, branch, Some(depth))
 }
 
 /// Whether `refspec` currently exists as a branch on `url` — a real `git
@@ -1365,6 +1383,51 @@ mod tests {
             "refs/heads/main:refs/heads/other",
         )
         .expect_err("fetch accepts branch names, not caller-provided refspecs");
+
+        assert!(err.to_string().contains("invalid branch name"));
+        assert!(!source_dir.path().join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn fetch_shallow_lands_the_remote_branch_at_fetch_head_and_produces_a_shallow_clone() {
+        let dest_dir = tempdir().unwrap();
+        let expected = repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        fetch_shallow(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            "main",
+            1,
+        )
+        .expect("a depth-limited fetch of an existing branch should succeed");
+
+        let fetched = source_repo
+            .find_reference("FETCH_HEAD")
+            .expect("FETCH_HEAD should exist after a successful fetch")
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(fetched.id(), expected);
+        assert!(
+            source_repo.is_shallow(),
+            "a --depth=1 fetch must leave the clone shallow"
+        );
+    }
+
+    #[test]
+    fn fetch_shallow_rejects_a_raw_refspec_before_touching_fetch_head() {
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        let err = fetch_shallow(
+            source_dir.path(),
+            "/does/not/matter",
+            "refs/heads/main:refs/heads/other",
+            1,
+        )
+        .expect_err("fetch_shallow accepts branch names, not caller-provided refspecs");
 
         assert!(err.to_string().contains("invalid branch name"));
         assert!(!source_dir.path().join(".git/FETCH_HEAD").exists());
