@@ -336,3 +336,90 @@ No condition, boundary computation, or rewrite-detection logic changes;
 this addendum only corrects what happens with the boundary and rebuild base
 this decision already established once `build_pending_dest_tip` reports
 nothing to build from them.
+
+# Addendum: a missing boundary object is confirmed as a rewrite on a
+non-shallow clone
+
+A real deployment hit condition 4's `repo.find_commit(boundary).is_err()`
+branch (`sync.rs:1278`, mirrored in `dest_resume_point_for_branch`'s own
+`sync.rs:1220`) on an ordinary `git commit --amend && git push --force` of a
+mirror-only branch — exactly the case this decision names as in scope
+("a mirror-only branch rewritten via `git commit --amend`: ... the old dest
+history is replaced"). The push was refused with the generic resume-point
+message instead of rebuilding.
+
+**Why.** The boundary trailer names the pre-rewrite tip. Once force-pushed,
+that commit is unreachable from any ref on source; a CI job that clones or
+fetches fresh (GitLab Runner's default) never retrieves it, so
+`find_commit(boundary)` fails before the ancestry check that would otherwise
+identify the rewrite ever runs. The code already treats a missing boundary
+object conservatively — "a different failure than a rewrite" (the doc
+comment above `mirror_only_rewrite_detected`) — which was the right call
+when the object could be missing for either of two reasons: the branch was
+genuinely rewritten, or this clone simply hasn't fetched enough history yet
+to have it (still an ordinary fast-forward underneath). Those two cases were
+indistinguishable from inside `mirror_only_rewrite_detected` as written, so
+it refused both alike.
+
+They stop being indistinguishable once it's known whether this clone's
+history for the branch is complete. `Repository::is_shallow` (git2, backed by
+`git_repository_is_shallow`) answers exactly that, for the whole repository,
+using no new git operation gitprism doesn't already have a handle for. On a
+**non-shallow** clone, a missing boundary object has no remaining
+explanation other than the commit no longer being reachable from source's
+current history — the same conclusion condition 4's ordinary
+`graph_descendant_of` check reaches when the object *is* present and simply
+isn't an ancestor. On a **shallow** clone, the ambiguity is real and
+unresolved by anything gitprism can check locally; today's refusal, with its
+existing "fetch/pull the latest source history first" guidance, stands
+unchanged.
+
+**Decision.** In `mirror_only_rewrite_detected` only — not
+`dest_resume_point_for_branch`, whose conservative `None` for a round-tripped
+branch must never be reinterpreted as a confirmed rewrite — replace
+
+```
+if boundary == source_tip || repo.find_commit(boundary).is_err() {
+    return Ok(false);
+}
+```
+
+with a missing-object branch that checks `repo.is_shallow()`: shallow keeps
+returning `Ok(false)` (unchanged); non-shallow returns `Ok(true)` directly,
+since there is nothing further to check — no boundary commit exists to run
+`graph_descendant_of` against, and its absence *is* the positive
+identification. `boundary == source_tip` keeps its own unconditional `Ok(false)`,
+shallow or not: that case means source hasn't moved past the recorded
+boundary at all, never a rewrite regardless of clone completeness.
+
+This does not loosen condition 3 (a prior gitprism marker must still be found
+before this function is even reached) or narrow who may request
+`ForceMirrorOnly` (still only `sync_pair_to_dest`, still only after this
+check). It only replaces one conservative guess ("missing means unknown, so
+refuse") with a deterministic read of a fact the object database already
+knows, matching this decision's original "no new git operation is added to
+detect a rewrite" reasoning.
+
+**Consequences.**
+* A shallow CI checkout still refuses on a rewrite whose boundary object
+  went missing, unchanged from today — this addendum does not eliminate the
+  ambiguity there, it eliminates it only where the object database has
+  enough information to actually resolve it. Deployment guidance (fetch depth
+  for branches gitprism runs against) is deployment guidance, tracked
+  separately in `design/playbooks/`, not folded into this code change.
+* Every rewrite shape this decision already lists (amend, rebase, hard reset)
+  can now hit this path, not just `git reset --hard` to an already-marked
+  commit (the prior addendum's case) — any of them discards the boundary
+  commit outright when it was the exact tip dest last synced from, and a
+  fresh clone never has it.
+* **Test gap found alongside this addendum, must be closed together**: the
+  existing amend/rebase/reset tests (`sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_*`)
+  rewrite `source_repo` in place via `branch(..., force: true)` — the
+  pre-rewrite commit stays present in the same object database throughout,
+  so `find_commit(boundary)` trivially succeeds and none of them exercise
+  this addendum's path at all. At least one test must instead model a real
+  deployment: rewrite source in one repo, then run `sync_pair_to_dest`
+  against a **separate, freshly fetched clone** (mirroring how `dest_dir`
+  is already its own bare repo in these fixtures) that never fetched the
+  pre-rewrite tip, on both a shallow and a non-shallow clone of it — shallow
+  keeps refusing, non-shallow rebuilds.

@@ -1783,3 +1783,39 @@ dest), confirmed it failed against the old code, then removed `.gitprism.toml` f
 
 Verification: `cargo test` — 222 passed, 0 failed (same count: one test replaced,
 not added). `cargo clippy --all-targets` — clean.
+
+## 2026-08-26
+
+**Update**: Addendum to [decisions/0039](decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md):
+a real deployment hit condition 4's missing-boundary-object branch on an
+ordinary `git commit --amend && git push --force` of a mirror-only branch —
+a case this decision already lists as in scope — because a fresh CI clone
+never has the pre-rewrite tip the boundary trailer names, and a missing
+object was (correctly, at the time) treated as "can't tell, refuse" rather
+than a confirmed rewrite. `Repository::is_shallow` resolves the ambiguity
+deterministically: on a non-shallow clone, nothing else can explain a
+missing boundary object, so it's now read as confirmed. On a shallow clone
+the ambiguity is real and the existing refusal stands. Found alongside it: the
+existing amend/rebase/reset tests never actually exercise this path, since
+they rewrite `source_repo` in place and the pre-rewrite object never leaves
+the object database — closing that gap is tracked as part of the same
+implementation.
+
+**Update**: Implemented the addendum. TDD: added
+`sync_pair_to_dest_rebuilds_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_non_shallow_clone`,
+which runs the amend rewrite against a genuinely separate `fresh_clone_of_branch`
+fixture (a real `git fetch` into a brand-new repo, so the pre-rewrite tip is
+truly absent, not just orphaned-but-present the way the in-place `branch(...,
+force: true)` rewrite tests leave it) — confirmed it failed with today's
+"isn't at a point this clone can safely build on" refusal against the old
+code. Added the shallow counterpart
+(`sync_pair_to_dest_still_refuses_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_shallow_clone`,
+a `--depth=1` fetch) as a regression guard, confirmed it already passed
+(refusal is correct there and unchanged). Fixed `mirror_only_rewrite_detected`
+in `sync.rs`: split the `boundary == source_tip || find_commit(boundary).is_err()`
+guard so a missing boundary object now returns `!repo.is_shallow()` instead of
+an unconditional `false` — `dest_resume_point_for_branch`'s own, separate
+missing-object check (shared with round-tripped branches) is untouched.
+
+Verification: `cargo test` — 224 passed, 0 failed (222 + 2 new). `cargo clippy
+--all-targets` — clean.

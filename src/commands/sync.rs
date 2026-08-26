@@ -1275,8 +1275,18 @@ fn mirror_only_rewrite_detected(
     let Some(boundary) = newest_source_marker(repo, dest_tip, branch, key)? else {
         return Ok(false);
     };
-    if boundary == source_tip || repo.find_commit(boundary).is_err() {
+    if boundary == source_tip {
         return Ok(false);
+    }
+    if repo.find_commit(boundary).is_err() {
+        // decisions/0039 addendum: on a shallow clone this is genuinely
+        // ambiguous — rewritten, or just not fetched far back enough yet —
+        // so it stays refused, unchanged. On a non-shallow clone there is no
+        // other explanation left: the object database holds everything
+        // reachable from `source_tip`, and the boundary isn't in it. That
+        // absence is itself the positive identification condition 4 asks
+        // for; there's no `graph_descendant_of` left to run.
+        return Ok(!repo.is_shallow());
     }
 
     let descends = repo.graph_descendant_of(source_tip, boundary).with_context(|| {
@@ -2625,6 +2635,54 @@ mod tests {
             index.read_tree(&commit.tree().unwrap()).unwrap();
             index.write().unwrap();
         }
+    }
+
+    /// A fresh, independent clone of `branch` off `source_repo`, mimicking
+    /// what a real CI checkout gives gitprism: only objects reachable from
+    /// `branch`'s current tip, nothing this repo's own working history still
+    /// happens to have lying around unreachable in its object database.
+    /// `shallow` controls whether the clone is `--depth=1` (so
+    /// `Repository::is_shallow` reports true) or a plain, full fetch of
+    /// everything reachable (not shallow, but — unlike the in-place
+    /// `branch(..., force: true)` rewrites the other rewrite tests use —
+    /// still genuinely missing anything `source_repo` itself no longer
+    /// reaches from a ref, e.g. a pre-amend/pre-rebase/pre-reset tip).
+    fn fresh_clone_of_branch(
+        source_repo: &Repository,
+        branch: &str,
+        shallow: bool,
+    ) -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let url = source_repo.path().display().to_string();
+        let refspec = format!("refs/heads/{branch}");
+        if shallow {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .arg("fetch")
+                .arg("-q")
+                .arg("--depth=1")
+                .arg(&url)
+                .arg(&refspec)
+                .status()
+                .unwrap();
+            assert!(status.success(), "shallow fetch of {branch:?} failed");
+        } else {
+            git::fetch(dir.path(), &url, branch).unwrap();
+        }
+        {
+            let fetched_tip = repo
+                .find_reference("FETCH_HEAD")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            repo.branch(branch, &fetched_tip, false).unwrap();
+        }
+        repo.set_head(&refspec).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        (dir, repo)
     }
 
     fn add_dest_marker_commit(
@@ -7595,6 +7653,181 @@ mod tests {
             .find_blob(tree.get_name("feature.txt").unwrap().id())
             .unwrap();
         assert_eq!(blob.content(), b"amended\n");
+    }
+
+    #[test]
+    // decisions/0039's addendum "a missing boundary object is confirmed as a
+    // rewrite on a non-shallow clone": the amend test above rewrites
+    // `source_repo` in place, so the pre-amend commit never actually leaves
+    // its object database and `find_commit(boundary)` trivially succeeds —
+    // it never exercises the missing-object path a real, freshly fetched CI
+    // clone hits. This test runs the sync against a genuinely separate clone
+    // instead.
+    fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_non_shallow_clone()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit_with_message(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "original\n")],
+            "add feature",
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror feature-x to dest");
+
+        // Amend, in place, exactly like the test above — but this time the
+        // sync that follows runs against a *separate* clone that fetched
+        // `feature-x` only after the amend, so it never had the pre-amend
+        // tip the dest marker names.
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+            .unwrap();
+        add_commit_with_message(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "amended\n")],
+            "add feature (amended)",
+        );
+
+        let (fresh_dir, fresh_repo) = fresh_clone_of_branch(&source_repo, "feature-x", false);
+        assert!(
+            !fresh_repo.is_shallow(),
+            "a plain fetch must not produce a shallow clone"
+        );
+
+        sync_pair_to_dest(
+            &fresh_repo,
+            fresh_dir.path(),
+            &config,
+            "feature-x",
+            &reporter,
+        )
+        .expect(
+            "a rewritten mirror-only branch must rebuild even when this clone \
+             never had the pre-rewrite boundary commit, as long as it isn't shallow",
+        );
+
+        let rebuilt = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = rebuilt.tree().unwrap();
+        let blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), b"amended\n");
+    }
+
+    #[test]
+    // The shallow counterpart of the test above: the ambiguity ("rewritten,
+    // or just an incomplete clone?") is real on a shallow clone, so refusal
+    // must stand — this is a regression guard, not new behavior.
+    fn sync_pair_to_dest_still_refuses_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_shallow_clone()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit_with_message(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "original\n")],
+            "add feature",
+        );
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature-x", &reporter)
+            .expect("first sync should mirror feature-x to dest");
+
+        source_repo
+            .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+            .unwrap();
+        add_commit_with_message(
+            &source_repo,
+            "feature-x",
+            &[("feature.txt", "amended\n")],
+            "add feature (amended)",
+        );
+
+        let (fresh_dir, fresh_repo) = fresh_clone_of_branch(&source_repo, "feature-x", true);
+        assert!(
+            fresh_repo.is_shallow(),
+            "a --depth=1 fetch must produce a shallow clone"
+        );
+
+        let err = sync_pair_to_dest(
+            &fresh_repo,
+            fresh_dir.path(),
+            &config,
+            "feature-x",
+            &reporter,
+        )
+        .expect_err("a shallow clone can't tell a rewrite from an incomplete fetch");
+        assert!(
+            err.to_string().contains("safely build on"),
+            "unexpected error: {err}"
+        );
+
+        let untouched = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = untouched.tree().unwrap();
+        let blob = dest_repo
+            .find_blob(tree.get_name("feature.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(
+            blob.content(),
+            b"original\n",
+            "dest must be left exactly as the first sync produced it"
+        );
     }
 
     #[test]
