@@ -1783,3 +1783,96 @@ dest), confirmed it failed against the old code, then removed `.gitprism.toml` f
 
 Verification: `cargo test` — 222 passed, 0 failed (same count: one test replaced,
 not added). `cargo clippy --all-targets` — clean.
+
+## 2026-08-26
+
+**Update**: Addendum to [decisions/0039](decisions/0039-mirror-only-source-rewrites-rebuild-the-projection.md):
+a real deployment hit condition 4's missing-boundary-object branch on an
+ordinary `git commit --amend && git push --force` of a mirror-only branch —
+a case this decision already lists as in scope — because a fresh CI clone
+never has the pre-rewrite tip the boundary trailer names, and a missing
+object was (correctly, at the time) treated as "can't tell, refuse" rather
+than a confirmed rewrite. `Repository::is_shallow` resolves the ambiguity
+deterministically: on a non-shallow clone, nothing else can explain a
+missing boundary object, so it's now read as confirmed. On a shallow clone
+the ambiguity is real and the existing refusal stands. Found alongside it: the
+existing amend/rebase/reset tests never actually exercise this path, since
+they rewrite `source_repo` in place and the pre-rewrite object never leaves
+the object database — closing that gap is tracked as part of the same
+implementation.
+
+**Update**: Implemented the addendum. TDD: added
+`sync_pair_to_dest_rebuilds_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_non_shallow_clone`,
+which runs the amend rewrite against a genuinely separate `fresh_clone_of_branch`
+fixture (a real `git fetch` into a brand-new repo, so the pre-rewrite tip is
+truly absent, not just orphaned-but-present the way the in-place `branch(...,
+force: true)` rewrite tests leave it) — confirmed it failed with today's
+"isn't at a point this clone can safely build on" refusal against the old
+code. Added the shallow counterpart
+(`sync_pair_to_dest_still_refuses_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_shallow_clone`,
+a `--depth=1` fetch) as a regression guard, confirmed it already passed
+(refusal is correct there and unchanged). Fixed `mirror_only_rewrite_detected`
+in `sync.rs`: split the `boundary == source_tip || find_commit(boundary).is_err()`
+guard so a missing boundary object now returns `!repo.is_shallow()` instead of
+an unconditional `false` — `dest_resume_point_for_branch`'s own, separate
+missing-object check (shared with round-tripped branches) is untouched.
+
+Verification: `cargo test` — 224 passed, 0 failed (222 + 2 new). `cargo clippy
+--all-targets` — clean.
+
+## 2026-08-26 — narrow the missing-object check to NotFound, document two limitations
+
+**Update**: A code review of `fb6763d` found `mirror_only_rewrite_detected`'s
+`repo.find_commit(boundary).is_err()` treats any libgit2 error as "object
+missing," which on a non-shallow clone now resolves to a confirmed rewrite
+and a force-push — a transient ODB error or corruption would be misread as a
+rewrite instead of failing loudly, against AGENTS.md's own "fail clearly and
+let the operator resolve it" default. Narrowed to `Err(error) if error.code()
+== git2::ErrorCode::NotFound`, the same guard already used at `sync.rs:1618`
+for an unrelated missing-object case; every other `Err` now propagates with
+context. Investigated empirically what `find_commit` actually returns for a
+present-but-wrong-type object (a tree/blob oid): also `ErrorCode::NotFound`
+(different `ErrorClass`, same code) — libgit2 doesn't distinguish "wrong
+type" from "absent" here, so that case stays on the missing-object path
+either way. A genuinely different code is realistic: a loose object file this
+process can't read reports `ErrorCode::Locked`, confirmed with a chmod'd
+object in a new test
+(`mirror_only_rewrite_detected_propagates_a_real_lookup_failure_instead_of_guessing`),
+which fails as `Ok(true)` against the pre-narrowing code. Updated
+`mirror_only_rewrite_detected`'s own doc comment, which still described the
+missing-object case as never counting as a detected rewrite — no longer true
+on a non-shallow clone — and trimmed the inline comment `fb6763d` added,
+which restated decisions/0039's addendum prose inline, to a short pointer at
+the addendum instead (AGENTS.md: no code comments duplicating existing
+documentation).
+
+Also recorded, per decisions/0039's addendum, as known accepted limitations
+rather than fixed: `Repository::is_shallow` is a whole-repository flag, not
+scoped to the branch under evaluation, so a shared `Repository` handle with
+any ref ever shallow-fetched reads `true` for every branch's check that
+`sync` run — a fully-fetched branch with a genuine rewrite falls back to
+refusal instead of rebuilding (fails safe, confirmed git/libgit2 expose no
+finer granularity: `.git/shallow` is a flat, non-branch-scoped list). And a
+non-shallow read doesn't strictly prove the odb holds everything reachable
+from `source_tip` for a clone made with `--reference`/`--shared`/alternates,
+never marked shallow but able to lose objects if the alternate store is
+independently pruned — gitprism doesn't create such clones itself but
+doesn't preclude one.
+
+Also fixed `fresh_clone_of_branch`'s shallow-clone test fixture: it hand-rolled
+a `std::process::Command` git invocation for `--depth=1`, bypassing
+`git::fetch`'s validation and diagnostics. `git.rs`'s `fetch` is now split
+into a shared `fetch_with_depth(..., depth: Option<u32>)` and a thin public
+`fetch` (`depth: None`); a `#[cfg(test)]`-only `fetch_shallow` exposes
+`Some(depth)` for the fixture, reusing the same validation and diagnostics —
+gitprism itself never calls it, only tests do.
+
+Also factored the amend rewrite test and the two new fresh-clone tests'
+~30-line-each duplicated setup (dest with one commit, source grafted onto
+it, a mirror-only `feature-x` branch synced once) into
+`mirror_only_feature_branch_synced_once`, the same precedent
+`repository_with_commits` already set in this file.
+
+Verification: `cargo test` — 227 passed, 0 failed (224 + 3 new: the lookup-
+failure test, plus 2 for `fetch_shallow` in `git.rs`). `cargo clippy
+--all-targets` — clean. Nothing committed; changes left in the working tree.

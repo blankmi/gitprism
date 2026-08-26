@@ -336,3 +336,156 @@ No condition, boundary computation, or rewrite-detection logic changes;
 this addendum only corrects what happens with the boundary and rebuild base
 this decision already established once `build_pending_dest_tip` reports
 nothing to build from them.
+
+# Addendum: a missing boundary object is confirmed as a rewrite on a
+non-shallow clone
+
+A real deployment hit condition 4's `repo.find_commit(boundary).is_err()`
+branch (`sync.rs:1278`, mirrored in `dest_resume_point_for_branch`'s own
+`sync.rs:1220`) on an ordinary `git commit --amend && git push --force` of a
+mirror-only branch — exactly the case this decision names as in scope
+("a mirror-only branch rewritten via `git commit --amend`: ... the old dest
+history is replaced"). The push was refused with the generic resume-point
+message instead of rebuilding.
+
+**Why.** The boundary trailer names the pre-rewrite tip. Once force-pushed,
+that commit is unreachable from any ref on source; a CI job that clones or
+fetches fresh (GitLab Runner's default) never retrieves it, so
+`find_commit(boundary)` fails before the ancestry check that would otherwise
+identify the rewrite ever runs. The code already treats a missing boundary
+object conservatively — "a different failure than a rewrite" (the doc
+comment above `mirror_only_rewrite_detected`) — which was the right call
+when the object could be missing for either of two reasons: the branch was
+genuinely rewritten, or this clone simply hasn't fetched enough history yet
+to have it (still an ordinary fast-forward underneath). Those two cases were
+indistinguishable from inside `mirror_only_rewrite_detected` as written, so
+it refused both alike.
+
+They stop being indistinguishable once it's known whether this clone's
+history for the branch is complete. `Repository::is_shallow` (git2, backed by
+`git_repository_is_shallow`) answers exactly that, for the whole repository,
+using no new git operation gitprism doesn't already have a handle for. On a
+**non-shallow** clone, a missing boundary object has no remaining
+explanation other than the commit no longer being reachable from source's
+current history — the same conclusion condition 4's ordinary
+`graph_descendant_of` check reaches when the object *is* present and simply
+isn't an ancestor. On a **shallow** clone, the ambiguity is real and
+unresolved by anything gitprism can check locally; today's refusal, with its
+existing "fetch/pull the latest source history first" guidance, stands
+unchanged.
+
+**Decision.** In `mirror_only_rewrite_detected` only — not
+`dest_resume_point_for_branch`, whose conservative `None` for a round-tripped
+branch must never be reinterpreted as a confirmed rewrite — replace
+
+```
+if boundary == source_tip || repo.find_commit(boundary).is_err() {
+    return Ok(false);
+}
+```
+
+with a missing-object branch that checks `repo.is_shallow()`: shallow keeps
+returning `Ok(false)` (unchanged); non-shallow returns `Ok(true)` directly,
+since there is nothing further to check — no boundary commit exists to run
+`graph_descendant_of` against, and its absence *is* the positive
+identification. `boundary == source_tip` keeps its own unconditional `Ok(false)`,
+shallow or not: that case means source hasn't moved past the recorded
+boundary at all, never a rewrite regardless of clone completeness.
+
+This does not loosen condition 3 (a prior gitprism marker must still be found
+before this function is even reached) or narrow who may request
+`ForceMirrorOnly` (still only `sync_pair_to_dest`, still only after this
+check). It only replaces one conservative guess ("missing means unknown, so
+refuse") with a deterministic read of a fact the object database already
+knows, matching this decision's original "no new git operation is added to
+detect a rewrite" reasoning.
+
+**Consequences.**
+* A shallow CI checkout still refuses on a rewrite whose boundary object
+  went missing, unchanged from today — this addendum does not eliminate the
+  ambiguity there, it eliminates it only where the object database has
+  enough information to actually resolve it. Deployment guidance (fetch depth
+  for branches gitprism runs against) is deployment guidance, tracked
+  separately in `design/playbooks/`, not folded into this code change.
+* Every rewrite shape this decision already lists (amend, rebase, hard reset)
+  can now hit this path, not just `git reset --hard` to an already-marked
+  commit (the prior addendum's case) — any of them discards the boundary
+  commit outright when it was the exact tip dest last synced from, and a
+  fresh clone never has it.
+* **Test gap found alongside this addendum, must be closed together**: the
+  existing amend/rebase/reset tests (`sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_*`)
+  rewrite `source_repo` in place via `branch(..., force: true)` — the
+  pre-rewrite commit stays present in the same object database throughout,
+  so `find_commit(boundary)` trivially succeeds and none of them exercise
+  this addendum's path at all. At least one test must instead model a real
+  deployment: rewrite source in one repo, then run `sync_pair_to_dest`
+  against a **separate, freshly fetched clone** (mirroring how `dest_dir`
+  is already its own bare repo in these fixtures) that never fetched the
+  pre-rewrite tip, on both a shallow and a non-shallow clone of it — shallow
+  keeps refusing, non-shallow rebuilds.
+
+# Addendum: narrow the missing-object branch to `NotFound`, and two
+documented limitations
+
+A review of the previous addendum's implementation found
+`repo.find_commit(boundary).is_err()` (`sync.rs:1281` at the time) treats
+*any* libgit2 error as "object missing," not just a genuinely absent object.
+On a non-shallow clone that misread now resolves to `Ok(true)` — a confirmed
+rewrite, force-pushed via `PushMode::ForceMirrorOnly` — for a transient ODB
+error or corruption gitprism should instead fail loudly on, per
+[AGENTS.md](../../AGENTS.md)'s "if resolution requires guessing intent...
+fail clearly and let the operator resolve it."
+
+**Decision.** `mirror_only_rewrite_detected` now matches on
+`repo.find_commit(boundary)` directly: `Err(error) if error.code() ==
+git2::ErrorCode::NotFound` is the only branch read as "missing," taking the
+same `!repo.is_shallow()` path this addendum already established; every
+other `Err` propagates via `.with_context(...)` as a real error instead of
+being guessed either way. This is the same `ErrorCode::NotFound` guard
+already used at `sync.rs:1618` for an unrelated missing-object case,
+narrowed here rather than introducing a new pattern.
+
+**Empirically, this rarely matters in practice but is still worth the
+narrowing.** `git2::Repository::find_commit` on an object that exists but
+isn't a commit (a tree or blob oid, tested directly) also reports
+`ErrorCode::NotFound` — libgit2 folds "wrong type" into the same code as
+"absent," just under `ErrorClass::Invalid` instead of `ErrorClass::Odb`, so
+that particular case is not actually distinguishable from a genuinely
+missing object this way and stays on the missing-object path either way. A
+non-`NotFound` error is realistic, though: a loose object file this process
+can't read (permission denied, corruption) reports `ErrorCode::Locked`
+(`ErrorClass::Os`), confirmed with a chmod'd loose object in a test — the
+new `mirror_only_rewrite_detected_propagates_a_real_lookup_failure_instead_of_guessing`
+test, which chmods a real boundary commit's own loose object file to `0o000`
+and asserts `Err`, confirmed to fail (as `Ok(true)`) against the
+pre-narrowing code.
+
+**Two known, accepted limitations, documented rather than fixed** — per
+AGENTS.md's default ("the default decision is to stop and involve the
+operator, unless the project owner explicitly decides the added automation
+is necessary"), neither is being solved here, both fail safe (refuse rather
+than wrongly force-push) or are already outside gitprism's control:
+
+* **`is_shallow()` is a whole-repository flag, not scoped to the branch
+  being evaluated.** One shared `Repository` handle serves every branch in a
+  `sync` run (`sync.rs`'s `run`); if any ref in that checkout was ever
+  shallow-fetched, `is_shallow()` reads `true` for every branch's check that
+  run, even a fully-fetched branch with a genuine rewrite — that branch
+  falls back to refusal instead of rebuilding. Git and libgit2 don't expose
+  finer granularity than this: `git_repository_is_shallow` is backed only by
+  whether `.git/shallow` exists and is non-empty (confirmed against the
+  git2-rs source), and `.git/shallow`'s own content is a flat list of
+  grafted shallow-boundary commit ids from the *current* shallow history, not
+  a per-branch or per-object record of what's missing — there is nothing to
+  scope the check to a single branch with. This fails safe: the outcome is
+  an unnecessary refusal, never a wrong force-push.
+* **A non-shallow read does not strictly prove the odb holds everything
+  reachable from `source_tip`.** `is_shallow()==false` is treated as proof
+  the object database holds everything reachable from `source_tip` — true
+  for every clone gitprism itself creates, but not strictly true for a clone
+  made with `git clone --reference`/`--shared`, or one relying on alternates
+  (`.git/objects/info/alternates`): such a clone is never marked shallow, yet
+  can lose objects if the alternate object store it depends on is
+  independently pruned or garbage-collected later. gitprism doesn't create
+  such clones itself and has no supported workflow that does, but doesn't
+  preclude an operator from pointing it at one.
