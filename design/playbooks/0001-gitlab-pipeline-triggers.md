@@ -88,6 +88,31 @@ Fix at the image/job level, operator's choice:
   credential instead of SSH — this sidesteps `ssh` entirely and lands in the
   same `GIT_ASKPASS`/credential-helper path the previous entry covers.
 
+## Full re-clone on every run
+
+gitprism's marker scans need unshallowed history (decisions/0003,
+decisions/0019), so `GIT_DEPTH: "0"` is required. That's a correctness
+requirement, not a performance one — it says nothing about whether the
+checkout itself should be thrown away and rebuilt on every run. If the job
+also leaves `GIT_STRATEGY` at GitLab's default (`clone`), every push, every
+scheduled backstop tick, and every manual trigger re-clones full history from
+scratch, even on a runner whose checkout directory would otherwise survive
+between jobs.
+
+This only matters where that directory *would* survive: a shell executor (or
+a Docker/Kubernetes executor with the build directory on a persistent
+volume). On a fully ephemeral executor with no persistent build directory,
+there's nothing to reuse and `GIT_STRATEGY: fetch` has no effect.
+
+Where persistence is available, set `GIT_STRATEGY: fetch` alongside
+`GIT_DEPTH: "0"`. GitLab then reuses the existing checkout and does an
+incremental `git fetch`, still unshallowed, instead of a fresh clone — only
+the first run on a given runner pays full-clone cost. This is a runner
+configuration fix, not a reason to move gitprism into separate long-lived
+infrastructure: the persistence a dedicated "always-on sync container" would
+provide is exactly what a shell executor's build directory already gives for
+free.
+
 # Open
 
 Concrete `.gitlab-ci.yml` job definitions are an implementation detail for later, not
