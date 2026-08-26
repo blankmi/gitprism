@@ -1757,3 +1757,29 @@ propagating it.
 
 Verification: `cargo test` — 222 passed, 0 failed (baseline 221 plus 1 new).
 `cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` — clean.
+
+## 2026-08-26 — .gitprism.toml drops out of the per-commit policy check
+
+**Update**: A real deployment hit decisions/0037's per-commit control-file check on
+`.gitprism.toml`: the operator updated the config and re-pinned
+`GITPRISM_POLICY_SHA256`, then `sync` still halted on an earlier, still-pending
+commit on the same branch carrying a previous config version — the setup-iteration
+shape, several config edits made before the first successful sync ever ran. Decided
+[decisions/0042](decisions/0042-gitprism-toml-drops-out-of-the-per-commit-policy-check.md):
+0037's per-commit comparison now applies to `.gitprismignore` only.
+`.gitprism.toml` never had 0036's disclosure vector — it's self-excluded from dest
+and doesn't gate what content gets filtered per commit — so it keeps only
+decisions/0026's single global verification, unchanged.
+
+**Update**: Implemented decisions/0042. TDD: replaced
+`sync_pair_to_dest_halts_a_branch_whose_replayed_commit_has_a_differing_gitprism_toml`
+with `sync_pair_to_dest_replays_a_commit_with_a_differing_gitprism_toml_normally`
+(two pending commits with differing `.gitprism.toml` content, neither yet synced to
+dest), confirmed it failed against the old code, then removed `.gitprism.toml` from
+`find_control_file_policy_mismatch`'s per-commit loop and dropped the now-unused
+`config_raw` parameter from it, `sync_pair_to_dest_with_key`, and the test-only
+`sync_pair_to_dest` wrapper. `VerifiedPolicy.config_raw` in `policy.rs` is untouched
+— decisions/0026's digest still needs it.
+
+Verification: `cargo test` — 222 passed, 0 failed (same count: one test replaced,
+not added). `cargo clippy --all-targets` — clean.
