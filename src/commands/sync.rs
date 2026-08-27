@@ -10349,6 +10349,11 @@ mod tests {
         )
         .expect("feature must mirror to dest");
 
+        // sync_pair_to_dest's own push-accept path already cached this tip
+        // as a side effect — remove it so the first call below is a genuine
+        // miss, not a hit disguised as one.
+        run_cache.dest_tip.remove("feature");
+
         let real_dest_url = dest_dir.path().display().to_string();
         let first = fetch_dest_tip_cached(
             &repo,

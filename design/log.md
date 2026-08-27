@@ -2030,3 +2030,18 @@ correctness fix touching this search's candidate loop must have its cost
 re-checked every time, not assumed preserved. `cargo test` (240 passed),
 `cargo clippy --workspace --all-targets --all-features --locked -- -D
 warnings`, and `cargo fmt --check` all clean.
+
+**Update**: A sixth review finding, on the test added for the fifth: its
+"first" call to `fetch_dest_tip_cached` was described as a genuine miss, but
+`sync_pair_to_dest`'s own push-accept path had already cached that branch's
+dest tip as a side effect earlier in the same test, via the same fix. The
+"first" call was already a hit; the test proved a hit is a hit twice, not
+that a miss populates the cache. Fixed by removing the branch's entry from
+`run_cache.dest_tip` immediately before that call, so it exercises a real
+miss → fetch → insert against the real dest URL before the second call's
+hit is checked against a broken one. Confirmed the corrected test still
+fails against a temporarily disabled cache-insert-after-miss (the same
+"fetching ... failed" error as before) and passes with it restored. No
+production code changed. `cargo test` (240 passed), `cargo clippy
+--workspace --all-targets --all-features --locked -- -D warnings`, and
+`cargo fmt --check` all clean.
