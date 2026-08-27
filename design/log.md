@@ -1959,3 +1959,43 @@ all fixed:
 
 `cargo test` (237 passed), `cargo clippy --workspace --all-targets
 --all-features --locked -- -D warnings`, and `cargo fmt --check` all clean.
+
+**Update**: A fourth review finding on the same implementation: the
+equal-`cbase` fix above collapsed a group to one representative branch name
+*before* checking whether that specific candidate's own dest history had a
+usable marker — so a genuinely correct, more specific anchor held by a
+*different* member of the group (chosen out because its name sorted later)
+could be silently discarded, falling back to the coarser baseline. Concrete
+case: `z-feature` mirrors first at shared commit S; `a-feature` mirrors
+second and, since `z-feature` already has a dest ref, anchors directly onto
+it rather than re-projecting S — so `a-feature`'s own dest history carries
+no marker naming S at all, only `z-feature`'s does. Picking `a-feature`
+(alphabetically first) and stopping there finds nothing and silently falls
+back, even though `z-feature`'s real anchor was right there.
+
+Fixed by no longer collapsing before step 5: candidates are now grouped by
+`cbase` for the domination comparison (unchanged), but every group member
+proceeds to step 5, not just one. A candidate with nothing to find is
+skipped, not treated as failure — the ordinary shape once this decision's
+own recursive anchoring has been running a while, since a later sibling in
+a group typically already deferred to an earlier one. If none of a group's
+members find anything, the existing safe-degrade to baseline still applies.
+If the ones that did find something all agree, that's the anchor. If two or
+more disagree — genuinely independent dest-space projections of the same
+source-side fork point, only possible when populated without either seeing
+the other's dest ref — a new failure mode, `DestAnchor::AmbiguousResolution`,
+hard-fails naming every disagreeing candidate and its own resolved anchor,
+the same no-guessing default as the existing incomparable-merge-base
+hard-fail, just discovered one step later and reported with its own message
+(`ambiguous_resolution_message`).
+
+Two new tests reproduce this precisely: the exact z-feature/a-feature shape
+above (confirmed to fail against the prior collapse-first logic before the
+fix, and pass after), and a genuine `AmbiguousResolution` built from two
+independently-seeded dest projections of the same source commit (no way to
+construct real disagreement through gitprism's own recursive anchoring,
+which converges by construction). decisions/0043 revised again: steps 4–5
+now describe grouping and per-candidate resolution instead of
+collapse-then-try-one, and Consequences documents the new failure mode.
+`cargo test` (239 passed), `cargo clippy --workspace --all-targets
+--all-features --locked -- -D warnings`, and `cargo fmt --check` all clean.

@@ -92,37 +92,59 @@ a more specific anchor among sibling branches:
    refinement at all — only survivors strictly beyond `boundary_base` are
    real candidates to disambiguate among. If none exist, use the baseline
    unchanged, same as "no survivors." Otherwise, among the survivors that do
-   go beyond `boundary_base`, find the unique most-specific one: `C`'s
-   `cbase` must be a descendant of (or equal to) every other survivor's
+   go beyond `boundary_base`, **group them by `cbase`** — two or more
+   survivors sharing the exact same `cbase` (not just tying `boundary_base`,
+   but tying *each other*) are not ambiguous by merge-base, since equal is
+   the opposite of incomparable, but every branch name in such a group must
+   be *kept*, not collapsed to one representative: which of them, if any,
+   actually has a usable dest-side marker is a question step 5 below has to
+   answer per candidate, not one this step can shortcut by picking a name
+   arbitrarily (e.g. lexicographically) before step 5 ever runs — a
+   representative chosen that way can easily be the one candidate whose own
+   dest history happens to lack a qualifying marker, silently discarding a
+   sibling that would have found one. Find the unique most-specific group:
+   its `cbase` must be a descendant of (or equal to) every other group's
    `cbase`, via `graph_descendant_of` (the same primitive
    [decisions/0039](0039-mirror-only-source-rewrites-rebuild-the-projection.md)'s
-   condition 4 already uses). Exactly one maximal survivor → use it. **Two or
-   more incomparable maximal survivors → hard-fail**, naming both candidate
-   branches and their `cbase` oids; no guessing, matching this project's
-   existing no-merge-base and no-lease precedent
-   ([decisions/0007](0007-conflict-policy-hard-stop.md),
+   condition 4 already uses). Exactly one maximal group → its branch names
+   all proceed to step 5 together. **Two or more incomparable maximal
+   groups → hard-fail**, naming every candidate in every such group and its
+   `cbase` oid; no guessing, matching this project's existing no-merge-base
+   and no-lease precedent ([decisions/0007](0007-conflict-policy-hard-stop.md),
    [decisions/0023](0023-setup-reconciles-pre-existing-branches-via-merge-base.md)).
    Without excluding baseline-ties first, two unrelated siblings that each
    merely share `boundary_base` itself (offering nothing beyond what the
-   baseline already found) would read as a spurious ambiguity. Two or more
-   survivors sharing the exact same `cbase` (not just tying `boundary_base`,
-   but tying *each other*) are likewise not ambiguous — equal is the
-   opposite of incomparable. Collapse them to one representative (the
-   lexicographically smallest branch name, for determinism) before the
-   domination comparison; only survivors whose `cbase`s are genuinely
-   incomparable after that collapse are ambiguous.
-5. For the winning candidate `C`, locate the dest-space anchor: walk `C`'s
-   fetched dest tip's history, first-parent
+   baseline already found) would read as a spurious ambiguity.
+5. For every branch name in the winning group (not just one), fetch it and
+   locate the dest-space anchor: walk its dest tip's history, first-parent
    ([decisions/0019](0019-marker-scans-are-first-parent-only.md)'s idiom,
    reused rather than re-derived — a round-tripped candidate's dest history
    can contain real human merges gitprism didn't build), for the newest
    commit whose `Gitprism-Source-Commit` trailer names a commit that is
    `cbase` itself or an ancestor of it (`marker::verify` with
    `MarkerDirection::SourceToDest`, the same primitive `pending_commits`'
-   loop-prevention check already calls). That commit's source oid becomes
-   the new boundary; its own oid becomes the new chain's starting parent —
-   in place of `boundary_base`/`dest_tip_base`, with `pending_commits` and
-   `build_pending_dest_tip` unchanged downstream of that substitution.
+   loop-prevention check already calls). A candidate whose own dest history
+   has nothing qualifying (e.g. it already anchored onto *another* member of
+   the same group during its own earlier sync, and so carries no
+   independent marker of its own for `cbase` — the ordinary, expected shape
+   once decisions/0043 has been running for a while) simply contributes
+   nothing and is skipped, not treated as a failure. Among the candidates
+   that *did* find something: if none did, degrade to the baseline
+   (step 3's own safe-degrade). If every one that found something agrees on
+   the identical `(source oid, dest oid)` pair, use it — this is the
+   overwhelmingly common case once decisions/0043's own recursive anchoring
+   is in effect, since a later sibling in the same group ordinarily just
+   built onto an earlier one rather than re-projecting `cbase` itself. **If
+   two or more disagree — genuinely different dest-space anchors for the
+   same source-side `cbase`, which can only happen when they were populated
+   independently of each other (e.g. two clones that never saw each other's
+   dest ref) — hard-fail**, naming every disagreeing candidate and its own
+   resolved dest oid; the same no-guessing default as step 4's hard-fail,
+   just discovered one step later. The resolved `(source oid, dest oid)`
+   pair — whichever way it was reached — becomes the new boundary and dest
+   chain's starting parent, in place of `boundary_base`/`dest_tip_base`,
+   with `pending_commits` and `build_pending_dest_tip` unchanged downstream
+   of that substitution.
 
 **Not solved here — accepted, same as decisions/0038/0039's own accepted
 hazards:** if `C` (e.g. `feature`) hasn't been mirrored to dest yet in *this*
@@ -186,10 +208,28 @@ branch-processing-order guarantee is added, and none is implied by
 * Both call sites of `newest_dest_marker_opt_for_branch`
   (`!dest_ref_exists` and decisions/0039's rewrite-rebuild arm) get the
   improved anchor automatically, with no separate implementation.
-* **New failure mode to test and document**: a discovered branch with two
-  incomparable most-specific mirrored ancestors hard-fails the branch (not
-  the whole run — matching decisions/0024's per-branch-warning precedent
-  for other structural surprises), naming both candidates.
+* **Two new failure modes to test and document**, both a per-branch halt
+  (not the whole run — matching decisions/0024's per-branch-warning
+  precedent for other structural surprises), naming every candidate
+  involved: a discovered branch with two incomparable most-specific
+  mirrored ancestors (step 4), and two equally specific candidates whose
+  own dest histories resolve `cbase` differently (step 5) — genuinely
+  distinct situations discovered at different points in the search, so
+  reported with distinct messages naming different things (merge-base oids
+  for the first, resolved dest oids for the second) rather than conflated
+  into one.
+* **A representative chosen before step 5 runs is unsound** — caught in
+  review of the first implementation of this decision: collapsing an
+  equal-`cbase` group to one branch name (e.g. the lexicographically
+  smallest) before checking whether that specific candidate's own dest
+  history has anything useful can silently discard a sibling that *does*
+  have a usable marker, falling back to the coarser baseline even though a
+  correct, more specific anchor exists. This is the ordinary shape once
+  this decision has been in effect for a while: a later sibling in an
+  equal-`cbase` group typically already anchored onto an earlier one during
+  its own sync (this same mechanism, recursively), so it carries no
+  independent marker of its own — trying every group member and skipping
+  the ones that find nothing (step 5, revised) is required, not optional.
 * **Ordering hazard, accepted, permanently absent a later rewrite of the
   misanchored branch itself** — see "Not solved here" above. A branch
   discovered before its own parent branch has a dest ref falls back to the
@@ -217,8 +257,13 @@ branch-processing-order guarantee is added, and none is implied by
     workaround actually works;
   * a genuinely ambiguous case (two mirror-only branches, neither an ancestor
     of the other in `task`'s history) hard-fails naming both;
-  * two sibling candidates that share the exact same `cbase` are *not*
-    reported as ambiguous;
+  * two sibling candidates that share the exact same `cbase`, where one
+    already anchored onto the other during its own earlier sync (so only
+    one has a usable marker), resolve onto the one that does — not the
+    lexicographically first, and not a silent fallback to the baseline;
+  * two sibling candidates that share the exact same `cbase` but were
+    populated independently and resolve to genuinely different dest oids
+    hard-fail, naming both candidates and their own resolved anchors;
   * a round-tripped candidate correctly used as the anchor when no more
     specific mirror-only candidate exists (baseline and the new search agree,
     confirming no regression on the common case);
