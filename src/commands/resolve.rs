@@ -1562,8 +1562,20 @@ mod tests {
             .unwrap();
         }
         repo.set_head(&format!("refs/heads/{branch}")).unwrap();
-        repo.checkout_head(None).unwrap();
+        checkout_head_exact(&repo);
         repo
+    }
+
+    /// Forced checkout of HEAD followed by decisions/0034's byte-exact
+    /// control-file restore — what a real `setup`/`sync` leaves on disk.
+    /// Without it, a host with `core.autocrlf=true` (Windows CI) checks out
+    /// `.gitprismignore` with CRLF and decisions/0037's policy check sees the
+    /// pinned bytes disagree with an identical blob.
+    fn checkout_head_exact(repo: &Repository) {
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        policy::restore_control_files_exact(repo, &head_tree).unwrap();
     }
 
     /// Unlike `commands::sync`'s own `add_commit` fixture (which never needs
@@ -1598,8 +1610,7 @@ mod tests {
                 &[&tip],
             )
             .unwrap();
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(repo);
         oid
     }
 
@@ -1660,9 +1671,7 @@ mod tests {
             .unwrap();
         source_repo.branch("feature", &main_tip, false).unwrap();
         source_repo.set_head("refs/heads/feature").unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let source_change = add_commit(&source_repo, "feature", &[("f.txt", "source")]);
         let dest_feature =
             add_independent_dest_commit_on(&dest_repo, dest_tip, "feature", ("f.txt", "dest"));
@@ -1690,9 +1699,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
         let error = run_with_direction(
             source_dir.path(),
@@ -1753,9 +1760,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
         let first_error = run_with_direction(
@@ -1846,9 +1851,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
 
         // A pending commit that both sets a `.gitprismignore` diverging from
         // the pinned policy below and carries real, non-excluded content —
@@ -2342,9 +2345,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
         let error = run_with_direction(
