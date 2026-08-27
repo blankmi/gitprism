@@ -286,3 +286,154 @@ branch-processing-order guarantee is added, and none is implied by
     branch, against a deliberately unreachable remote, must still succeed
     with the identical oid — proof positive it never fetched again, not
     just absence of a slowdown.
+
+# Addendum (2026-08-27): a branch-scoped `DestToSource` marker is recognized by every branch it's an ancestor of
+
+## Context
+
+A repository review (finding F-04) reproduced a duplicate-commit bug for
+the most common topology this decision exists to fix: `task` forked from
+round-tripped `main` *after* a dest-native commit *X* (committed directly
+to dest, outside gitprism) was reflected into source by dest→source as
+marker commit *M* on `main` (`Gitprism-Dest-Commit: X`,
+`MarkerDirection::DestToSource`, `Gitprism-Branch: main`). `task` inherits
+*M* as an ordinary ancestor — it's just a commit on `main`'s history that
+`task` branched from.
+
+Two independent places reject *M* for `task`, for the same underlying
+reason: `marker::verify` (`src/marker.rs`, ~line 320) requires an exact
+match between the commit's own recorded `Gitprism-Branch` and the branch
+name the caller asks about — deliberately, for every direction except
+`Setup`, which every branch inherits regardless of name
+(decisions/0017). *M* is scoped to `"main"`, not `"task"`.
+
+* `build_pending_dest_tip`'s loop prevention (decisions/0003) calls
+  `marker::verify(&source_commit, branch, [Setup, DestToSource], ...)`
+  with `branch = "task"` — fails, so *M* is not recognized as already on
+  dest and gets replayed as an ordinary new commit, filtering to a
+  duplicate of *X* on dest's `task`.
+* This decision's own step 5 (`newest_source_marker_at_or_before`) only
+  ever looks for `MarkerDirection::SourceToDest` trailers, walking a
+  sibling candidate's *dest*-side history — it can never find *M* at all,
+  since *M* lives on *source*, not dest. Even when `main` is found as
+  `task`'s sibling candidate and `cbase` lands exactly on *M*, step 5
+  still resolves to whatever *earlier* `SourceToDest` marker dest's own
+  history happens to carry, silently choosing a less specific anchor than
+  the one *M* itself already proves.
+
+Both gaps have the same root cause and the same fix: *M*'s own MAC already
+proves, independent of which branch asks, that dest genuinely has *X* —
+that fact doesn't become false because a *different* branch happens to be
+doing the asking.
+
+## Decision
+
+When a `DestToSource` marker commit is an ancestor of the branch currently
+being processed, and the MAC verifies for the marker's *own* recorded
+branch (never for the caller's branch — `marker::verify` itself is
+unchanged, still exact-match, still exactly as strict as decisions/0025
+requires), that marker:
+
+1. **Counts for loop prevention, for any branch it is an ancestor of.**
+   `build_pending_dest_tip` (and `find_control_file_policy_mismatch`'s own
+   parallel loop-prevention skip, decisions/0037, which must stay
+   consistent with what will and won't actually be replayed) now go
+   through one shared helper, `loop_prevented`: first the existing
+   branch-scoped check (`Setup`/`DestToSource` matched against the caller's
+   `branch`, unchanged); if that fails, parse the commit's message
+   (`marker::parse`, already `pub(crate)`) to read its own recorded branch,
+   then re-verify with *that* branch name and `DestToSource` only (`Setup`
+   already inherits unconditionally, so it needs no widening here).
+   `marker::verify`'s internal MAC payload is always computed over the
+   marker's own recorded branch regardless of which branch name is passed
+   in for the filter check — passing the marker's own branch back to itself
+   is exactly "does this marker's own MAC verify," nothing weaker.
+2. **Is usable by step 5 as an anchor**, resolving directly to the dest
+   commit it names. A new function, `newest_dest_to_source_marker_at_or_before`,
+   walks a candidate's own *source*-side history first-parent from `cbase`
+   backward (the same shape `scan_for_dest_marker` already walks for the
+   baseline scan, but deliberately `DestToSource`-only — `Setup` excluded,
+   see Why) for the newest marker scoped to that candidate's own name.
+   Tried per candidate alongside the existing dest-side scan
+   (`newest_source_marker_at_or_before`); whichever of the two is strictly
+   more specific (its own source oid equal to `cbase`, or a descendant of
+   the other's) wins; if only one found anything, it wins by default; if
+   neither did, the candidate contributes nothing, unchanged from today.
+
+## Why
+
+* **`marker::verify` itself is not weakened.** The task that produced this
+  addendum was explicit that the MAC verification scope must stay exactly
+  as strict, checked against the marker's own recorded branch — never
+  against the branch asking. Both changes above only ever call
+  `marker::verify` with a branch name read *from the marker itself*
+  (`marker::parse`), so a forged or copied trailer still can't pass: the
+  MAC is computed over the marker's own recorded fields regardless of which
+  name is handed to `verify`, so misrepresenting the branch buys an
+  attacker nothing new.
+* **Why `Setup` is excluded from the new source-side scan.** `Setup` is
+  already unconditionally inherited by every branch
+  (`marker::verify`'s own hardcoded exception, decisions/0017) — every
+  candidate branch's own history trivially reaches the one shared graft
+  commit, regardless of name. Accepting it in
+  `newest_dest_to_source_marker_at_or_before` would rediscover the same
+  coarse point `boundary_base` already reflects for *every* candidate, not
+  a real per-candidate refinement — caught in review of the first
+  implementation of this addendum: two equal-`cbase` sibling candidates
+  with no `DestToSource` marker of their own started reading as
+  *disagreeing* (`AmbiguousResolution`) instead of both correctly
+  contributing nothing, because each one's "finding" was really just the
+  shared graft in disguise. Loop prevention has no equivalent hazard:
+  `marker::verify` already inherits `Setup` unconditionally there, so
+  `loop_prevented`'s own first check already covers it before the
+  `DestToSource`-only widening is ever reached.
+* **Why loop prevention needed its own fix, not just step 5's.** Step 5
+  only runs for a brand-new branch's first mirror or a positively detected
+  rewrite (this decision's own scope) — an *ordinary* resync of an
+  already-anchored branch never re-runs it (see "Not solved here" above).
+  If step 5 ever resolves onto a coarser anchor than *M* — the documented
+  wrong-order ordering hazard this decision already accepts, or simply a
+  candidate branch not yet processed this run — *M* still ends up inside
+  that branch's own `pending_commits` range regardless of how the anchor
+  was chosen, and only loop prevention itself can then recognize it.
+  Reasoned, not assumed: reproduced independently by forcing the wrong-order
+  fallback via `RunCache::dest_ref_exists` and confirming loop prevention
+  alone (step 5's fix reverted) still closes it.
+* **Git already proves this; nothing new is trusted.** Reasoned the same
+  way this decision's own body reasons about `merge_base`: the MAC already
+  proves *M* is authentic and its `DestToSource` direction already means
+  "the named dest commit is already on dest" (decisions/0003) — this
+  addendum only widens *which branch's replay loop* is allowed to act on a
+  fact that was already true regardless of the asking branch, it does not
+  ask git or the MAC to prove anything new.
+
+## Consequences
+
+* One new shared helper, `loop_prevented` (`src/commands/sync.rs`), used by
+  both `build_pending_dest_tip` and `find_control_file_policy_mismatch` —
+  one definition of "already on dest," not two that could drift.
+* One new function, `newest_dest_to_source_marker_at_or_before`, alongside
+  the existing `newest_source_marker_at_or_before` it's tried against —
+  `scan_for_dest_marker` itself stays untouched (per this decision's own
+  original "unchanged" guarantee for the baseline scan), since a
+  `Setup`-accepting scan is the wrong tool for this specific,
+  per-candidate refinement.
+* No new fetches: `newest_dest_to_source_marker_at_or_before` walks only
+  already-local source-side history, seeded at `cbase` (already resolved
+  by this point in the search) — it runs alongside, not instead of, the
+  existing dest-side fetch, so decisions/0043's own O(branch count) cost
+  claim is unaffected.
+* **Tests added:**
+  * `run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it`
+    (`src/commands/sync.rs`) — the full reproduction, via `run()` end to
+    end: dest-native *X*, imported as *M* on `main`, `task` forked
+    afterward. Confirmed failing (two commits beyond dest `main`'s tip
+    instead of one) against the pre-fix code, and passing after.
+  * `build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch`
+    (`src/commands/sync.rs`) — isolates loop prevention from the step-5
+    fix by forcing the wrong-order baseline fallback (`main` hidden from
+    the sibling search via `RunCache::dest_ref_exists`, so *M* is
+    necessarily inside `task`'s own `pending_commits` range regardless of
+    anchor precision). Confirmed failing with only the step-5 fix reverted
+    (three replayed commits instead of two), and passing with both fixes
+    in place.

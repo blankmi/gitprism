@@ -211,7 +211,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     if any_branch_halted {
         anyhow::bail!(
-            "gitprism sync: one or more branches halted — either a replayed commit's control file disagreed with the pinned policy, or a discovered branch's dest anchor was ambiguous between equally specific mirrored siblings — see the branch lines above for the affected commit(s)/branch(es) and remedy"
+            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a discovered branch's dest anchor was ambiguous between equally specific mirrored siblings, or a discovered branch's existing dest ref wasn't safe to build on — see the branch lines above for the affected commit(s)/branch(es) and remedy"
         );
     }
 
@@ -297,12 +297,18 @@ fn sync_pair_to_dest(
     )
 }
 
-/// Returns `Ok(true)` if this branch halted with nothing pushed — either
-/// because a replayed commit's control file disagreed with the pinned
-/// policy (decisions/0037), or because a discovered branch's dest anchor
-/// was genuinely ambiguous between two or more equally specific mirrored
-/// sibling branches (decisions/0043) — `Ok(false)` for every other outcome
-/// (done, skipped, or decisions/0024's warning).
+/// Returns `Ok(true)` if this branch halted with nothing pushed — because a
+/// replayed commit's control file disagreed with the pinned policy
+/// (decisions/0037), because a discovered branch's dest anchor was genuinely
+/// ambiguous between two or more equally specific mirrored sibling branches
+/// (decisions/0043), or because a discovered branch's existing dest ref
+/// isn't a point gitprism recognizes as safe to build on (decisions/0045) —
+/// `Ok(false)` for every other outcome (done, skipped, or decisions/0024's
+/// warning). The equivalent refusal for a *round-tripped* (`config.branches`)
+/// branch stays a fatal `anyhow::bail!`, unaffected by decisions/0045: that
+/// branch class really can have independent dest content decisions/0017
+/// promises to reflect back, so an operator must resolve the divergence
+/// before every other branch's sync is attempted.
 #[allow(clippy::too_many_arguments)]
 fn sync_pair_to_dest_with_key(
     repo: &Repository,
@@ -480,9 +486,20 @@ fn sync_pair_to_dest_with_key(
                     };
                     (rebuild_dest_tip, boundary)
                 }
-                None => anyhow::bail!(
+                None if round_tripped => anyhow::bail!(
                     "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)"
                 ),
+                // decisions/0045: per-branch halt for a discovered branch.
+                None => {
+                    reporter.complete(
+                        Outcome::Error,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&unsafe_to_build_on_message(branch)),
+                    );
+                    return Ok(true);
+                }
             }
         } else {
             // No dest ref to be unsafe about yet, so no safety check applies
@@ -658,24 +675,31 @@ fn sync_pair_to_dest_with_key(
         )?;
 
         // `build.new_tip` is `None` in three cases: the branch has nothing
-        // new to merge onto an existing dest ref (a genuine no-op); it's a
-        // brand-new branch with no commits of its own beyond whatever
-        // graft/marker point it shares with dest (decisions/0017: still has
-        // to be created on dest); or a detected rewrite's replacement
-        // commits built nothing at all — either `pending_commits` was empty
-        // (source was reset straight back to a commit already carrying a
-        // marker) or every pending commit filtered to no change against the
-        // rebuild base. The first case alone is a genuine no-op; the other
-        // two still need `dest_tip` pushed — for a fresh branch it's already
-        // the right content, just missing a ref name, and for a detected
-        // rewrite `dest_tip` here is `rebuild_dest_tip`, the graft-derived
-        // base dest must be rewound to (decisions/0039's addendum: a rewrite
-        // that rebuilds to the base is still a rewrite, not a no-op, even
-        // when the base and the built chain happen to coincide).
+        // new to merge onto an existing dest ref (a genuine no-op — no push
+        // at all, the `None` arm below); it's a brand-new branch with no
+        // commits of its own beyond whatever graft/marker point it shares
+        // with dest (decisions/0017: still has to be created on dest); or a
+        // detected rewrite's replacement commits built nothing at all —
+        // either `pending_commits` was empty (source was reset straight back
+        // to a commit already carrying a marker) or every pending commit
+        // filtered to no change against the rebuild base. The other two
+        // still need something pushed — for a fresh branch `dest_tip` is
+        // already the right content, just missing a ref name, and for a
+        // detected rewrite `dest_tip` here is `rebuild_dest_tip`, the
+        // graft-derived base dest must be rewound to (decisions/0039's
+        // addendum: a rewrite that rebuilds to the base is still a rewrite,
+        // not a no-op, even when the base and the built chain happen to
+        // coincide). `branch_scoped_dest_tip` (decisions/0044) decides
+        // whether `dest_tip` can be used as-is or needs this branch's own
+        // marker commit on top.
         let force_rebuild = matches!(push_mode, PushMode::ForceMirrorOnly { .. });
-        let new_dest_tip = build
-            .new_tip
-            .or((force_rebuild || !dest_ref_exists).then_some(dest_tip));
+        let new_dest_tip = match build.new_tip {
+            Some(tip) => Some(tip),
+            None if force_rebuild || !dest_ref_exists => Some(branch_scoped_dest_tip(
+                repo, config, dest_tip, source_tip, branch, state_key,
+            )?),
+            None => None,
+        };
 
         if let Some(new_dest_tip) = new_dest_tip {
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
@@ -752,11 +776,16 @@ fn sync_pair_to_dest_with_key(
             round_tripped,
             if new_dest_tip.is_none() {
                 Some("up to date, nothing to sync")
-            } else if force_rebuild && build.new_tip.is_none() {
+            } else if force_rebuild && build.new_tip.is_none() && new_dest_tip == Some(dest_tip) {
                 // Honest about what actually happened: dest's ref moved, but
-                // to the shared rebuild base, not to a newly built commit —
-                // must not read as "N new commits pushed" when none were.
+                // to the shared rebuild base itself, not to a newly built
+                // commit — must not read as "N new commits pushed" when none
+                // were.
                 Some("rebuilt from the shared graft; no new commits were needed")
+            } else if force_rebuild && build.new_tip.is_none() {
+                Some(
+                    "rebuilt from the shared graft with a branch-scoped marker commit; no source content changed",
+                )
             } else {
                 None
             },
@@ -768,8 +797,9 @@ fn sync_pair_to_dest_with_key(
 /// A replayed commit whose control file disagreed with the pinned policy
 /// (decisions/0037): which commit, and which of the two filenames — never
 /// both conflated into one report, since the operator needs to know exactly
-/// which file to look at.
-struct PolicyMismatch {
+/// which file to look at. `pub(crate)` so `gitprism resolve`'s source-to-dest
+/// path (decisions/0037's addendum) can run the same pre-pass.
+pub(crate) struct PolicyMismatch {
     commit: Oid,
     filename: &'static str,
     reason: PolicyMismatchReason,
@@ -803,7 +833,7 @@ enum PolicyMismatchReason {
 /// (an operator iterating on `.gitprism.toml` before the first successful
 /// sync accumulates several pending versions) with no matching security
 /// benefit.
-fn find_control_file_policy_mismatch(
+pub(crate) fn find_control_file_policy_mismatch(
     repo: &Repository,
     pending: &[Oid],
     branch: &str,
@@ -815,19 +845,12 @@ fn find_control_file_policy_mismatch(
             .find_commit(commit_oid)
             .context("resolving a pending commit to check its control files")?;
 
-        // Same loop-prevention `build_pending_dest_tip` itself applies: a
-        // commit that came from dest→source (or from `setup`'s own graft) is
-        // never replayed onto dest by this branch's sync, so it's not this
-        // check's business either.
-        if marker::verify(
-            &commit,
-            branch,
-            &[MarkerDirection::Setup, MarkerDirection::DestToSource],
-            None,
-            key,
-        )
-        .is_some()
-        {
+        // Same loop-prevention `build_pending_dest_tip` itself applies (see
+        // `loop_prevented`): a commit that's already on dest — for `branch`
+        // or, per decisions/0043's addendum, for whichever branch its own
+        // `DestToSource` marker names — is never replayed onto dest by this
+        // branch's sync, so it's not this check's business either.
+        if loop_prevented(&commit, branch, key) {
             continue;
         }
 
@@ -897,8 +920,9 @@ fn read_control_file_blob(
 /// The operator-facing message for a halted branch (decisions/0037): names
 /// the branch, the offending commit, exactly which control file differs, and
 /// the remedy — update the pinned digest to the approved policy, or
-/// reconcile the branch.
-fn policy_mismatch_message(branch: &str, mismatch: &PolicyMismatch) -> String {
+/// reconcile the branch. `pub(crate)` so `gitprism resolve` reports the same
+/// halt in the same words as `sync` (decisions/0037's addendum).
+pub(crate) fn policy_mismatch_message(branch: &str, mismatch: &PolicyMismatch) -> String {
     let problem = match mismatch.reason {
         PolicyMismatchReason::DiffersFromPinnedPolicy => {
             format!(
@@ -920,6 +944,19 @@ fn policy_mismatch_message(branch: &str, mismatch: &PolicyMismatch) -> String {
          update GITPRISM_POLICY_SHA256 to the approved policy (via `gitprism policy-hash`) \
          or reconcile the branch so its {} matches exactly",
         mismatch.commit, mismatch.filename
+    )
+}
+
+/// decisions/0045: refusal text for a *discovered* branch. Unlike the
+/// round-tripped message, it cannot blame dest→source, which never runs for
+/// a branch outside `config.branches`.
+fn unsafe_to_build_on_message(branch: &str) -> String {
+    format!(
+        "{branch:?} isn't at a point this clone can safely build on — its dest history and \
+         this clone's source history for {branch:?} share no ancestry gitprism recognizes \
+         (a dest-native branch of the same name with genuinely unrelated history, or this \
+         clone is behind); fetch/pull the latest source history first, or reconcile the \
+         branches manually if their histories are genuinely unrelated"
     )
 }
 
@@ -974,6 +1011,48 @@ struct PendingDestBuild {
 /// the duplication and mid-chain-stranding bugs that motivated decisions/0016
 /// stop being possible. Stops at the first commit that doesn't merge cleanly
 /// (decisions/0007). `dest_tip` seeds the chain's first parent.
+/// Loop prevention (decisions/0003): whether `commit` already exists on
+/// dest, so replaying it for `branch` would loop — a `Setup` graft (any
+/// branch cut from it, `marker::verify`'s own hardcoded exception) or a
+/// `DestToSource` marker scoped to `branch` itself.
+///
+/// Widened by decisions/0043's addendum (F-04): a `DestToSource` marker is
+/// written once, scoped to whichever branch's dest→source sync imported it,
+/// but once that commit is an ancestor of a *different* branch's tip (e.g. a
+/// branch forked after the import), the dest-native commit it names is
+/// already on dest regardless of which branch originally imported it. Self-
+/// verified against the marker's own recorded branch
+/// (`marker::parse(...).branch`), never against `branch` — this reuses
+/// `marker::verify` exactly as written, so its MAC check is not weakened;
+/// only which branch name gets passed to it changes.
+fn loop_prevented(commit: &git2::Commit, branch: &str, key: &marker::StateKey) -> bool {
+    if marker::verify(
+        commit,
+        branch,
+        &[MarkerDirection::Setup, MarkerDirection::DestToSource],
+        None,
+        key,
+    )
+    .is_some()
+    {
+        return true;
+    }
+    let Some(message) = commit.message().ok() else {
+        return false;
+    };
+    let Some(parsed) = marker::parse(message) else {
+        return false;
+    };
+    marker::verify(
+        commit,
+        &parsed.branch,
+        &[MarkerDirection::DestToSource],
+        None,
+        key,
+    )
+    .is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_pending_dest_tip(
     repo: &Repository,
@@ -995,19 +1074,10 @@ fn build_pending_dest_tip(
             .find_commit(source_oid)
             .context("resolving a pending source commit")?;
 
-        // Loop prevention (decisions/0003): a source commit that itself came
-        // from dest (dest→source sync) already exists on dest — pushing it
-        // back would loop. First thing in the loop now that there's no
-        // cursor left to advance before it.
-        if marker::verify(
-            &source_commit,
-            branch,
-            &[MarkerDirection::Setup, MarkerDirection::DestToSource],
-            None,
-            key,
-        )
-        .is_some()
-        {
+        // Loop prevention (decisions/0003, widened by decisions/0043's
+        // addendum) — see `loop_prevented`. First thing in the loop now that
+        // there's no cursor left to advance before it.
+        if loop_prevented(&source_commit, branch, key) {
             continue;
         }
 
@@ -1178,10 +1248,11 @@ fn already_merged_into_a_landing_branch(
 /// cherry-picks give dest content a *marker* commit on source (see
 /// [`newest_dest_marker`]), but never change source's real ancestry with
 /// dest, so this never moves once `setup` has run for the pair.
-fn graft_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Oid> {
-    repo.merge_base(source_tip, dest_tip).context(
-        "no shared history between source and dest for this pair — has `gitprism setup` been run?",
-    )
+///
+/// `Ok(None)`: no merge base at all. Callers decide what that means for
+/// their branch class (decisions/0045).
+fn graft_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Result<Option<Oid>> {
+    Ok(repo.merge_base(source_tip, dest_tip).ok())
 }
 
 /// Whether `dest_tip` is a point gitprism already accounts for — a *safety*
@@ -1241,7 +1312,7 @@ fn dest_tip_accounted_for(
     }
 
     // Case 2.
-    if graft_point(repo, source_tip, dest_tip)? == dest_tip {
+    if graft_point(repo, source_tip, dest_tip)? == Some(dest_tip) {
         return Ok(DestTipAccountedFor::AtGraftOnly);
     }
 
@@ -1312,8 +1383,12 @@ pub(crate) fn dest_resume_point_for_branch(
         // (rather than threading it through from `dest_tip_is_accounted_for`'s
         // own case-2 check) is deliberate: it's cheap, and it preserves
         // today's failure ordering — no enum/Option plumbing needed just to
-        // avoid one extra `merge_base` call.
-        return Ok(Some(graft_point(repo, source_tip, dest_tip)?));
+        // avoid one extra `merge_base` call. `dest_tip_is_accounted_for`
+        // already proved shared history exists; a missing graft here is a
+        // broken invariant, not a per-branch condition.
+        return Ok(Some(graft_point(repo, source_tip, dest_tip)?.context(
+            "no shared history between source and dest for this pair — has `gitprism setup` been run?",
+        )?));
     };
 
     if boundary == source_tip {
@@ -1365,14 +1440,14 @@ fn dest_resume_point(repo: &Repository, source_tip: Oid, dest_tip: Oid) -> Resul
 ///    `false` result instead of discarded.
 ///
 /// A missing boundary object (the trailer names a commit this clone never
-/// fetched) is genuinely ambiguous on a shallow clone — rewritten, or just
-/// not fetched back far enough yet — so it does not count as a detected
-/// rewrite there; [`dest_resume_point_for_branch`]'s ordinary refusal
-/// message stands for that case. On a non-shallow clone there is no other
-/// explanation left, so it does count as a detected rewrite instead
-/// (decisions/0039's addendum, via `Repository::is_shallow`). Any other
-/// `find_commit` failure is a real error and propagates as `Err`, never
-/// guessed either way.
+/// fetched) is genuinely ambiguous, shallow clone or not — rewritten, or
+/// this clone simply hasn't fetched source far enough back yet — so it
+/// never counts as a detected rewrite; [`dest_resume_point_for_branch`]'s
+/// ordinary refusal stands for that case (decisions/0039's addendum-to-the-
+/// addendum, 2026-08-27: a non-shallow clone's own history is *stale*, not
+/// *complete* — see the amendment for why `Repository::is_shallow` doesn't
+/// prove otherwise). Any other `find_commit` failure is a real error and
+/// propagates as `Err`, never guessed either way.
 fn mirror_only_rewrite_detected(
     repo: &Repository,
     source_tip: Oid,
@@ -1395,9 +1470,9 @@ fn mirror_only_rewrite_detected(
     match repo.find_commit(boundary) {
         Ok(_) => {}
         Err(error) if error.code() == git2::ErrorCode::NotFound => {
-            // decisions/0039 addendum "a missing boundary object is
-            // confirmed as a rewrite on a non-shallow clone".
-            return Ok(!repo.is_shallow());
+            // decisions/0039 addendum (2026-08-27): a stale non-shallow
+            // clone looks exactly like this; not positive rewrite evidence.
+            return Ok(false);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1639,6 +1714,31 @@ pub(crate) fn build_dest_commit(
             source_commit.id()
         )
     })
+}
+
+/// decisions/0044: the tip to create/rebuild a dest ref at when nothing was
+/// built — `dest_tip` itself if [`dest_tip_is_accounted_for`] recognizes it
+/// for *this* branch, otherwise a content-empty marker commit on top of it
+/// (a sibling's anchor carries the sibling's marker, not this branch's).
+fn branch_scoped_dest_tip(
+    repo: &Repository,
+    config: &Config,
+    dest_tip: Oid,
+    source_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Oid> {
+    if dest_tip_is_accounted_for(repo, source_tip, dest_tip, branch, key)? {
+        return Ok(dest_tip);
+    }
+    let source_commit = repo
+        .find_commit(source_tip)
+        .context("resolving source's tip for a branch-scoped marker commit")?;
+    let tree_id = repo
+        .find_commit(dest_tip)
+        .context("resolving dest's anchor commit for a branch-scoped marker commit")?
+        .tree_id();
+    build_dest_commit(repo, config, dest_tip, &source_commit, tree_id, branch, key)
 }
 
 /// Cherry-picks dest's pending commits on `branch` onto source's same-named
@@ -2491,11 +2591,39 @@ fn dest_anchor_for_branch(
     // `ls-remote`).
     let mut resolutions: Vec<(String, Oid, Oid)> = Vec::new();
     for name in names {
+        // decisions/0043's addendum (F-04): a `DestToSource` marker at or
+        // before `cbase` on `name`'s own source-side history already records
+        // exactly what dest has for `name`. No fetch needed, and it can be
+        // strictly more specific than the dest-side scan below, which
+        // depends on dest's own history separately carrying a matching
+        // trailer — never true for a dest-native commit dest→source only
+        // reflected into source's history, not dest's.
+        let source_side = newest_dest_to_source_marker_at_or_before(repo, cbase, &name, key)?;
+
         let candidate_dest_tip =
             fetch_dest_tip_cached(repo, source_root, dest_url, &name, run_cache)?;
-        if let Some((found_dest_oid, found_source_oid)) =
+        let dest_side =
             newest_source_marker_at_or_before(repo, candidate_dest_tip, &name, cbase, key)?
-        {
+                .map(|(found_dest_oid, found_source_oid)| (found_source_oid, found_dest_oid));
+
+        let resolved = match (source_side, dest_side) {
+            (Some((source_oid, dest_oid)), Some((_, dest_side_source_oid)))
+                if source_oid == cbase
+                    || repo
+                        .graph_descendant_of(source_oid, dest_side_source_oid)
+                        .with_context(|| {
+                            format!(
+                                "checking whether {source_oid} descends from {dest_side_source_oid}"
+                            )
+                        })? =>
+            {
+                Some((source_oid, dest_oid))
+            }
+            (Some(source_side), None) => Some(source_side),
+            (_, dest_side) => dest_side,
+        };
+
+        if let Some((found_source_oid, found_dest_oid)) = resolved {
             resolutions.push((name, found_source_oid, found_dest_oid));
         }
     }
@@ -2580,6 +2708,57 @@ fn newest_source_marker_at_or_before(
                     })?);
         if qualifies {
             return Ok(Some((oid, source_oid)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// decisions/0043's addendum (F-04): the newest `DestToSource` marker at or
+/// before `cbase`, on `branch`'s own source-side history — deliberately
+/// narrower than [`scan_for_dest_marker`] (`Setup` excluded): every branch
+/// trivially inherits the one shared `Setup` graft regardless of its own
+/// name (`marker::verify`'s own hardcoded exception), so accepting it here
+/// would rediscover the same coarse point `boundary_base` already reflects
+/// for every candidate, not a real per-candidate refinement — exactly the
+/// false "candidate found something" that made two equal-`cbase` siblings
+/// with no `DestToSource` marker of their own read as disagreeing instead of
+/// both correctly contributing nothing.
+fn newest_dest_to_source_marker_at_or_before(
+    repo: &Repository,
+    cbase: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Option<(Oid, Oid)>> {
+    let mut revwalk = repo
+        .revwalk()
+        .context("starting a sibling candidate's own dest-to-source scan")?;
+    revwalk
+        .push(cbase)
+        .context("seeding a sibling candidate's own dest-to-source scan")?;
+    revwalk
+        .set_sorting(git2::Sort::TOPOLOGICAL)
+        .context("ordering a sibling candidate's own dest-to-source scan newest-first")?;
+    revwalk.simplify_first_parent().context(
+        "restricting a sibling candidate's own dest-to-source scan to first-parent history (decisions/0019)",
+    )?;
+
+    for (scanned, oid) in revwalk.enumerate() {
+        if scanned >= limits::MAX_MARKER_SCAN_COMMITS {
+            anyhow::bail!(
+                "sibling candidate dest-to-source scan exceeds the {} commit limit",
+                limits::MAX_MARKER_SCAN_COMMITS
+            );
+        }
+        let oid =
+            oid.context("walking a sibling candidate's own history for a dest-to-source marker")?;
+        let commit = repo
+            .find_commit(oid)
+            .context("resolving a commit in a sibling candidate's own history")?;
+        if let Some(dest_oid) =
+            marker::verify(&commit, branch, &[MarkerDirection::DestToSource], None, key)
+        {
+            return Ok(Some((oid, dest_oid)));
         }
     }
 
@@ -6941,6 +7120,156 @@ mod tests {
     }
 
     #[test]
+    fn sync_pair_to_dest_gives_a_branch_with_no_commits_of_its_own_a_branch_scoped_marker() {
+        // decisions/0044 (review finding F-02): `task`, forked from
+        // mirror-only `feature` with no commits of its own yet, anchors on
+        // `feature`'s own dest tip (decisions/0043). That dest commit
+        // carries `feature`'s own marker, not `task`'s — pointing `task`'s
+        // dest ref directly at it made every later resync of `task` fail
+        // `dest_tip_accounted_for` and bail permanently, even once `task`
+        // gained a real commit of its own.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+        let feature_tip = source_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        source_repo
+            .branch(
+                "task",
+                &source_repo.find_commit(feature_tip).unwrap(),
+                false,
+            )
+            .unwrap();
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+        let mut cache = RunCache::default();
+
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "feature",
+            &reporter,
+            &mut cache,
+        )
+        .expect("feature must mirror to dest");
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut cache,
+        )
+        .expect("task, with no commits of its own, must still be created on dest");
+
+        let dest_task_tip = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let dest_feature_tip = dest_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(
+            dest_task_tip.id(),
+            dest_feature_tip.id(),
+            "task must get its own branch-scoped marker commit, not point directly at \
+             feature's own dest commit"
+        );
+        assert_eq!(
+            dest_task_tip.parent_id(0).unwrap(),
+            dest_feature_tip.id(),
+            "the branch-scoped marker commit must sit directly on top of feature's own dest tip"
+        );
+        assert_eq!(
+            dest_task_tip.tree_id(),
+            dest_feature_tip.tree_id(),
+            "the branch-scoped marker commit must carry no content change"
+        );
+
+        // Second run, task unchanged: must be a genuine no-op — no bail
+        // (the F-02 bug), and no new marker commit every run either.
+        let mut cache2 = RunCache::default();
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut cache2,
+        )
+        .expect("an unchanged resync must succeed, not permanently bail");
+        let dest_task_tip_after_second_run = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_task_tip_after_second_run,
+            dest_task_tip.id(),
+            "an unchanged branch must not gain a new marker commit every run"
+        );
+
+        // Third run: task gains a real commit of its own, which must sync
+        // normally on top of its own branch-scoped marker.
+        add_commit(&source_repo, "task", &[("task.txt", "x\n")]);
+        let mut cache3 = RunCache::default();
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut cache3,
+        )
+        .expect("task's own real commit must sync normally once it has one");
+        let dest_task_tip_after_third_run = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            dest_task_tip_after_third_run.parent_id(0).unwrap(),
+            dest_task_tip.id()
+        );
+        let tree = dest_task_tip_after_third_run.tree().unwrap();
+        assert!(tree.get_name("task.txt").is_some());
+    }
+
+    #[test]
     fn run_does_not_pull_back_independent_content_from_a_non_configured_branch() {
         // decisions/0017's deliberate asymmetry: dest→source only ever
         // reflects content back for branches named in `config.branches`.
@@ -6984,7 +7313,7 @@ mod tests {
             .id();
         // Content landing directly on dest's mirror — e.g. someone pushing
         // straight to it — independent of anything gitprism put there.
-        add_independent_dest_commit_on(
+        let dest_feature_tip_with_independent_content = add_independent_dest_commit_on(
             &dest_repo,
             "feature-x",
             dest_feature_tip,
@@ -6996,13 +7325,18 @@ mod tests {
         // considers it at all — this run's source→dest half correctly
         // refuses to fast-forward feature-x over dest content it doesn't
         // recognize, the same safety check any configured branch gets
-        // (decisions/0009) — expected to surface as an error here precisely
-        // because nothing will ever bring this branch's dest content back
-        // into source to make it recognized.
+        // (decisions/0009) — expected to surface as a per-branch halt here
+        // (decisions/0045: a discovered branch's refusal is never fatal on
+        // its own) precisely because nothing will ever bring this branch's
+        // dest content back into source to make it recognized; the overall
+        // run still fails since a branch halted.
         let err = run(source_dir.path(), config.path()).expect_err(
-            "source→dest must refuse to build over dest content it doesn't recognize, even on a discovered branch",
+            "a halted branch must still fail the overall run (decisions/0037's precedent)",
         );
-        assert!(format!("{err:#}").contains("feature-x"));
+        assert!(
+            format!("{err:#}").to_lowercase().contains("halted"),
+            "the run's own error should mention a halted branch: {err:#}"
+        );
 
         let source_feature_tip_after = source_repo
             .find_branch("feature-x", git2::BranchType::Local)
@@ -7015,6 +7349,31 @@ mod tests {
             source_feature_tip_after, source_feature_tip,
             "feature-x's independent dest content must never be pulled back into source — \
              dest→source is scoped to config.branches only"
+        );
+
+        let dest_feature_tip_after = dest_repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_feature_tip_after, dest_feature_tip_with_independent_content,
+            "nothing must be pushed to dest for the halted branch"
+        );
+
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "a properly configured branch must still be processed when a discovered \
+             branch halts (decisions/0045's per-branch, not whole-run, halt)"
         );
     }
 
@@ -8337,14 +8696,19 @@ mod tests {
     }
 
     #[test]
-    // decisions/0039's addendum "a missing boundary object is confirmed as a
-    // rewrite on a non-shallow clone": the amend test above rewrites
-    // `source_repo` in place, so the pre-amend commit never actually leaves
-    // its object database and `find_commit(boundary)` trivially succeeds —
-    // it never exercises the missing-object path a real, freshly fetched CI
-    // clone hits. This test runs the sync against a genuinely separate clone
+    // decisions/0039's addendum-to-the-addendum (2026-08-27, review finding
+    // F-01): a missing boundary object is never positive rewrite evidence,
+    // regardless of `Repository::is_shallow()` — a stale (behind) but
+    // non-shallow clone looks exactly like a real rewrite from inside
+    // `mirror_only_rewrite_detected`, and the old special case force-pushed
+    // dest backwards from it (`stale_nonshallow_clone_...` below reproduces
+    // the end-to-end race). The amend test above rewrites `source_repo` in
+    // place, so the pre-amend commit never actually leaves its object
+    // database and `find_commit(boundary)` trivially succeeds — it never
+    // exercises the missing-object path a real, freshly fetched CI clone
+    // hits. This test runs the sync against a genuinely separate clone
     // instead.
-    fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_non_shallow_clone()
+    fn sync_pair_to_dest_refuses_a_mirror_only_branch_when_the_boundary_object_is_missing_even_from_a_non_shallow_clone()
      {
         let (dest_dir, dest_repo, _source_dir, repo, graft, config) =
             mirror_only_feature_branch_synced_once();
@@ -8370,7 +8734,7 @@ mod tests {
         );
 
         let mut dest_ref_cache = RunCache::default();
-        sync_pair_to_dest(
+        let halted = sync_pair_to_dest(
             &fresh_repo,
             fresh_dir.path(),
             &config,
@@ -8379,28 +8743,38 @@ mod tests {
             &mut dest_ref_cache,
         )
         .expect(
-            "a rewritten mirror-only branch must rebuild even when this clone \
-             never had the pre-rewrite boundary commit, as long as it isn't shallow",
+            "a missing boundary object must halt this branch, not be guessed at as a \
+             confirmed rewrite just because this clone happens to be non-shallow",
+        );
+        assert!(
+            halted,
+            "a mirror-only branch that can't be safely built on must halt, not silently push"
         );
 
-        let rebuilt = dest_repo
+        let untouched = dest_repo
             .find_branch("feature-x", git2::BranchType::Local)
             .unwrap()
             .get()
             .peel_to_commit()
             .unwrap();
-        let tree = rebuilt.tree().unwrap();
+        let tree = untouched.tree().unwrap();
         let blob = dest_repo
             .find_blob(tree.get_name("feature.txt").unwrap().id())
             .unwrap();
-        assert_eq!(blob.content(), b"amended\n");
+        assert_eq!(
+            blob.content(),
+            b"original\n",
+            "dest must be left exactly as the first sync produced it — a stale clone must \
+             never force-push dest backwards just because it isn't shallow"
+        );
         drop(dest_dir);
     }
 
     #[test]
     // The shallow counterpart of the test above: the ambiguity ("rewritten,
-    // or just an incomplete clone?") is real on a shallow clone, so refusal
-    // must stand — this is a regression guard, not new behavior.
+    // or just an incomplete clone?") is real on a shallow clone too — same
+    // halt, same reasoning, decisions/0039's addendum-to-the-addendum no
+    // longer distinguishes them by shallowness.
     fn sync_pair_to_dest_still_refuses_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_shallow_clone()
      {
         let (dest_dir, dest_repo, _source_dir, repo, graft, config) =
@@ -8423,7 +8797,7 @@ mod tests {
         );
 
         let mut dest_ref_cache = RunCache::default();
-        let err = sync_pair_to_dest(
+        let halted = sync_pair_to_dest(
             &fresh_repo,
             fresh_dir.path(),
             &config,
@@ -8431,10 +8805,10 @@ mod tests {
             &reporter,
             &mut dest_ref_cache,
         )
-        .expect_err("a shallow clone can't tell a rewrite from an incomplete fetch");
+        .expect("a shallow clone can't tell a rewrite from an incomplete fetch — must halt, not error the whole invocation");
         assert!(
-            err.to_string().contains("safely build on"),
-            "unexpected error: {err}"
+            halted,
+            "a mirror-only branch that can't be safely built on must halt, not silently push"
         );
 
         let untouched = dest_repo
@@ -8453,6 +8827,114 @@ mod tests {
             "dest must be left exactly as the first sync produced it"
         );
         drop(dest_dir);
+    }
+
+    #[test]
+    fn sync_pair_to_dest_refuses_to_force_push_dest_backwards_from_a_stale_non_shallow_clone() {
+        // decisions/0039's addendum-to-the-addendum (review finding F-01,
+        // reproduced end-to-end): two CI clones for the same mirror-only
+        // branch finishing out of order, both non-shallow. Clone A syncs at
+        // T1, then advances the branch to T2 (an ordinary fast-forward, no
+        // rewrite) and syncs again. A stale clone B — a full, non-shallow
+        // clone taken back when the branch was still at T1 — must never
+        // force-push dest's tip back down to a chain built from T1: a
+        // missing boundary object on a non-shallow clone looks exactly like
+        // a genuine rewrite from inside `mirror_only_rewrite_detected`, and
+        // treating it as positive rewrite evidence let a stale clone's
+        // passing `--force-with-lease` (the lease only guards against
+        // *concurrent* dest movement, not stale source knowledge) rebuild
+        // and force dest backwards.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        source_repo
+            .branch("task", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "task", &[("t1.txt", "1\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        // Clone A syncs task at T1.
+        sync_pair_to_dest(
+            &source_repo,
+            source_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut RunCache::default(),
+        )
+        .unwrap();
+        let dest_tip_at_t1 = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // Clone B: a full (non-shallow) clone of source taken now, at T1.
+        let (b_dir, b_repo) = fresh_clone_of_branch(&source_repo, "task", false);
+        assert!(
+            !b_repo.is_shallow(),
+            "a plain fetch must not produce a shallow clone"
+        );
+
+        // Clone A advances task to T2 (fast-forward, no rewrite) and syncs.
+        add_commit(&source_repo, "task", &[("t2.txt", "2\n")]);
+        sync_pair_to_dest(
+            &source_repo,
+            source_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut RunCache::default(),
+        )
+        .unwrap();
+        let dest_tip_at_t2 = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_ne!(dest_tip_at_t1, dest_tip_at_t2);
+
+        // Stale clone B — still at T1, never rewrote anything — syncs last.
+        let halted = sync_pair_to_dest(
+            &b_repo,
+            b_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut RunCache::default(),
+        )
+        .expect("a stale clone must halt this branch, not error the whole invocation");
+        assert!(halted, "a stale clone must halt, never force-push");
+
+        let dest_tip_after_stale_clone = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_tip_after_stale_clone, dest_tip_at_t2,
+            "a stale clone must never move dest's task ref backwards"
+        );
     }
 
     #[test]
@@ -9302,6 +9784,121 @@ mod tests {
         }
     }
 
+    // decisions/0044/0045: never create a dest ref this branch's own
+    // dest_tip_accounted_for won't recognize next run, and a discovered
+    // branch's unsafe-resume-point refusal is a per-branch halt.
+
+    #[test]
+    fn unsafe_to_build_on_message_names_the_branch_and_never_claims_dest_to_source_could_apply() {
+        let message = unsafe_to_build_on_message("hotfix");
+        assert!(
+            message.contains("\"hotfix\""),
+            "must name the branch: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("hasn't reflected"),
+            "a discovered (mirror-only) branch's refusal must never claim dest→source could \
+             have applied — dest→source never runs for it: {message}"
+        );
+    }
+
+    #[test]
+    fn run_halts_only_a_dest_native_branch_colliding_with_a_same_named_discovered_branch() {
+        // decisions/0045 (review finding F-05): dest developers create a
+        // branch that happens to share a name with a branch source
+        // independently created too — genuinely unrelated history, dest-ref
+        // already exists on both sides. Before this decision,
+        // `graft_point`'s merge-base failure propagated as a fatal
+        // `anyhow::bail!` from inside `dest_tip_accounted_for`, aborting the
+        // whole run before any later-sorted branch (alphabetically after
+        // "hotfix") ever got its own turn.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A genuinely unrelated, orphan dest-native branch "hotfix" — no
+        // ancestry shared with anything `gitprism setup` ever grafted.
+        let hotfix_signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        let blob = dest_repo.blob(b"hotfix content").unwrap();
+        let mut builder = dest_repo.treebuilder(None).unwrap();
+        builder
+            .insert("hotfix.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+        dest_repo
+            .commit(
+                Some("refs/heads/hotfix"),
+                &hotfix_signature,
+                &hotfix_signature,
+                "an orphan dest-native hotfix, unrelated to anything gitprism ever grafted",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        // Source independently has its own, entirely unrelated "hotfix" —
+        // sorts before "main" alphabetically, so a fatal bail here would
+        // have starved main's own sync too.
+        source_repo
+            .branch("hotfix", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(
+            &source_repo,
+            "hotfix",
+            &[("source-hotfix.txt", "content\n")],
+        );
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let err = run(source_dir.path(), config.path())
+            .expect_err("a halted branch must still fail the overall run (decisions/0037)");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("halted"),
+            "the run's own error should mention a halted branch: {err:#}"
+        );
+
+        // "main" sorts after "hotfix" — it must still have been processed
+        // in the same run, not starved by hotfix's halt.
+        let dest_main_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip_after, dest_tip,
+            "main must still be processed (a no-op here) when hotfix halts"
+        );
+
+        // dest's own hotfix content must be untouched — nothing pushed for
+        // the halted branch.
+        let dest_hotfix_tip_after = dest_repo
+            .find_branch("hotfix", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let hotfix_tree = dest_hotfix_tip_after.tree().unwrap();
+        assert!(
+            hotfix_tree.get_name("hotfix.txt").is_some(),
+            "dest's own hotfix content must be untouched"
+        );
+        assert!(
+            hotfix_tree.get_name("source-hotfix.txt").is_none(),
+            "source's unrelated hotfix content must never have been pushed"
+        );
+    }
+
     // decisions/0043: mirror-only branches graft onto their nearest
     // mirrored ancestor.
 
@@ -9438,6 +10035,209 @@ mod tests {
             "task's dest tree must still carry feature.txt, inherited from feature's own tip"
         );
         assert!(task_tree.get_name("task.txt").is_some());
+    }
+
+    #[test]
+    fn run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it() {
+        // Repository review F-04: a dest-native commit X, committed directly
+        // to dest's round-tripped main, gets imported into source's main as
+        // a `DestToSource` marker M (dest→source). `task`, forked from
+        // main's tip *after* that import, inherits M as an ancestor. M is
+        // scoped to "main", not "task" — `task`'s own resume-boundary scan
+        // and decisions/0043's sibling search both correctly don't accept it
+        // as *task's own* marker, but before the fix, loop prevention didn't
+        // accept it either, so `task`'s sync re-replayed M's filtered
+        // content as a brand-new commit — X duplicated onto dest's task.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("s1.txt", "s1\n")]);
+        let source_remote = bare_source_remote_seeded_at(
+            &source_repo,
+            "main",
+            source_repo
+                .find_branch("main", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+        );
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+        run(source_dir.path(), config.path()).unwrap();
+
+        // A dest-native commit X, landing directly on dest main.
+        let dest_main_before_x = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        add_independent_dest_commit(
+            &dest_repo,
+            dest_main_before_x,
+            ("x.txt", "x\n"),
+            "dest native X",
+        );
+        run(source_dir.path(), config.path()).unwrap(); // imports X into source main as M
+        let dest_main_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let main_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        source_repo.branch("task", &main_tip, false).unwrap();
+        add_commit(&source_repo, "task", &[("task.txt", "t\n")]);
+
+        run(source_dir.path(), config.path()).unwrap();
+
+        let dest_task = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut walk = dest_repo.revwalk().unwrap();
+        walk.push(dest_task.id()).unwrap();
+        walk.hide(dest_main_tip).unwrap();
+        let commits_since_main: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
+        assert_eq!(
+            commits_since_main.len(),
+            1,
+            "task's dest chain must add only its own commit onto dest main — M must not be \
+             re-replayed as a duplicate of the already-imported X"
+        );
+    }
+
+    #[test]
+    fn build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch() {
+        // decisions/0043's addendum (F-04), isolating loop prevention from
+        // the anchor-search fix above: "main" is deliberately kept out of
+        // `task`'s sibling candidates (decisions/0043's own accepted
+        // "wrong order" ordering hazard, forced here via the cache instead
+        // of real timing), so `task`'s first sync falls all the way back to
+        // the original graft — M ends up inside `pending` regardless of how
+        // precise the anchor search is. Only loop prevention recognizing
+        // M's own `DestToSource` marker (scoped to "main", not "task") can
+        // stop it from being replayed as a duplicate of the already-
+        // imported X.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("s1.txt", "s1\n")]);
+        let source_remote = bare_source_remote_seeded_at(
+            &source_repo,
+            "main",
+            source_repo
+                .find_branch("main", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+        );
+
+        let config = Config::load(
+            write_config(
+                &source_remote.path().display().to_string(),
+                &dest_dir.path().display().to_string(),
+                &["main"],
+            )
+            .path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        let mut run_cache = RunCache::default();
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "main",
+            &reporter,
+            &mut run_cache,
+        )
+        .expect("main must mirror s1.txt to dest first");
+
+        let dest_main_before_x = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        add_independent_dest_commit(
+            &dest_repo,
+            dest_main_before_x,
+            ("x.txt", "x\n"),
+            "dest native X",
+        );
+        sync_pair_from_dest(&repo, source_dir.path(), &config, "main", &reporter)
+            .expect("main must import X into source as M");
+
+        let main_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        source_repo.branch("task", &main_tip, false).unwrap();
+        add_commit(&source_repo, "task", &[("task.txt", "t\n")]);
+
+        // Forces the baseline fallback for `task`'s first sync: "main" is
+        // excluded from the sibling search's candidates even though its
+        // dest ref really does exist (decisions/0043 step 2's cache, seeded
+        // by hand rather than by real cross-run timing).
+        let mut task_run_cache = RunCache::default();
+        task_run_cache
+            .dest_ref_exists
+            .insert("main".to_string(), false);
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "task",
+            &reporter,
+            &mut task_run_cache,
+        )
+        .expect("task must mirror, falling back to the graft since main is hidden from the search");
+
+        let dest_task = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut walk = dest_repo.revwalk().unwrap();
+        walk.push(dest_task.id()).unwrap();
+        walk.hide(dest_tip).unwrap();
+        let commits_since_graft: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
+        assert_eq!(
+            commits_since_graft.len(),
+            2,
+            "task's flattened chain must replay s1.txt and its own commit only — M must be loop-\
+             prevented even though it's scoped to \"main\", not \"task\""
+        );
     }
 
     #[test]

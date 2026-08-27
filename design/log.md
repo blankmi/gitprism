@@ -2045,3 +2045,113 @@ fails against a temporarily disabled cache-insert-after-miss (the same
 production code changed. `cargo test` (240 passed), `cargo clippy
 --workspace --all-targets --all-features --locked -- -D warnings`, and
 `cargo fmt --check` all clean.
+
+**Update**: A full repository review (`docs/2026-08-27_REPOSITORY_REVIEW.md`)
+surfaced three more findings against `src/commands/sync.rs`, all reproduced
+against a separate worktree of the pre-fix code before fixing, then fixed:
+
+* **F-01**: `mirror_only_rewrite_detected`'s non-shallow special case
+  (decisions/0039's "missing boundary object" addendum) misread a stale
+  clone as a confirmed rewrite: two ordinary, non-adversarial CI clones for
+  the same mirror-only branch finishing out of order — both non-shallow —
+  made the older clone force-push dest's tip backwards, passing lease and
+  all (the lease only guards concurrent movement, not stale source
+  knowledge). `is_shallow()==false` never actually proved this clone's view
+  of the branch was *current*, only that it had no shallow boundary.
+  Reproduced end to end
+  (`sync_pair_to_dest_refuses_to_force_push_dest_backwards_from_a_stale_non_shallow_clone`)
+  and fixed: the missing-boundary-object branch now returns `Ok(false)`
+  unconditionally, matching the shallow case exactly — decisions/0039
+  amended with a dated addendum.
+* **F-02**: decisions/0043's sibling-anchoring could extend a brand-new
+  branch's dest ref directly onto a *sibling's* dest commit, which carries
+  the sibling's own marker, not this branch's — every later resync then
+  failed `dest_tip_accounted_for` and bailed permanently, even once the
+  branch gained a real commit of its own. Reproduced
+  (`sync_pair_to_dest_gives_a_branch_with_no_commits_of_its_own_a_branch_scoped_marker`)
+  and fixed via new decisions/0044: before using the anchor verbatim,
+  `dest_tip_is_accounted_for` is checked for this exact branch name; if it
+  wouldn't recognize the anchor next run, a content-empty, branch-scoped
+  marker commit (via the existing `build_dest_commit`) is built on top of
+  it first — the same asymmetry decisions/0003 already licenses for
+  dest→source's own no-op marker commits, applied to source→dest's
+  fallback path.
+* **F-05**: two refusal sites decisions/0024/0037/0043's per-branch-halt
+  rollout missed — the unconditional "isn't at a point this clone can
+  safely build on" bail, and `graft_point`'s "no shared history" merge-base
+  failure — stayed fatal `anyhow::bail!`s reachable from a *discovered*
+  branch, starving every later-sorted branch (including `main`, whenever it
+  sorts after the offending one) of its own turn. Reproduced
+  (`run_halts_only_a_dest_native_branch_colliding_with_a_same_named_discovered_branch`)
+  and fixed via new decisions/0045: both become the existing per-branch
+  `Outcome::Error` + `Ok(true)` pattern for a branch outside
+  `config.branches`, unchanged (fatal) for a round-tripped branch.
+  `graft_point` changes from erroring on no merge-base to `Result<Option<Oid>>`,
+  mirroring `dest_anchor_for_branch`'s own existing idiom for the same
+  underlying git failure. The refusal message for a discovered branch also
+  no longer claims "dest→source hasn't reflected its content yet" —
+  dest→source never runs for a branch outside `config.branches`, so that
+  clause never applied there.
+
+All three reproduction tests were run against a `git worktree` of the
+pre-fix commit first and confirmed to fail there, then confirmed to pass
+against the fix. Three pre-existing tests needed updating for the changed
+behavior (a non-shallow "boundary object missing" test now asserts a halt
+instead of a rebuild; its shallow counterpart now asserts `Ok(true)`
+instead of `Err`; a discovered-branch-with-independent-dest-content test's
+assertions follow the new aggregate halted-branch message instead of the
+old branch-specific bail text). `cargo test` (248 passed), `cargo clippy
+--all-targets -- -D warnings`, and `cargo fmt --check` all clean.
+
+**Update**: The same review's two remaining findings fixed.
+
+* **F-03**: `gitprism resolve --direction source-to-dest` recomputed
+  `sync`'s own pending-commit list without ever running decisions/0037's
+  per-commit `.gitprismignore` policy pre-pass, so a pending commit whose
+  control file disagreed with the pinned policy could still have its clean
+  prefix built and pushed to dest before the operator ever reached the
+  real conflict `resolve` exists to help with — reopening the disclosure
+  path decisions/0036/0037 were written to close. Fixed by making
+  `find_control_file_policy_mismatch`/`policy_mismatch_message`
+  `pub(crate)` and calling the pre-pass in `resolve.rs`'s
+  `start_source_to_dest` (over the full pending list, before any
+  build/push) and again in `finish_source_to_dest` (against just the
+  commit being resolved, as defense in depth for a `--continue` invocation
+  that never runs `start`'s own check). decisions/0037 amended with a
+  dated addendum. Test added
+  (`source_to_dest_resolution_refuses_to_start_on_a_pending_control_file_mismatch`,
+  `src/commands/resolve.rs`), confirmed failing against the pre-fix code
+  (the mismatched commit's content reached dest before the later commit's
+  real conflict surfaced) and passing after.
+* **F-04**: a `DestToSource` marker commit *M* (naming a dest-native
+  commit *X*), scoped to whichever branch's dest→source sync imported it,
+  is an ordinary ancestor of any branch forked afterward — but
+  `marker::verify`'s exact-branch-match requirement (decisions/0025,
+  unchanged) meant a *different* branch's loop prevention and
+  decisions/0043's step 5 anchor search both rejected it, so a task branch
+  forked from `main` after `main` imported a dest-native commit
+  re-projected that commit as a duplicate on dest. Fixed via a dated
+  decisions/0043 addendum: a `DestToSource` marker, once an ancestor of
+  the branch being processed and self-verified against its own recorded
+  branch (never the asking branch — `marker::verify` itself untouched),
+  now counts for that branch's own loop prevention (new shared helper,
+  `loop_prevented`, used by both `build_pending_dest_tip` and
+  decisions/0037's own parallel loop-prevention skip) and is usable by
+  step 5 as an anchor (new function,
+  `newest_dest_to_source_marker_at_or_before`, deliberately narrower than
+  `scan_for_dest_marker` — `Setup` excluded, since every branch trivially
+  inherits it regardless of name and accepting it here reintroduced a
+  false "candidates disagree" ambiguity for two equal-merge-base siblings
+  neither of which had its own `DestToSource` marker, caught by the
+  existing equal-`cbase` test suite). Two tests added
+  (`src/commands/sync.rs`):
+  `run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it`
+  (the full reproduction via `run()`) and
+  `build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch`
+  (isolates loop prevention from the step-5 fix by forcing the
+  already-documented wrong-order baseline fallback). Both confirmed
+  failing against the pre-fix code and passing after; the loop-prevention
+  test also confirmed to still fail with only the step-5 fix in place,
+  proving it exercises an independent path. `cargo test` (251 passed),
+  `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
+  clean.

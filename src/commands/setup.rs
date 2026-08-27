@@ -75,6 +75,13 @@ fn run_with_remove_file(
         .find_reference("HEAD")
         .ok()
         .and_then(|head_ref| head_ref.symbolic_target().ok().flatten().map(str::to_owned));
+    // Checkout baseline: what is actually in the index/working tree right now,
+    // whichever branch HEAD was on. `None` = unborn HEAD.
+    let original_head_commit = repo
+        .head()
+        .ok()
+        .and_then(|head_ref| head_ref.peel_to_commit().ok())
+        .map(|commit| commit.id());
 
     // `--config`'s default is a bare filename meant to resolve against
     // source's root — same place `.gitprismignore` lives below — not
@@ -347,11 +354,7 @@ fn run_with_remove_file(
     // back every branch this run created rather than leaving grafted
     // branches behind that HEAD never actually landed on.
     if let Some(first) = config.branches.first()
-        && let Err(err) = checkout_branch(
-            &repo,
-            first,
-            touched_branches.first().and_then(|b| b.original_oid),
-        )
+        && let Err(err) = checkout_branch(&repo, first, original_head_commit)
     {
         // The control files were just deleted above to let checkout land
         // them cleanly; a failed checkout must not leave the user without
@@ -660,11 +663,25 @@ fn rollback_branches(
     failures
 }
 
-/// `original_oid` is `branch`'s tip *before* this run touched it — `Some`
-/// for a pre-existing branch (decisions/0021, decisions/0023), `None` for
-/// one setup just created fresh. See the comment inside for why checkout
-/// needs it.
-fn checkout_branch(repo: &Repository, branch: &str, original_oid: Option<git2::Oid>) -> Result<()> {
+/// `original_head_commit` is the commit HEAD resolved to before this run
+/// touched anything (`None` if unborn). See the comment inside for why
+/// checkout needs it.
+fn checkout_branch(
+    repo: &Repository,
+    branch: &str,
+    original_head_commit: Option<git2::Oid>,
+) -> Result<()> {
+    checkout_branch_with_restore(repo, branch, original_head_commit, &|repo, tree| {
+        crate::policy::restore_control_files_exact(repo, tree)
+    })
+}
+
+fn checkout_branch_with_restore(
+    repo: &Repository,
+    branch: &str,
+    original_head_commit: Option<git2::Oid>,
+    restore_control_files: &dyn Fn(&Repository, &git2::Tree) -> Result<()>,
+) -> Result<()> {
     let refname = format!("refs/heads/{branch}");
     // libgit2 checkout's conflict/dirty detection defaults its "baseline" —
     // what it believes is already on disk — to HEAD's *current* tree. By
@@ -680,18 +697,14 @@ fn checkout_branch(repo: &Repository, branch: &str, original_oid: Option<git2::O
     // does, which every subsequent `git status` reports as those paths
     // staged for deletion.
     //
-    // Detaching HEAD to `branch`'s own *pre-run* tip first (or, if it didn't
-    // exist before this run, to a nonexistent scratch ref — the same "make
-    // HEAD unborn" trick `rollback_branches` uses below — so checkout sees
-    // no baseline at all) gives checkout a real, non-degenerate baseline to
-    // diff the target against, so it genuinely creates what's missing
-    // instead of assuming there's nothing to do. `set_head` lands HEAD back
-    // on `branch` itself afterward, once checkout has actually run against
-    // the right comparison.
-    match original_oid {
+    // Detaching HEAD to the pre-run HEAD commit first (or, if it was unborn,
+    // to a nonexistent scratch ref — the same "make HEAD unborn" trick
+    // `rollback_branches` uses below) gives checkout a baseline that matches
+    // what is actually on disk. `set_head` lands HEAD on `branch` afterward.
+    match original_head_commit {
         Some(oid) => repo
             .set_head_detached(oid)
-            .with_context(|| format!("detaching HEAD to {branch}'s pre-setup tip {oid}"))?,
+            .with_context(|| format!("detaching HEAD to the pre-run HEAD commit {oid}"))?,
         None => repo
             .set_head("refs/heads/gitprism-setup-checkout-scratch")
             .context("detaching HEAD to an unborn scratch ref before checkout")?,
@@ -708,10 +721,67 @@ fn checkout_branch(repo: &Repository, branch: &str, original_oid: Option<git2::O
     // as a checkout conflict, not get silently overwritten.
     repo.checkout_tree(commit.as_object(), None)
         .with_context(|| format!("checking out {refname} into the working directory"))?;
-    crate::policy::restore_control_files_exact(repo, &commit.tree()?)?;
-    repo.set_head(&refname)
-        .with_context(|| format!("setting HEAD to {refname}"))?;
+    // The graft is now in the index/working tree; a failure below must undo
+    // that too, or the caller's ref-only rollback leaves them disagreeing.
+    let tree = commit.tree()?;
+    if let Err(err) = restore_control_files(repo, &tree) {
+        return Err(with_recovery_failures(
+            err,
+            restore_original_worktree(repo, commit.id(), original_head_commit),
+        ));
+    }
+    if let Err(err) = repo
+        .set_head(&refname)
+        .with_context(|| format!("setting HEAD to {refname}"))
+    {
+        return Err(with_recovery_failures(
+            err,
+            restore_original_worktree(repo, commit.id(), original_head_commit),
+        ));
+    }
     Ok(())
+}
+
+/// Restores the index and working directory to `original_head_commit`'s tree
+/// (empty tree if unborn) after `checkout_tree` already materialized
+/// `currently_checked_out`. Safe (non-forced) checkout: a conflicting change
+/// is reported as a recovery failure, never discarded.
+///
+/// HEAD is first detached to `currently_checked_out` so libgit2's baseline is
+/// what is really on disk; HEAD still points at the restore *target*, and
+/// baseline == target would make the checkout a silent no-op.
+fn restore_original_worktree(
+    repo: &Repository,
+    currently_checked_out: git2::Oid,
+    original_head_commit: Option<git2::Oid>,
+) -> Vec<anyhow::Error> {
+    if let Err(error) = repo.set_head_detached(currently_checked_out) {
+        return vec![anyhow::Error::new(error).context(format!(
+            "detaching HEAD to the currently checked-out commit {currently_checked_out} before restoring it"
+        ))];
+    }
+    let target_tree = match original_head_commit {
+        Some(oid) => repo
+            .find_commit(oid)
+            .and_then(|commit| commit.tree())
+            .with_context(|| format!("resolving pre-run HEAD commit {oid}'s tree to restore it")),
+        None => repo
+            .treebuilder(None)
+            .and_then(|builder| builder.write())
+            .and_then(|oid| repo.find_tree(oid))
+            .context("building an empty tree to restore the pre-run unborn state"),
+    };
+    let target_tree = match target_tree {
+        Ok(tree) => tree,
+        Err(err) => return vec![err],
+    };
+    match repo.checkout_tree(target_tree.as_object(), None) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![
+            anyhow::Error::new(error)
+                .context("restoring the working tree and index to their pre-run state"),
+        ],
+    }
 }
 
 /// This run's own bootstrap control files, read once up front — bundled
@@ -1738,6 +1808,149 @@ mod tests {
     }
 
     #[test]
+    fn checkout_baseline_uses_the_real_pre_run_head_not_the_first_configured_branch() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "dest content")]);
+
+        let source_dir = tempdir().unwrap();
+        // HEAD is attached to a real, pre-existing local branch that is not
+        // even a member of config.branches ("main" has no local copy at all
+        // yet) — the branch actually checked out on disk right now, and the
+        // one whose tree checkout must use as its diff baseline, not
+        // "main"'s own (nonexistent) pre-run tip.
+        repo_with_a_commit_on(
+            source_dir.path(),
+            "other",
+            &[("shared.txt", "other content")],
+        );
+        let repo = Repository::open(source_dir.path()).unwrap();
+        repo.set_head("refs/heads/other").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path()).expect(
+            "setup must use the real pre-run HEAD as checkout's baseline, not spuriously conflict",
+        );
+
+        let repo = Repository::open(source_dir.path()).unwrap();
+        assert_eq!(repo.head().unwrap().name().unwrap(), "refs/heads/main");
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join("shared.txt")).unwrap(),
+            "dest content",
+            "the configured branch's own content must be checked out, not the other branch's stale copy"
+        );
+        assert!(
+            repo.find_branch("other", git2::BranchType::Local).is_ok(),
+            "the unconfigured branch HEAD started on must survive untouched"
+        );
+    }
+
+    #[test]
+    fn checkout_phase_failure_restores_the_working_tree_and_index_to_the_pre_run_state() {
+        let source_dir = tempdir().unwrap();
+        let orig_tip =
+            repo_with_a_commit_on(source_dir.path(), "main", &[("orig.txt", "orig content")]);
+        let repo = Repository::open(source_dir.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        // The graft/merge commit `checkout_branch_with_restore` is about to
+        // check out — built directly here (rather than through setup's own
+        // commit phase) so this test targets the recovery seam in isolation.
+        let mut builder = repo.treebuilder(None).unwrap();
+        let blob = repo.blob(b"grafted content").unwrap();
+        builder
+            .insert("new.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let graft_tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        repo.commit(
+            Some("refs/heads/graft"),
+            &signature,
+            &signature,
+            "graft",
+            &graft_tree,
+            &[],
+        )
+        .unwrap();
+
+        let err = checkout_branch_with_restore(&repo, "graft", Some(orig_tip), &|_repo, _tree| {
+            Err(anyhow::anyhow!("injected restore-control-files failure"))
+        })
+        .expect_err("an injected control-file restore failure must surface as an error");
+        assert!(format!("{err:#}").contains("injected restore-control-files failure"));
+
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join("orig.txt")).unwrap(),
+            "orig content",
+            "the pre-run file must be back on disk after the recovery checkout"
+        );
+        assert!(
+            !source_dir.path().join("new.txt").exists(),
+            "the graft's own file must not remain on disk after recovery"
+        );
+        let index = repo.index().unwrap();
+        assert!(
+            index.get_path(Path::new("new.txt"), 0).is_none(),
+            "the graft's file must not remain staged after recovery"
+        );
+        assert!(
+            index.get_path(Path::new("orig.txt"), 0).is_some(),
+            "the original file must be re-staged after recovery"
+        );
+    }
+
+    #[test]
+    fn checkout_phase_failure_error_mentions_residue_when_recovery_itself_fails() {
+        let source_dir = tempdir().unwrap();
+        let orig_tip =
+            repo_with_a_commit_on(source_dir.path(), "main", &[("orig.txt", "orig content")]);
+        let repo = Repository::open(source_dir.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let mut builder = repo.treebuilder(None).unwrap();
+        let blob = repo.blob(b"grafted content").unwrap();
+        builder
+            .insert("new.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let graft_tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        repo.commit(
+            Some("refs/heads/graft"),
+            &signature,
+            &signature,
+            "graft",
+            &graft_tree,
+            &[],
+        )
+        .unwrap();
+
+        let err = checkout_branch_with_restore(&repo, "graft", Some(orig_tip), &|_repo, _tree| {
+            // Simulates external interference between the failed step and
+            // this run's own recovery attempt: a conflicting untracked file
+            // now sits exactly where the recovery checkout needs to restore
+            // "orig.txt", so the recovery checkout itself also fails.
+            fs::write(source_dir.path().join("orig.txt"), "conflicting content").unwrap();
+            Err(anyhow::anyhow!("injected restore-control-files failure"))
+        })
+        .expect_err("an injected control-file restore failure must surface as an error");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("injected restore-control-files failure"));
+        assert!(
+            message.contains("recovery also failed"),
+            "the aggregated error must mention that the residue-recovery checkout itself failed: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(source_dir.path().join("orig.txt")).unwrap(),
+            "conflicting content",
+            "a genuinely conflicting file must survive, not be silently overwritten by recovery"
+        );
+    }
+
+    #[test]
     fn run_fails_loudly_when_a_pre_existing_branch_has_no_history_in_common_with_dest() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
@@ -2097,6 +2310,108 @@ mod tests {
             repo.find_branch("release-2.0", git2::BranchType::Local)
                 .is_err(),
             "the branch this run would have newly created must not be left behind"
+        );
+    }
+
+    #[test]
+    fn setup_then_sync_end_to_end_mirrors_the_filtered_projection_to_dest() {
+        let dest_dir = tempdir().unwrap();
+        // A bare dest, same as `sync::run`'s own test fixtures use — pushing
+        // to a non-bare repo's currently checked-out branch is refused by
+        // git's `receive.denyCurrentBranch` safety check.
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let mut builder = dest_repo.treebuilder(None).unwrap();
+        let blob = dest_repo.blob(b"dest content").unwrap();
+        builder
+            .insert("a.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("Dest Author", "author@example.com").unwrap();
+        dest_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "initial",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        fs::write(source_dir.path().join(exclude::FILENAME), "secret/\n").unwrap();
+        let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
+
+        run(source_dir.path(), config.path()).expect("setup should succeed");
+
+        // A new commit on source's "main", beyond what setup grafted: one
+        // file that must reach dest, and one under the excluded "secret/"
+        // directory that must never leave source.
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let main_tip = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut builder = repo.treebuilder(Some(&main_tip.tree().unwrap())).unwrap();
+        let feature_blob = repo.blob(b"feature content").unwrap();
+        builder
+            .insert("feature.txt", feature_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let mut secret_builder = repo.treebuilder(None).unwrap();
+        let secret_blob = repo.blob(b"do not leak").unwrap();
+        secret_builder
+            .insert("data.txt", secret_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        builder
+            .insert(
+                "secret",
+                secret_builder.write().unwrap(),
+                git2::FileMode::Tree.into(),
+            )
+            .unwrap();
+        let new_tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "add feature",
+            &new_tree,
+            &[&main_tip],
+        )
+        .unwrap();
+
+        crate::commands::sync::run(source_dir.path(), config.path()).expect("sync should succeed");
+
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        let dest_main = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let dest_tree = dest_main.tree().unwrap();
+        let feature_entry = dest_tree
+            .get_name("feature.txt")
+            .expect("the filtered projection must include feature.txt");
+        assert_eq!(
+            dest_repo.find_blob(feature_entry.id()).unwrap().content(),
+            b"feature content"
+        );
+        assert!(
+            dest_tree.get_name("secret").is_none(),
+            "the excluded secret/ directory must never reach dest"
+        );
+        assert!(
+            dest_tree.get_name(crate::config::FILENAME).is_none(),
+            ".gitprism.toml must exclude itself from the projection reaching dest"
+        );
+        assert!(
+            dest_tree.get_name(exclude::FILENAME).is_none(),
+            ".gitprismignore must exclude itself from the projection reaching dest"
         );
     }
 }

@@ -489,3 +489,116 @@ than wrongly force-push) or are already outside gitprism's control:
   independently pruned or garbage-collected later. gitprism doesn't create
   such clones itself and has no supported workflow that does, but doesn't
   preclude an operator from pointing it at one.
+
+# Addendum (2026-08-27): a missing boundary object is never positive
+rewrite evidence, shallow or not — `is_shallow()` doesn't distinguish a
+rewrite from a stale clone
+
+A repository review (F-01) reproduced the second documented limitation
+above end to end, and found it is not a narrow edge case: it is the steady
+state of two CI clones for the same mirror-only branch finishing out of
+order, both non-shallow — no `--reference`/`--shared`/alternates involved.
+
+**Reproduction.** Clone A syncs mirror-only `task` at T1 (dest now carries
+a marker naming T1). A full, ordinary `git clone` of source — clone B — is
+taken at this point; it has `task` at T1 and, like every plain clone,
+`is_shallow()` is `false`. Clone A then fast-forwards `task` to T2 (an
+ordinary new commit, not a rewrite) and syncs again (dest's marker now
+names T2). Clone B, still at T1, runs sync: `dest_resume_point_for_branch`
+correctly refuses (T2 is not an object clone B ever fetched).
+`mirror_only_rewrite_detected` re-inspects the same missing-object
+condition, finds `!repo.is_shallow()` true for clone B, and returns a
+confirmed rewrite. `sync_pair_to_dest` selects `PushMode::ForceMirrorOnly`
+with `expected_dest` set to the tip clone B just fetched (T2's dest
+commit, moments old) — the `--force-with-lease` compare-and-swap
+[decisions/0040](0040-mirror-only-force-is-a-compare-and-swap-lease.md)
+relies on passes, because nothing else moved dest between clone B's fetch
+and its push. Dest's `task` is rebuilt from clone B's stale T1 and pushed,
+replacing the T2-based projection — the exact steady-state force-push
+[requirements/0001](../requirements/0001-workflow-and-scope.md) forbids,
+happening on an entirely ordinary, non-adversarial timeline.
+
+**Why the previous addendum's reasoning was wrong.** It treated
+`is_shallow()==false` as proof this clone's object database holds
+everything reachable from `source_tip` — true in the narrow sense that a
+non-shallow clone has no `.git/shallow` boundary, but not true in the sense
+the rewrite check actually needs: proof this clone's own view of `branch`
+is *current*. A stale-but-complete clone (fetched a while ago, never
+re-fetched since) is non-shallow by that definition and still missing every
+object created after its last fetch — indistinguishable, from
+`is_shallow()` alone, from a clone that fetched a branch whose pre-rewrite
+tip was force-pushed away on source. The second documented limitation named
+this gap for `--reference`/`--shared`/alternates; the same gap, it turns
+out, is reached by nothing more exotic than an ordinary clone plus the
+passage of time.
+
+**Why the lease did not catch this.** [decisions/0040](0040-mirror-only-force-is-a-compare-and-swap-lease.md)'s
+`--force-with-lease` guards against dest moving *between this run's own
+fetch and its own push* — a concurrent writer. It says nothing about
+whether *this run's source knowledge* is current. Clone B's fetch of dest
+happens after clone A's second sync already landed T2, so the lease's
+expected oid is T2's dest commit — correct and current. The problem is
+entirely upstream of the lease: clone B rebuilds from source content it
+believes is authoritative but is actually behind, and the lease faithfully
+protects a push built on that stale belief.
+
+**Decision.** In `mirror_only_rewrite_detected`, the missing-boundary-object
+branch (`Err(error) if error.code() == git2::ErrorCode::NotFound`) no
+longer branches on `repo.is_shallow()` at all. It returns `Ok(false)`
+unconditionally — the same ordinary refusal `dest_resume_point_for_branch`
+already produces for this case, regardless of clone completeness:
+
+```rust
+Err(error) if error.code() == git2::ErrorCode::NotFound => {
+    return Ok(false);
+}
+```
+
+The "two documented limitations, accepted" framing above is superseded for
+the first limitation (whole-repository, not per-branch granularity) only in
+that it's now moot for the shallow/non-shallow question — that limitation's
+own text about `.git/shallow`'s granularity stands unchanged where it still
+applies (a real shallow-clone refusal). The second limitation (non-shallow
+doesn't strictly prove completeness) is fully superseded: it is no longer a
+narrow, accepted gap, it is the reason `is_shallow()` is not used for this
+decision at all any more.
+
+**What is not changed.** Conditions 1–3 of the four-condition rewrite check
+are untouched. `dest_resume_point_for_branch`'s own conservative `Ok(None)`
+for a round-tripped branch is untouched — this addendum only ever affected
+`mirror_only_rewrite_detected`, which round-tripped branches never reach.
+A genuine rewrite whose boundary object *is* present (the ordinary case —
+`git commit --amend`/rebase/reset against a clone that still has the
+pre-rewrite object, or a fresh clone that happens to still be current) is
+still detected via the existing `graph_descendant_of` ancestry check;
+nothing about that path changes.
+
+**Consequences.**
+
+* A genuine rewrite of a mirror-only branch, synced from a clone that never
+  fetched the pre-rewrite tip, now always refuses with
+  `dest_resume_point_for_branch`'s ordinary "isn't at a point this clone can
+  safely build on" message — shallow or not. An operator fetching/pulling
+  the latest source history before re-running resolves it, same remedy the
+  message already names; there is no longer an automatic rebuild path for
+  this specific shape (missing boundary object) at all. The other rewrite
+  shapes this decision documents (amend/rebase/reset against a clone that
+  still has the pre-rewrite object in its own odb) are unaffected and still
+  rebuild automatically.
+* Combined with [decisions/0045](0045-discovered-branch-refusals-are-per-branch-halts.md),
+  this refusal is a per-branch halt for a mirror-only branch, not a
+  whole-run abort — a stale clone's `task` halting does not stop any other
+  branch's sync in the same run.
+* **Test the implementation commit must add**, reproducing the exact
+  out-of-order-clones scenario above end to end (not just the
+  single-repository missing-object shape decisions/0039's earlier addendum
+  already covers): clone A syncs T1, a separate non-shallow clone B is
+  taken, clone A advances to T2 and syncs again, then stale clone B syncs —
+  dest's `task` must still be at the T2-based tip afterward, never
+  regressed to a T1-based rebuild.
+* The existing non-shallow "boundary object missing" test
+  (`sync_pair_to_dest_rebuilds_a_mirror_only_branch_when_the_boundary_object_is_missing_from_a_non_shallow_clone`)
+  asserted the now-removed rebuild behavior and is renamed/rewritten to
+  assert the halt instead, matching its shallow counterpart exactly — the
+  two tests are now nearly identical, which is itself the point: shallowness
+  no longer distinguishes them.
