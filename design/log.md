@@ -1876,3 +1876,26 @@ it, a mirror-only `feature-x` branch synced once) into
 Verification: `cargo test` — 227 passed, 0 failed (224 + 3 new: the lookup-
 failure test, plus 2 for `fetch_shallow` in `git.rs`). `cargo clippy
 --all-targets` — clean. Nothing committed; changes left in the working tree.
+
+## 2026-08-27
+
+**Update**: Diagnosed a real-deployment symptom — PRs in Azure DevOps for a
+mirror-only branch forked from *another* mirror-only branch (a task branch
+off a mirror-only feature branch, itself off round-tripped `main`) show
+already-merged commits in the diff. Traced to code: `scan_for_dest_marker`
+only recognizes `Setup`/`DestToSource` trailers, which exist only on
+round-tripped branches, so a branch forked from a mirror-only sibling always
+falls back to the nearest round-tripped marker instead of that sibling's own
+mirror — producing a flattened dest chain with no real ancestry in common
+with the sibling's separately-mirrored dest branch, and therefore no correct
+`merge-base` for Azure's PR diff to compute against.
+
+Decided [decisions/0043](decisions/0043-mirror-only-branches-graft-onto-their-nearest-mirrored-ancestor.md)
+— extend the anchor search to every branch with an existing dest ref (not
+just `config.branches`), picking the most specific one via `merge_base` +
+`graph_descendant_of` (same primitives decisions/0006/0023/0039 already use),
+resolved to that branch's dest commit at their real merge-base rather than
+its live tip (keeps round-tripped candidates safe too, no special-casing
+needed). Ambiguous ties hard-fail, naming both candidates — decided
+explicitly in conversation over silently falling back, per this project's
+standing no-guessing default. Not yet implemented; no code changed.
