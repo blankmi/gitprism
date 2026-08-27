@@ -105,5 +105,5 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           rust-version: 1.89.0
-          command: check bans sources
+          command: check
           arguments: --all-features

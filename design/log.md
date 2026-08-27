@@ -1876,3 +1876,282 @@ it, a mirror-only `feature-x` branch synced once) into
 Verification: `cargo test` — 227 passed, 0 failed (224 + 3 new: the lookup-
 failure test, plus 2 for `fetch_shallow` in `git.rs`). `cargo clippy
 --all-targets` — clean. Nothing committed; changes left in the working tree.
+
+## 2026-08-27
+
+**Update**: Diagnosed a real-deployment symptom — PRs in Azure DevOps for a
+mirror-only branch forked from *another* mirror-only branch (a task branch
+off a mirror-only feature branch, itself off round-tripped `main`) show
+already-merged commits in the diff. Traced to code: `scan_for_dest_marker`
+only recognizes `Setup`/`DestToSource` trailers, which exist only on
+round-tripped branches, so a branch forked from a mirror-only sibling always
+falls back to the nearest round-tripped marker instead of that sibling's own
+mirror — producing a flattened dest chain with no real ancestry in common
+with the sibling's separately-mirrored dest branch, and therefore no correct
+`merge-base` for Azure's PR diff to compute against.
+
+Decided [decisions/0043](decisions/0043-mirror-only-branches-graft-onto-their-nearest-mirrored-ancestor.md)
+— extend the anchor search to every branch with an existing dest ref (not
+just `config.branches`), picking the most specific one via `merge_base` +
+`graph_descendant_of` (same primitives decisions/0006/0023/0039 already use),
+resolved to that branch's dest commit at their real merge-base rather than
+its live tip (keeps round-tripped candidates safe too, no special-casing
+needed). Ambiguous ties hard-fail, naming both candidates — decided
+explicitly in conversation over silently falling back, per this project's
+standing no-guessing default. Not yet implemented; no code changed.
+
+**Update**: Implemented decisions/0043 in `src/commands/sync.rs` — new
+`dest_anchor_for_branch` (refines `newest_dest_marker_opt_for_branch`'s
+baseline against every sibling branch with an existing dest ref) and
+`newest_source_marker_at_or_before` (step 5's bounded walk over the winning
+sibling's own dest history), wired into both of
+`sync_pair_to_dest_with_key`'s call sites — the brand-new-branch arm and
+decisions/0039's rewrite-rebuild arm. An `Ambiguous` anchor halts only the
+affected branch (decisions/0024's per-branch precedent), not the whole run.
+Clarified decision 0043 itself during implementation: candidates whose
+merge-base merely *ties* the baseline exactly are excluded before the
+ambiguity check, since two unrelated siblings that both tie the baseline
+(offering no refinement) are not actually ambiguous — caught by a failing
+test, folded back into the decision doc rather than left as an undocumented
+implementation detail. Six new tests (real dest-side ancestry assertions,
+not just content), `cargo test` (233 passed), `cargo clippy --all-targets`,
+and `cargo fmt --check` all clean. Decision 0043 marked `stable`/verified.
+
+**Update**: Code review of the implementation surfaced three real defects,
+all fixed:
+
+* Two candidates with the exact same merge-base (equal, not incomparable)
+  were reported `Ambiguous` — a plain algorithm bug against decision 0043's
+  own definition. Fixed: survivors sharing a `cbase` collapse to one
+  representative (lexicographically smallest name) before the domination
+  comparison. New test:
+  `dest_anchor_for_branch_equal_cbase_siblings_are_resolved_not_ambiguous`.
+* `dest_anchor_for_branch` queried `git ls-remote` once per sibling
+  candidate per newly-discovered/rewritten branch — O(branch count²)
+  subprocesses per run. Fixed: one dest-ref-existence cache per `run()`
+  invocation, threaded through, updated in-memory after each successful
+  push. While implementing this, a further regression was caught in review
+  before commit: a stale cache entry for the branch's own top-of-loop check
+  would have survived decisions/0009's `RejectedRefMoved` race-retry,
+  defeating it. Fixed by invalidating that branch's cache entry on retry.
+  New regression test (written failing first, confirmed it fails without
+  the fix, then passes with it):
+  `sync_pair_to_dest_recovers_from_a_stale_no_dest_ref_cache_entry_on_a_race_retry`.
+* Decision 0043's own "self-corrects on the run after" claim didn't hold:
+  once a branch has any dest ref, an ordinary resync never re-invokes the
+  anchor search — only a positively detected rewrite of the branch's own
+  source history does (decisions/0039). Automatically re-triggering a
+  rebuild whenever a sibling's topology merely improves would be a new
+  automatic force-rewrite trigger with no signal from the affected branch's
+  own developer — exactly the "novel automation" this project's
+  operator-intervention default reserves for an explicit decision, not a
+  silent add. Decided in conversation to weaken the guarantee instead:
+  decision 0043 now states plainly that ordinary resync does not reconsider
+  an anchor, self-correction is limited to decisions/0039's existing rewrite
+  detection, and documents the operator workaround (`git commit --amend
+  --no-edit` / `git rebase --force-rebase` on the misanchored branch). The
+  test that used to imply automatic end-to-end correction was renamed
+  (`dest_anchor_for_branch_is_stateless_and_finds_a_sibling_mirrored_since_its_last_call`)
+  and two new tests added:
+  `sync_pair_to_dest_wrong_order_task_does_not_self_correct_on_an_ordinary_resync`
+  and
+  `sync_pair_to_dest_wrong_order_rewrite_of_task_picks_up_feature_as_the_anchor`.
+
+`cargo test` (237 passed), `cargo clippy --workspace --all-targets
+--all-features --locked -- -D warnings`, and `cargo fmt --check` all clean.
+
+**Update**: A fourth review finding on the same implementation: the
+equal-`cbase` fix above collapsed a group to one representative branch name
+*before* checking whether that specific candidate's own dest history had a
+usable marker — so a genuinely correct, more specific anchor held by a
+*different* member of the group (chosen out because its name sorted later)
+could be silently discarded, falling back to the coarser baseline. Concrete
+case: `z-feature` mirrors first at shared commit S; `a-feature` mirrors
+second and, since `z-feature` already has a dest ref, anchors directly onto
+it rather than re-projecting S — so `a-feature`'s own dest history carries
+no marker naming S at all, only `z-feature`'s does. Picking `a-feature`
+(alphabetically first) and stopping there finds nothing and silently falls
+back, even though `z-feature`'s real anchor was right there.
+
+Fixed by no longer collapsing before step 5: candidates are now grouped by
+`cbase` for the domination comparison (unchanged), but every group member
+proceeds to step 5, not just one. A candidate with nothing to find is
+skipped, not treated as failure — the ordinary shape once this decision's
+own recursive anchoring has been running a while, since a later sibling in
+a group typically already deferred to an earlier one. If none of a group's
+members find anything, the existing safe-degrade to baseline still applies.
+If the ones that did find something all agree, that's the anchor. If two or
+more disagree — genuinely independent dest-space projections of the same
+source-side fork point, only possible when populated without either seeing
+the other's dest ref — a new failure mode, `DestAnchor::AmbiguousResolution`,
+hard-fails naming every disagreeing candidate and its own resolved anchor,
+the same no-guessing default as the existing incomparable-merge-base
+hard-fail, just discovered one step later and reported with its own message
+(`ambiguous_resolution_message`).
+
+Two new tests reproduce this precisely: the exact z-feature/a-feature shape
+above (confirmed to fail against the prior collapse-first logic before the
+fix, and pass after), and a genuine `AmbiguousResolution` built from two
+independently-seeded dest projections of the same source commit (no way to
+construct real disagreement through gitprism's own recursive anchoring,
+which converges by construction). decisions/0043 revised again: steps 4–5
+now describe grouping and per-candidate resolution instead of
+collapse-then-try-one, and Consequences documents the new failure mode.
+`cargo test` (239 passed), `cargo clippy --workspace --all-targets
+--all-features --locked -- -D warnings`, and `cargo fmt --check` all clean.
+
+**Update**: A fifth review finding on the same implementation: trying every
+member of an equal-`cbase` group (the fix above) fetches each one with a
+real `git fetch` subprocess, once per group member per branch searched —
+with N sibling branches sharing one fork point, later branches inspect
+growing groups, roughly `1 + 2 + ... + N` fetches. The same quadratic shape
+the step-2 `ls-remote` cache was built to eliminate, reintroduced one
+correctness fix later via a more expensive subprocess.
+
+Fixed by widening the existing per-run cache (`DestRefCache`, renamed
+`RunCache`) to also remember a fetched candidate's dest tip, not just
+whether its dest ref exists — a cache hit in step 5's loop now costs
+nothing, a miss fetches once and is remembered for every later lookup this
+run, including a later branch's own search landing on the same sibling. The
+main sync loop's own dest fetch (for the branch currently being synced, not
+a sibling) also populates this cache as a side benefit, since that fetch is
+already paid for. A successful push updates both the ref-existence and
+dest-tip cache entries directly, without a further fetch.
+
+New test proves the cache is actually consulted, not just present:
+`fetch_dest_tip_cached_hits_the_cache_without_fetching_again` calls the
+function twice for the same branch, pointing the *second* call at a
+deliberately unreachable remote — it must still succeed with the identical
+oid, which is only possible if it never touched the remote. Confirmed
+failing before the fix (a temporarily disabled cache check reproduces the
+exact "fetching ... failed" error) and passing after. decisions/0043
+revised: step 5 and Consequences describe the shared cache and note that a
+correctness fix touching this search's candidate loop must have its cost
+re-checked every time, not assumed preserved. `cargo test` (240 passed),
+`cargo clippy --workspace --all-targets --all-features --locked -- -D
+warnings`, and `cargo fmt --check` all clean.
+
+**Update**: A sixth review finding, on the test added for the fifth: its
+"first" call to `fetch_dest_tip_cached` was described as a genuine miss, but
+`sync_pair_to_dest`'s own push-accept path had already cached that branch's
+dest tip as a side effect earlier in the same test, via the same fix. The
+"first" call was already a hit; the test proved a hit is a hit twice, not
+that a miss populates the cache. Fixed by removing the branch's entry from
+`run_cache.dest_tip` immediately before that call, so it exercises a real
+miss → fetch → insert against the real dest URL before the second call's
+hit is checked against a broken one. Confirmed the corrected test still
+fails against a temporarily disabled cache-insert-after-miss (the same
+"fetching ... failed" error as before) and passes with it restored. No
+production code changed. `cargo test` (240 passed), `cargo clippy
+--workspace --all-targets --all-features --locked -- -D warnings`, and
+`cargo fmt --check` all clean.
+
+**Update**: A full repository review (`docs/2026-08-27_REPOSITORY_REVIEW.md`)
+surfaced three more findings against `src/commands/sync.rs`, all reproduced
+against a separate worktree of the pre-fix code before fixing, then fixed:
+
+* **F-01**: `mirror_only_rewrite_detected`'s non-shallow special case
+  (decisions/0039's "missing boundary object" addendum) misread a stale
+  clone as a confirmed rewrite: two ordinary, non-adversarial CI clones for
+  the same mirror-only branch finishing out of order — both non-shallow —
+  made the older clone force-push dest's tip backwards, passing lease and
+  all (the lease only guards concurrent movement, not stale source
+  knowledge). `is_shallow()==false` never actually proved this clone's view
+  of the branch was *current*, only that it had no shallow boundary.
+  Reproduced end to end
+  (`sync_pair_to_dest_refuses_to_force_push_dest_backwards_from_a_stale_non_shallow_clone`)
+  and fixed: the missing-boundary-object branch now returns `Ok(false)`
+  unconditionally, matching the shallow case exactly — decisions/0039
+  amended with a dated addendum.
+* **F-02**: decisions/0043's sibling-anchoring could extend a brand-new
+  branch's dest ref directly onto a *sibling's* dest commit, which carries
+  the sibling's own marker, not this branch's — every later resync then
+  failed `dest_tip_accounted_for` and bailed permanently, even once the
+  branch gained a real commit of its own. Reproduced
+  (`sync_pair_to_dest_gives_a_branch_with_no_commits_of_its_own_a_branch_scoped_marker`)
+  and fixed via new decisions/0044: before using the anchor verbatim,
+  `dest_tip_is_accounted_for` is checked for this exact branch name; if it
+  wouldn't recognize the anchor next run, a content-empty, branch-scoped
+  marker commit (via the existing `build_dest_commit`) is built on top of
+  it first — the same asymmetry decisions/0003 already licenses for
+  dest→source's own no-op marker commits, applied to source→dest's
+  fallback path.
+* **F-05**: two refusal sites decisions/0024/0037/0043's per-branch-halt
+  rollout missed — the unconditional "isn't at a point this clone can
+  safely build on" bail, and `graft_point`'s "no shared history" merge-base
+  failure — stayed fatal `anyhow::bail!`s reachable from a *discovered*
+  branch, starving every later-sorted branch (including `main`, whenever it
+  sorts after the offending one) of its own turn. Reproduced
+  (`run_halts_only_a_dest_native_branch_colliding_with_a_same_named_discovered_branch`)
+  and fixed via new decisions/0045: both become the existing per-branch
+  `Outcome::Error` + `Ok(true)` pattern for a branch outside
+  `config.branches`, unchanged (fatal) for a round-tripped branch.
+  `graft_point` changes from erroring on no merge-base to `Result<Option<Oid>>`,
+  mirroring `dest_anchor_for_branch`'s own existing idiom for the same
+  underlying git failure. The refusal message for a discovered branch also
+  no longer claims "dest→source hasn't reflected its content yet" —
+  dest→source never runs for a branch outside `config.branches`, so that
+  clause never applied there.
+
+All three reproduction tests were run against a `git worktree` of the
+pre-fix commit first and confirmed to fail there, then confirmed to pass
+against the fix. Three pre-existing tests needed updating for the changed
+behavior (a non-shallow "boundary object missing" test now asserts a halt
+instead of a rebuild; its shallow counterpart now asserts `Ok(true)`
+instead of `Err`; a discovered-branch-with-independent-dest-content test's
+assertions follow the new aggregate halted-branch message instead of the
+old branch-specific bail text). `cargo test` (248 passed), `cargo clippy
+--all-targets -- -D warnings`, and `cargo fmt --check` all clean.
+
+**Update**: The same review's two remaining findings fixed.
+
+* **F-03**: `gitprism resolve --direction source-to-dest` recomputed
+  `sync`'s own pending-commit list without ever running decisions/0037's
+  per-commit `.gitprismignore` policy pre-pass, so a pending commit whose
+  control file disagreed with the pinned policy could still have its clean
+  prefix built and pushed to dest before the operator ever reached the
+  real conflict `resolve` exists to help with — reopening the disclosure
+  path decisions/0036/0037 were written to close. Fixed by making
+  `find_control_file_policy_mismatch`/`policy_mismatch_message`
+  `pub(crate)` and calling the pre-pass in `resolve.rs`'s
+  `start_source_to_dest` (over the full pending list, before any
+  build/push) and again in `finish_source_to_dest` (against just the
+  commit being resolved, as defense in depth for a `--continue` invocation
+  that never runs `start`'s own check). decisions/0037 amended with a
+  dated addendum. Test added
+  (`source_to_dest_resolution_refuses_to_start_on_a_pending_control_file_mismatch`,
+  `src/commands/resolve.rs`), confirmed failing against the pre-fix code
+  (the mismatched commit's content reached dest before the later commit's
+  real conflict surfaced) and passing after.
+* **F-04**: a `DestToSource` marker commit *M* (naming a dest-native
+  commit *X*), scoped to whichever branch's dest→source sync imported it,
+  is an ordinary ancestor of any branch forked afterward — but
+  `marker::verify`'s exact-branch-match requirement (decisions/0025,
+  unchanged) meant a *different* branch's loop prevention and
+  decisions/0043's step 5 anchor search both rejected it, so a task branch
+  forked from `main` after `main` imported a dest-native commit
+  re-projected that commit as a duplicate on dest. Fixed via a dated
+  decisions/0043 addendum: a `DestToSource` marker, once an ancestor of
+  the branch being processed and self-verified against its own recorded
+  branch (never the asking branch — `marker::verify` itself untouched),
+  now counts for that branch's own loop prevention (new shared helper,
+  `loop_prevented`, used by both `build_pending_dest_tip` and
+  decisions/0037's own parallel loop-prevention skip) and is usable by
+  step 5 as an anchor (new function,
+  `newest_dest_to_source_marker_at_or_before`, deliberately narrower than
+  `scan_for_dest_marker` — `Setup` excluded, since every branch trivially
+  inherits it regardless of name and accepting it here reintroduced a
+  false "candidates disagree" ambiguity for two equal-merge-base siblings
+  neither of which had its own `DestToSource` marker, caught by the
+  existing equal-`cbase` test suite). Two tests added
+  (`src/commands/sync.rs`):
+  `run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it`
+  (the full reproduction via `run()`) and
+  `build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch`
+  (isolates loop prevention from the step-5 fix by forcing the
+  already-documented wrong-order baseline fallback). Both confirmed
+  failing against the pre-fix code and passing after; the loop-prevention
+  test also confirmed to still fail with only the step-5 fix in place,
+  proving it exercises an independent path. `cargo test` (251 passed),
+  `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
+  clean.

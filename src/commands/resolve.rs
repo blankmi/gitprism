@@ -35,7 +35,8 @@ use git2::{Oid, Repository, Signature};
 
 use crate::commands::sync::{
     build_dest_commit, build_source_commit, dest_resume_point_for_branch, filter_tree,
-    pending_commits, pending_dest_commits,
+    find_control_file_policy_mismatch, pending_commits, pending_dest_commits,
+    policy_mismatch_message,
 };
 use crate::config::Config;
 use crate::exclude;
@@ -152,6 +153,7 @@ pub fn run_with_direction(
             r#continue,
             &state_key,
             &exclude_list,
+            &ignore_raw,
             &policy::digest_bytes(config_raw.as_bytes(), ignore_raw.as_bytes()),
         ),
     }
@@ -218,6 +220,7 @@ fn resolve_source_to_dest(
     r#continue: bool,
     state_key: &marker::StateKey,
     exclude_list: &exclude::ExcludeList,
+    ignore_raw: &str,
     policy_digest: &str,
 ) -> Result<()> {
     require_branch_checked_out(repo, branch)?;
@@ -231,6 +234,7 @@ fn resolve_source_to_dest(
             operation,
             state_key,
             exclude_list,
+            ignore_raw,
             policy_digest,
             SourceToDestFinishMode::Continue,
         )
@@ -247,11 +251,13 @@ fn resolve_source_to_dest(
             branch,
             state_key,
             exclude_list,
+            ignore_raw,
             policy_digest,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_source_to_dest(
     repo: &Repository,
     source_root: &Path,
@@ -259,6 +265,7 @@ fn start_source_to_dest(
     branch: &str,
     state_key: &marker::StateKey,
     exclude_list: &exclude::ExcludeList,
+    ignore_raw: &str,
     policy_digest: &str,
 ) -> Result<()> {
     let source_tip = repo
@@ -285,6 +292,20 @@ fn start_source_to_dest(
     let boundary = dest_resume_point_for_branch(repo, source_tip, dest_tip, branch, state_key)?
         .with_context(|| format!("dest branch {branch:?} is not safe to build on"))?;
     let pending = pending_commits(repo, boundary, source_tip)?;
+
+    // decisions/0037's addendum (F-03): the same pre-pass `sync` runs before
+    // building or pushing anything for this branch, over the identical
+    // pending list — refuses the whole resolve, before any commit is built
+    // or dest is touched, rather than pushing a clean prefix filtered only
+    // by the pinned policy.
+    if let Some(mismatch) =
+        find_control_file_policy_mismatch(repo, &pending, branch, state_key, ignore_raw)?
+    {
+        anyhow::bail!(
+            "gitprism resolve: {}",
+            policy_mismatch_message(branch, &mismatch)
+        );
+    }
 
     let mut parent = dest_tip;
     let mut selected = None;
@@ -472,6 +493,7 @@ fn start_source_to_dest(
                 operation,
                 state_key,
                 exclude_list,
+                ignore_raw,
                 policy_digest,
                 SourceToDestFinishMode::Immediate,
             )
@@ -530,6 +552,7 @@ fn finish_source_to_dest(
     operation: SourceToDestOperation,
     state_key: &marker::StateKey,
     exclude_list: &exclude::ExcludeList,
+    ignore_raw: &str,
     policy_digest: &str,
     finish_mode: SourceToDestFinishMode,
 ) -> Result<()> {
@@ -579,6 +602,23 @@ fn finish_source_to_dest(
     )?;
     reject_excluded_edits(repo, &checkout_base.tree()?, &resolved_tree, exclude_list)?;
     let source_commit = repo.find_commit(operation.source_commit)?;
+    // decisions/0037's addendum (F-03): re-checked directly against the
+    // commit actually being pushed, not only relied on transitively via
+    // `start_source_to_dest`'s own pre-pass — a `--continue` invocation
+    // never runs that pre-pass itself, so finishing must not depend on it
+    // having run in some earlier process.
+    if let Some(mismatch) = find_control_file_policy_mismatch(
+        repo,
+        &[operation.source_commit],
+        branch,
+        state_key,
+        ignore_raw,
+    )? {
+        anyhow::bail!(
+            "gitprism resolve: {}",
+            policy_mismatch_message(branch, &mismatch)
+        );
+    }
     let new_dest = build_dest_commit(
         repo,
         config,
@@ -1522,8 +1562,20 @@ mod tests {
             .unwrap();
         }
         repo.set_head(&format!("refs/heads/{branch}")).unwrap();
-        repo.checkout_head(None).unwrap();
+        checkout_head_exact(&repo);
         repo
+    }
+
+    /// Forced checkout of HEAD followed by decisions/0034's byte-exact
+    /// control-file restore — what a real `setup`/`sync` leaves on disk.
+    /// Without it, a host with `core.autocrlf=true` (Windows CI) checks out
+    /// `.gitprismignore` with CRLF and decisions/0037's policy check sees the
+    /// pinned bytes disagree with an identical blob.
+    fn checkout_head_exact(repo: &Repository) {
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        policy::restore_control_files_exact(repo, &head_tree).unwrap();
     }
 
     /// Unlike `commands::sync`'s own `add_commit` fixture (which never needs
@@ -1558,8 +1610,7 @@ mod tests {
                 &[&tip],
             )
             .unwrap();
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(repo);
         oid
     }
 
@@ -1620,9 +1671,7 @@ mod tests {
             .unwrap();
         source_repo.branch("feature", &main_tip, false).unwrap();
         source_repo.set_head("refs/heads/feature").unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let source_change = add_commit(&source_repo, "feature", &[("f.txt", "source")]);
         let dest_feature =
             add_independent_dest_commit_on(&dest_repo, dest_tip, "feature", ("f.txt", "dest"));
@@ -1650,9 +1699,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
         let error = run_with_direction(
             source_dir.path(),
@@ -1713,9 +1760,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
         let first_error = run_with_direction(
@@ -1759,6 +1804,117 @@ mod tests {
             .unwrap()
             .delete()
             .unwrap();
+    }
+
+    #[test]
+    fn source_to_dest_resolution_refuses_to_start_on_a_pending_control_file_mismatch() {
+        // Repository review F-03 / decisions/0037's addendum: `resolve`'s
+        // source-to-dest path must refuse the whole resolve — pushing
+        // nothing — the same way `sync` halts a branch whose replayed
+        // commit carries a `.gitprismignore` differing from the pinned
+        // policy, instead of pushing a clean prefix filtered only by the
+        // pin and reopening decisions/0036/0037's disclosure path.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "base")]);
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        // Establishes a safe resume point beyond the graft — same shape as
+        // `source_to_dest_non_fast_forward_requires_restarting_resolution`:
+        // dest gained independent content, already reflected into source as
+        // a `DestToSource` marker, so `start_source_to_dest` has a real
+        // boundary to compute pending commits from.
+        let source_change = add_commit(&source_repo, "main", &[("f.txt", "source")]);
+        let dest_change = add_independent_dest_commit(&dest_repo, dest_tip, ("f.txt", "dest"));
+        let source_parent = source_repo.find_commit(source_change).unwrap();
+        let marker_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let marker_message = marker::build_message(
+            "gitprism sync: dest -> source",
+            marker::Direction::DestToSource,
+            "main",
+            dest_change,
+            "Gitprism-Dest-Commit",
+            &[source_change],
+            source_parent.tree_id(),
+            &marker_signature,
+            &marker_signature,
+            &marker::load_key().unwrap(),
+        );
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &marker_signature,
+                &marker_signature,
+                &marker_message,
+                &source_parent.tree().unwrap(),
+                &[&source_parent],
+            )
+            .unwrap();
+        checkout_head_exact(&source_repo);
+
+        // A pending commit that both sets a `.gitprismignore` diverging from
+        // the pinned policy below and carries real, non-excluded content —
+        // the same shape decisions/0037 warns about: a differing control
+        // file alone is self-excluded and produces no dest-side change, so
+        // the mismatch must be caught before any content-bearing commit
+        // reaches dest, not only when the mismatched commit itself would.
+        let mismatched_commit = add_commit(
+            &source_repo,
+            "main",
+            &[(exclude::FILENAME, "*.log\n"), ("extra.txt", "hello")],
+        );
+        // A later pending commit that genuinely conflicts on dest — without
+        // this, `start_source_to_dest` has nothing to resolve and bails
+        // before ever reaching the push this test guards against.
+        add_commit(&source_repo, "main", &[("f.txt", "source, again")]);
+
+        // The deployed/pinned policy — what `resolve` actually reads off
+        // disk — disagrees with what the pending commit above committed:
+        // decisions/0037's "approved-but-not-yet-repinned" ambiguity.
+        fs::write(source_dir.path().join(exclude::FILENAME), "*.secret\n").unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
+
+        let error = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "main",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("a pending commit's differing .gitprismignore must refuse the whole resolve");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&mismatched_commit.to_string()),
+            "message was: {message}"
+        );
+        assert!(
+            message.contains("GITPRISM_POLICY_SHA256"),
+            "message was: {message}"
+        );
+        assert!(
+            message.contains(exclude::FILENAME),
+            "message was: {message}"
+        );
+
+        let dest_main_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_after, dest_change,
+            "nothing must be pushed beyond dest's own independent commit when resolve's start \
+             refuses on a policy mismatch"
+        );
+        assert!(
+            find_source_to_dest_operation(&source_repo, "main", &marker::load_key().unwrap())
+                .is_err(),
+            "a refused resolve must not leave an in-progress operation behind"
+        );
     }
 
     /// A bare repo standing in for source's own remote, seeded at `tip` —
@@ -2189,9 +2345,7 @@ mod tests {
                 &[&source_parent],
             )
             .unwrap();
-        source_repo
-            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
+        checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
         let error = run_with_direction(

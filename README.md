@@ -138,10 +138,13 @@ installer and package-manager integrations are optional.
   moment it exists.
 * **dest → source is an explicit, configured list of branches** — the
   branches on dest whose independent changes should flow back into source.
-* **Real conflicts hard-stop.** If dest and source independently changed the
-  same content, gitprism doesn't guess a winner or silently drop one side —
-  it aborts that branch's sync, pushes nothing, and prints the exact commands
-  to reproduce and resolve the conflict by hand (`gitprism resolve`, below).
+* **Real conflicts hard-stop the whole run.** If dest and source
+  independently changed the same content, gitprism doesn't guess a winner or
+  silently drop one side — it aborts the entire run, pushes nothing further
+  for any branch, and prints the exact commands to reproduce and resolve the
+  conflict by hand (`gitprism resolve`, below). Branches already pushed
+  earlier in the same run are unaffected; branches not yet reached are not
+  processed until the conflict is resolved.
 * **gitprism never deletes branches** on either side, on either sync
   direction.
 
@@ -320,8 +323,9 @@ The recurring job — run this from CI (or manually) on every source push, on
 a schedule, or on demand. Does both directions in one run: `dest → source`
 for every configured branch, then `source → dest` for every branch that
 currently exists on source. Safe to run redundantly; a run that finds
-nothing new is a no-op. On a real conflict, it stops that branch's sync,
-leaves everything else unaffected, and prints how to resolve it.
+nothing new is a no-op. On a real conflict, it aborts the run: no further
+branches are processed until the operator resolves it with `gitprism
+resolve`. Branches already pushed earlier in the same run are unaffected.
 
 See [`design/playbooks/0001-gitlab-pipeline-triggers.md`](design/playbooks/0001-gitlab-pipeline-triggers.md)
 for a suggested GitLab CI trigger setup (gitprism itself doesn't care what

@@ -258,3 +258,93 @@ latter two, and `find_control_file_policy_mismatch` maps them onto a
 `PolicyMismatchReason` so the operator-facing message states what was
 actually wrong instead of always claiming a byte mismatch. Absence is
 unaffected — still not a mismatch.
+
+# Addendum (2026-08-27): `gitprism resolve`'s source-to-dest path runs the same pre-pass
+
+A repository review (finding F-03) found this decision's halt enforced in
+exactly one place: `sync_pair_to_dest_with_key`'s call to
+`find_control_file_policy_mismatch` (`src/commands/sync.rs`), before
+`build_pending_dest_tip` builds or pushes anything. `gitprism resolve
+--direction source-to-dest`'s `start_source_to_dest`
+(`src/commands/resolve.rs`) recomputes the identical pending list
+(`pending_commits(repo, boundary, source_tip)`, the same boundary
+`build_pending_dest_tip` uses) and replays it into real dest commits via
+`build_dest_commit`, pushing the clean prefix (`PushMode::FastForwardOnly`)
+before ever setting up the conflict a human is meant to resolve — with no
+call to the pre-pass anywhere in `resolve.rs`.
+
+Trigger: a branch has a pending commit whose committed `.gitprismignore`
+adds an exclusion for newly added sensitive content (and, in the same
+commit or a later one, real non-excluded content changes — a
+`.gitprismignore`-only commit is self-excluded and produces no dest-side
+change by itself, so it isn't what gets pushed), followed by a later
+pending commit that conflicts with dest. `sync` halts the branch before
+touching dest at all. Following the branch's own conflict message, the
+operator runs `gitprism resolve <branch> --direction source-to-dest`,
+which pushes everything before the conflict — filtered only by the
+*pinned* list — reopening exactly the disclosure path decisions/0036 and
+this decision were written to close, via a command documented as
+"recomputing exactly what `sync` would build next."
+
+## Decision
+
+`find_control_file_policy_mismatch` and `policy_mismatch_message`
+(`src/commands/sync.rs`) become `pub(crate)` — no behavior change, only
+visibility, so `resolve.rs` reports the identical halt in the identical
+words `sync` already uses, rather than a second implementation that could
+drift from it.
+
+`start_source_to_dest` runs the pre-pass over its own `pending` list
+immediately after computing it, before the loop that builds clean commits
+onto `parent` or decides what (if anything) to push — a mismatch anywhere
+in the pending range refuses the entire resolve invocation, pushing
+nothing, the same all-or-nothing shape `sync`'s own per-branch halt gives
+that branch.
+
+`finish_source_to_dest` also re-checks directly, against only
+`operation.source_commit` — the one commit actually being turned into a
+dest push — immediately before `build_dest_commit` is called. This is
+deliberate defense in depth rather than reliance on `start_source_to_dest`
+having already run in the same process: a `--continue` invocation is
+ordinarily a separate process from `start`, working from the authenticated
+operation ref alone, and must not depend on an earlier invocation's checks
+having actually executed. `validate_operation_state` already refuses a
+`--continue` whose pinned policy digest (`Resolve-Policy-SHA256`) differs
+from what `start` recorded, so `finish`'s own check can never legitimately
+disagree with what `start` would have found for the same commit — but it
+no longer has to rely on that chain holding for safety; it establishes it
+directly.
+
+`ignore_raw` (already loaded once by `run_with_direction` via
+`policy::load`, decisions/0026) is threaded through
+`resolve_source_to_dest` → `start_source_to_dest`/`finish_source_to_dest`
+alongside the existing `policy_digest`, the same value `sync::run` already
+threads to `sync_pair_to_dest_with_key` — no second read, no
+re-verification.
+
+## Why
+
+Reasoned the same way this decision's own body already reasons about
+`sync`: a security-relevant halt is only as strong as its weakest caller.
+`sync` and `resolve` recompute the identical pending list from the
+identical boundary specifically so an operator can trust `resolve`'s own
+doc comment ("recomputing exactly what `sync` would build next") — that
+claim was false for this one check, and a security check silently absent
+from one of two call sites computing "the same thing" is worse than one
+absent from a feature no one relies on being consistent.
+
+## Consequences
+
+* `resolve.rs`'s `start_source_to_dest`/`finish_source_to_dest` gain a
+  `pub(crate)` dependency on two items from `commands::sync`; no other
+  module needs to change.
+* **Test added:** `source_to_dest_resolution_refuses_to_start_on_a_pending_control_file_mismatch`
+  (`src/commands/resolve.rs`) — a pending commit setting a `.gitprismignore`
+  that differs from the pinned policy, plus real non-excluded content,
+  followed by a later pending commit that genuinely conflicts on dest:
+  `resolve --direction source-to-dest` refuses the whole invocation, names
+  the offending commit and `GITPRISM_POLICY_SHA256`, dest's tip is
+  unchanged, and no in-progress resolution operation is left behind.
+  Confirmed failing (the mismatched commit's content reached dest, then
+  the later commit's real conflict surfaced normally) against the pre-fix
+  code, and passing after.
