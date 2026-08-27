@@ -115,8 +115,14 @@ a more specific anchor among sibling branches:
    Without excluding baseline-ties first, two unrelated siblings that each
    merely share `boundary_base` itself (offering nothing beyond what the
    baseline already found) would read as a spurious ambiguity.
-5. For every branch name in the winning group (not just one), fetch it and
-   locate the dest-space anchor: walk its dest tip's history, first-parent
+5. For every branch name in the winning group (not just one), fetch its dest
+   tip through the same per-run cache as step 2's dest-ref-existence check
+   (a fetch on a cache miss, remembered for every later lookup this run —
+   trying every group member must not mean a fresh `git fetch` per member
+   per branch searched, or this step's own fix for the equal-`cbase` bug
+   just reintroduces the quadratic network cost this decision already
+   fixed once, via a more expensive subprocess than before) and locate the
+   dest-space anchor: walk its dest tip's history, first-parent
    ([decisions/0019](0019-marker-scans-are-first-parent-only.md)'s idiom,
    reused rather than re-derived — a round-tripped candidate's dest history
    can contain real human merges gitprism didn't build), for the newest
@@ -235,14 +241,20 @@ branch-processing-order guarantee is added, and none is implied by
   discovered before its own parent branch has a dest ref falls back to the
   coarser baseline, and an ordinary later resync does not retry the search;
   only a positively detected rewrite of the branch itself does.
-* **Dest-ref existence is a per-run cache**, not a fresh subprocess per
-  sibling candidate — required to keep this search's cost linear rather than
-  quadratic in branch count (see Decision step 2). A cache entry for the
-  branch currently being synced must be invalidated on decisions/0009's own
-  `RejectedRefMoved` race-retry, or a stale "no dest ref yet" entry from
-  before a concurrent writer's push would survive into the retry and defeat
-  it — this is decisions/0009's existing race-recompute invariant, not new
-  behavior; the cache must not regress it.
+* **Every real subprocess this search would otherwise repeat per candidate
+  per branch is a per-run cache**, not just dest-ref existence: a fetched
+  candidate's dest tip is cached too (see Decision steps 2 and 5), required
+  to keep this search's cost linear rather than quadratic in branch count.
+  Caught in review after the equal-`cbase` fix (step 5, trying every group
+  member) reintroduced exactly this cost via `git fetch` instead of
+  `ls-remote` — a second quadratic regression on top of the first, from a
+  fix aimed at correctness rather than cost, which is precisely why cost
+  must be re-checked every time a correctness fix touches this search's own
+  candidate loop. A cache entry for the branch currently being synced must
+  be invalidated on decisions/0009's own `RejectedRefMoved` race-retry, or a
+  stale "no dest ref yet" entry from before a concurrent writer's push would
+  survive into the retry and defeat it — this is decisions/0009's existing
+  race-recompute invariant, not new behavior; the cache must not regress it.
 * Tests the implementation commit must add:
   * `task` branched from mirror-only `feature` branched from round-tripped
     `main`: `task`'s dest chain anchors on `feature`'s dest tip, not `main`'s;
@@ -269,4 +281,8 @@ branch-processing-order guarantee is added, and none is implied by
     confirming no regression on the common case);
   * decisions/0039's rewrite-rebuild path exercised with a sibling mirror-only
     branch available as the more specific anchor, confirming the shared call
-    site benefits without a second implementation.
+    site benefits without a second implementation;
+  * a fetched candidate's dest tip is cached: a second lookup for the same
+    branch, against a deliberately unreachable remote, must still succeed
+    with the identical oid — proof positive it never fetched again, not
+    just absence of a slowdown.

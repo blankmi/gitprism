@@ -177,12 +177,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // once every branch has been processed, so CI can't mistake a halted
     // branch for a clean run.
     let mut any_branch_halted = false;
-    // decisions/0043 step 2: one dest-ref-existence cache for this whole
-    // `run()` invocation, not a fresh `git::remote_ref_exists` subprocess per
-    // sibling candidate per branch — shared across every branch below so a
-    // branch pushed earlier this run is immediately visible as a candidate
-    // for a later branch's anchor search within the same run.
-    let mut dest_ref_cache: DestRefCache = HashMap::new();
+    // decisions/0043 steps 2 and 5: one cache for this whole `run()`
+    // invocation — dest-ref existence and fetched dest tips alike, not a
+    // fresh `git ls-remote`/`git fetch` subprocess per sibling candidate per
+    // branch — shared across every branch below so a branch pushed earlier
+    // this run is immediately visible as a candidate for a later branch's
+    // anchor search within the same run.
+    let mut run_cache = RunCache::default();
     for branch in &source_branches {
         let halted = sync_pair_to_dest_with_key(
             &repo,
@@ -193,7 +194,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             &state_key,
             &exclude_list,
             &ignore_raw,
-            &mut dest_ref_cache,
+            &mut run_cache,
         )
         .with_context(|| format!("syncing {branch:?} source -> dest"))?;
         any_branch_halted |= halted;
@@ -269,7 +270,7 @@ fn sync_pair_to_dest(
     config: &Config,
     branch: &str,
     reporter: &Reporter,
-    dest_ref_cache: &mut DestRefCache,
+    run_cache: &mut RunCache,
 ) -> Result<bool> {
     let key = marker::load_key()?;
     let source_tip = repo
@@ -292,7 +293,7 @@ fn sync_pair_to_dest(
         &key,
         &exclude_list,
         &ignore_raw,
-        dest_ref_cache,
+        run_cache,
     )
 }
 
@@ -312,7 +313,7 @@ fn sync_pair_to_dest_with_key(
     state_key: &marker::StateKey,
     exclude_list: &ExcludeList,
     ignore_raw: &str,
-    dest_ref_cache: &mut DestRefCache,
+    run_cache: &mut RunCache,
 ) -> Result<bool> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating source branch {branch:?}"))?;
@@ -343,8 +344,7 @@ fn sync_pair_to_dest_with_key(
         // per-run cache decisions/0043's anchor search shares (see
         // `dest_ref_exists_cached`), so this check's own result is what the
         // anchor search's candidate loop sees for `branch` too.
-        let dest_ref_exists =
-            dest_ref_exists_cached(source_root, &dest_url, branch, dest_ref_cache)?;
+        let dest_ref_exists = dest_ref_exists_cached(source_root, &dest_url, branch, run_cache)?;
         // decisions/0038, decisions/0039: force is requested only once this
         // very run has established both that `branch` is mirror-only and
         // that it positively identified a source-side rewrite below — the
@@ -381,6 +381,12 @@ fn sync_pair_to_dest_with_key(
                 .peel_to_commit()
                 .context("resolving fetched dest branch to a commit")?
                 .id();
+            // decisions/0043 step 5: this fetch is already paid for and
+            // freshly accurate — free informational reuse for a later
+            // sibling's own anchor search this run, at no extra subprocess.
+            run_cache
+                .dest_tip
+                .insert(branch.to_string(), fetched_dest_tip);
 
             // There is no safe way to build a new commit straight from
             // source's filtered snapshot and fast-forward dest onto it
@@ -437,7 +443,7 @@ fn sync_pair_to_dest_with_key(
                         branch,
                         source_tip,
                         state_key,
-                        dest_ref_cache,
+                        run_cache,
                     )? {
                         DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
                         DestAnchor::Ambiguous(candidates) => {
@@ -505,7 +511,7 @@ fn sync_pair_to_dest_with_key(
                 branch,
                 source_tip,
                 state_key,
-                dest_ref_cache,
+                run_cache,
             )? {
                 DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
                 // decisions/0043: two or more sibling branches are equally
@@ -674,10 +680,12 @@ fn sync_pair_to_dest_with_key(
         if let Some(new_dest_tip) = new_dest_tip {
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
                 git::PushOutcome::Accepted => {
-                    // decisions/0043 step 2: `branch` now definitely has a
-                    // dest ref — visible in-memory to a later branch's
-                    // anchor search this same run, with no re-query.
-                    dest_ref_cache.insert(branch.to_string(), true);
+                    // decisions/0043 steps 2 and 5: `branch` now definitely
+                    // has a dest ref, at exactly `new_dest_tip` — visible
+                    // in-memory to a later branch's anchor search this same
+                    // run, with no re-query and no re-fetch.
+                    run_cache.dest_ref_exists.insert(branch.to_string(), true);
+                    run_cache.dest_tip.insert(branch.to_string(), new_dest_tip);
                 }
                 git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
                     // dest's tip moved between fetch and push — refetch and
@@ -700,7 +708,7 @@ fn sync_pair_to_dest_with_key(
                     // survive into the next iteration, or it would keep
                     // retrying the brand-new-branch path against a branch
                     // that now has a dest ref.
-                    dest_ref_cache.remove(branch);
+                    run_cache.dest_ref_exists.remove(branch);
                     attempt += 1;
                     continue;
                 }
@@ -2277,29 +2285,64 @@ enum DestAnchor {
     AmbiguousResolution(Vec<(String, Oid)>),
 }
 
-/// decisions/0043 step 2: dest-ref existence for every branch, resolved
-/// through one cache per `run()` invocation instead of a fresh
-/// `git::remote_ref_exists` subprocess per candidate per branch — this
-/// search runs once per newly-discovered-or-rewritten branch, so querying
-/// per candidate would be O(branch count²) real network round trips per run.
-/// A cache hit skips the subprocess entirely; a miss queries once and
-/// remembers the result for every later lookup this run, including a later
-/// branch's own candidate search.
-type DestRefCache = HashMap<String, bool>;
+/// decisions/0043 steps 2 and 5: every real subprocess this search would
+/// otherwise repeat per candidate per branch, resolved through one cache per
+/// `run()` invocation instead — dest-ref existence (`git ls-remote`) and a
+/// fetched candidate's dest tip (`git fetch`) alike. This search runs once
+/// per newly-discovered-or-rewritten branch, and step 5 (trying every member
+/// of an equal-merge-base group, not just one — see Decision step 5) can
+/// revisit the same sibling from more than one branch's own search, so
+/// caching only one of the two subprocesses would just trade one quadratic
+/// cost for the other. A cache hit skips the subprocess entirely; a miss
+/// queries or fetches once and remembers the result for every later lookup
+/// this run, including a later branch's own candidate search landing on the
+/// same sibling.
+#[derive(Default)]
+struct RunCache {
+    dest_ref_exists: HashMap<String, bool>,
+    dest_tip: HashMap<String, Oid>,
+}
 
 fn dest_ref_exists_cached(
     source_root: &Path,
     dest_url: &str,
     branch: &str,
-    cache: &mut DestRefCache,
+    cache: &mut RunCache,
 ) -> Result<bool> {
-    if let Some(&exists) = cache.get(branch) {
+    if let Some(&exists) = cache.dest_ref_exists.get(branch) {
         return Ok(exists);
     }
     let exists = git::remote_ref_exists(source_root, dest_url, branch)
         .with_context(|| format!("checking whether {branch:?} has a dest ref"))?;
-    cache.insert(branch.to_string(), exists);
+    cache.dest_ref_exists.insert(branch.to_string(), exists);
     Ok(exists)
+}
+
+/// A sibling candidate's fetched dest tip, resolved through the same
+/// per-run cache as `dest_ref_exists_cached` — see [`RunCache`]. Trying
+/// every member of an equal-merge-base group (Decision step 5) means the
+/// same sibling can be looked up from more than one branch's own search
+/// this run; a cache hit reuses the oid with no subprocess at all.
+fn fetch_dest_tip_cached(
+    repo: &Repository,
+    source_root: &Path,
+    dest_url: &str,
+    branch: &str,
+    cache: &mut RunCache,
+) -> Result<Oid> {
+    if let Some(&tip) = cache.dest_tip.get(branch) {
+        return Ok(tip);
+    }
+    git::fetch(source_root, dest_url, branch)
+        .with_context(|| format!("fetching sibling candidate {branch:?} from configured remote"))?;
+    let tip = repo
+        .find_reference("FETCH_HEAD")
+        .context("reading FETCH_HEAD after fetching a sibling candidate")?
+        .peel_to_commit()
+        .context("resolving a fetched sibling candidate to a commit")?
+        .id();
+    cache.dest_tip.insert(branch.to_string(), tip);
+    Ok(tip)
 }
 
 fn dest_anchor_for_branch(
@@ -2309,7 +2352,7 @@ fn dest_anchor_for_branch(
     branch: &str,
     source_tip: Oid,
     key: &marker::StateKey,
-    dest_ref_cache: &mut DestRefCache,
+    run_cache: &mut RunCache,
 ) -> Result<DestAnchor> {
     let Some((boundary_base, dest_tip_base)) =
         newest_dest_marker_opt_for_branch(repo, source_tip, branch, key)?
@@ -2328,7 +2371,7 @@ fn dest_anchor_for_branch(
         if candidate == branch {
             continue;
         }
-        if !dest_ref_exists_cached(source_root, dest_url, &candidate, dest_ref_cache)? {
+        if !dest_ref_exists_cached(source_root, dest_url, &candidate, run_cache)? {
             continue;
         }
         let candidate_tip = repo
@@ -2440,18 +2483,16 @@ fn dest_anchor_for_branch(
     // Every branch sharing the winning `cbase` must actually be tried, not
     // just the first one alphabetically: an equal merge-base only proves
     // the *source-side* fork point is shared, not that every candidate's
-    // *dest-side* history recorded it the same way.
+    // *dest-side* history recorded it the same way. `fetch_dest_tip_cached`
+    // keeps this at one real `git fetch` per sibling per run, even though
+    // the same sibling can be revisited by more than one branch's own
+    // search this run (decisions/0043's own cost claim would otherwise be
+    // regressed right back by this very fix, just via `fetch` instead of
+    // `ls-remote`).
     let mut resolutions: Vec<(String, Oid, Oid)> = Vec::new();
     for name in names {
-        git::fetch(source_root, dest_url, &name).with_context(|| {
-            format!("fetching sibling candidate {name:?} from configured remote")
-        })?;
-        let candidate_dest_tip = repo
-            .find_reference("FETCH_HEAD")
-            .context("reading FETCH_HEAD after fetching a sibling candidate")?
-            .peel_to_commit()
-            .context("resolving a fetched sibling candidate to a commit")?
-            .id();
+        let candidate_dest_tip =
+            fetch_dest_tip_cached(repo, source_root, dest_url, &name, run_cache)?;
         if let Some((found_dest_oid, found_source_oid)) =
             newest_source_marker_at_or_before(repo, candidate_dest_tip, &name, cbase, key)?
         {
@@ -5945,7 +5986,7 @@ mod tests {
         let branch = "main";
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let err = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -6016,7 +6057,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -6117,7 +6158,7 @@ mod tests {
         // With that marker in place, source→dest must actually recognize
         // dest_b's tip as accounted for and proceed normally, not refuse.
         let repo = Repository::open(source_dir.path()).unwrap();
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(&repo, source_dir.path(), &config, branch, &reporter, &mut dest_ref_cache).expect(
             "source→dest must recognize a dest tip whose only marker is a no-op commit, not refuse it",
         );
@@ -6344,7 +6385,7 @@ mod tests {
         let branch = "main";
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -6521,7 +6562,7 @@ mod tests {
         );
 
         let repo = Repository::open(source_dir.path()).unwrap();
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -7571,7 +7612,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let halted = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -7638,7 +7679,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let halted = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -7686,7 +7727,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let halted = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -7744,7 +7785,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let halted = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -7881,7 +7922,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let halted = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8128,7 +8169,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8227,7 +8268,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8266,7 +8307,7 @@ mod tests {
             "add feature (amended)",
         );
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8328,7 +8369,7 @@ mod tests {
             "a plain fetch must not produce a shallow clone"
         );
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &fresh_repo,
             fresh_dir.path(),
@@ -8381,7 +8422,7 @@ mod tests {
             "a --depth=1 fetch must produce a shallow clone"
         );
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let err = sync_pair_to_dest(
             &fresh_repo,
             fresh_dir.path(),
@@ -8448,7 +8489,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8540,7 +8581,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8634,7 +8675,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8719,7 +8760,7 @@ mod tests {
         // `FastForwardOnly`'s own `(!dest_ref_exists).then_some(dest_tip)`
         // fallback, which must stay byte-identical: `dest_ref_exists` is
         // `true` here, so nothing pending must mean nothing pushed.
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8772,7 +8813,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -8925,8 +8966,10 @@ mod tests {
 
         // Stale on purpose: stands in for a lookup this run already made
         // for feature-x before the concurrent push above landed.
-        let mut dest_ref_cache = HashMap::new();
-        dest_ref_cache.insert("feature-x".to_string(), false);
+        let mut dest_ref_cache = RunCache::default();
+        dest_ref_cache
+            .dest_ref_exists
+            .insert("feature-x".to_string(), false);
 
         sync_pair_to_dest(
             &repo,
@@ -9070,7 +9113,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -9118,7 +9161,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         let err = sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -9334,7 +9377,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -9467,7 +9510,7 @@ mod tests {
         // optimization (decisions/0043 step 2), not the "memory between
         // calls" this test disproves, so every call starts knowing nothing
         // and must still arrive at the right answer from real repo state.
-        let mut anchor_cache_1 = HashMap::new();
+        let mut anchor_cache_1 = RunCache::default();
         let anchor = dest_anchor_for_branch(
             &repo,
             source_dir.path(),
@@ -9488,7 +9531,7 @@ mod tests {
         // sibling holding a dest ref yet to interact with.
         let config = Config::load(write_config("unused", &dest_url, &["main"]).path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
-        let mut sync_cache = HashMap::new();
+        let mut sync_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -9511,7 +9554,7 @@ mod tests {
         // proving the search itself is stateless, not that anything
         // re-invokes it automatically for an already-mirrored task (it does
         // not; see decisions/0043).
-        let mut anchor_cache_2 = HashMap::new();
+        let mut anchor_cache_2 = RunCache::default();
         let anchor = dest_anchor_for_branch(
             &repo,
             source_dir.path(),
@@ -9665,7 +9708,7 @@ mod tests {
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
 
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -9745,7 +9788,7 @@ mod tests {
         let reporter = Reporter::new(1, std::iter::empty());
 
         // feature mirrors first, then task correctly anchors on it.
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -9897,7 +9940,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
 
         sync_pair_to_dest(
             &repo,
@@ -9935,7 +9978,7 @@ mod tests {
         let dest_url = dest_dir.path().display().to_string();
         let key = marker::load_key().unwrap();
 
-        let mut anchor_cache = HashMap::new();
+        let mut anchor_cache = RunCache::default();
         let anchor = dest_anchor_for_branch(
             &repo,
             source_dir.path(),
@@ -9955,7 +9998,7 @@ mod tests {
 
         // Deterministic: re-running the identical search from scratch
         // produces the same result every time.
-        let mut anchor_cache_2 = HashMap::new();
+        let mut anchor_cache_2 = RunCache::default();
         let anchor_again = dest_anchor_for_branch(
             &repo,
             source_dir.path(),
@@ -10050,7 +10093,7 @@ mod tests {
         .unwrap();
         let repo = Repository::open(source_dir.path()).unwrap();
         let reporter = Reporter::new(1, std::iter::empty());
-        let mut dest_ref_cache = HashMap::new();
+        let mut dest_ref_cache = RunCache::default();
 
         // z-feature mirrors first — its own dest chain independently
         // projects shared_tip, branch-scoped to "z-feature".
@@ -10099,7 +10142,7 @@ mod tests {
 
         let dest_url = dest_dir.path().display().to_string();
         let key = marker::load_key().unwrap();
-        let mut anchor_cache = HashMap::new();
+        let mut anchor_cache = RunCache::default();
         let anchor = dest_anchor_for_branch(
             &repo,
             source_dir.path(),
@@ -10227,7 +10270,7 @@ mod tests {
         .unwrap();
 
         let dest_url = dest_dir.path().display().to_string();
-        let mut anchor_cache = HashMap::new();
+        let mut anchor_cache = RunCache::default();
         let anchor = dest_anchor_for_branch(
             &repo,
             source_dir.path(),
@@ -10256,6 +10299,85 @@ mod tests {
             }
             other => panic!("expected AmbiguousResolution, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fetch_dest_tip_cached_hits_the_cache_without_fetching_again() {
+        // decisions/0043 step 5: trying every member of an equal-cbase
+        // group (see the tests above) must not cost a fresh `git fetch` per
+        // member per branch searched — the exact regression a review of the
+        // first fix for this caught: reintroducing O(branch count²) network
+        // calls via `fetch` instead of `ls-remote`. Proven directly, not
+        // just by absence of a slowdown: the second call is pointed at a
+        // deliberately broken remote and must still succeed, returning the
+        // identical oid — which is only possible if it never touched the
+        // remote at all.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+        let mut run_cache = RunCache::default();
+
+        sync_pair_to_dest(
+            &repo,
+            source_dir.path(),
+            &config,
+            "feature",
+            &reporter,
+            &mut run_cache,
+        )
+        .expect("feature must mirror to dest");
+
+        let real_dest_url = dest_dir.path().display().to_string();
+        let first = fetch_dest_tip_cached(
+            &repo,
+            source_dir.path(),
+            &real_dest_url,
+            "feature",
+            &mut run_cache,
+        )
+        .expect("the first call must really fetch");
+
+        // A URL that cannot possibly be fetched from — if the second call
+        // hits the cache as required, this is never touched.
+        let broken_dest_url = dest_dir.path().join("does-not-exist").display().to_string();
+        let second = fetch_dest_tip_cached(
+            &repo,
+            source_dir.path(),
+            &broken_dest_url,
+            "feature",
+            &mut run_cache,
+        )
+        .expect(
+            "a cache hit must succeed even against an unreachable remote — proof it never \
+             fetched again",
+        );
+
+        assert_eq!(
+            first, second,
+            "the cached oid must be returned unchanged on the second call"
+        );
     }
 
     #[test]
@@ -10310,7 +10432,7 @@ mod tests {
         // "This run": task discovered before feature has a dest ref, then
         // feature mirrors — one shared cache, matching one run's
         // per-branch loop (decisions/0043 step 2).
-        let mut run_cache = HashMap::new();
+        let mut run_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -10354,13 +10476,13 @@ mod tests {
 
         // The shared cache accurately reflects both branches processed
         // this run — decisions/0043 step 2's read-through/update contract.
-        assert_eq!(run_cache.get("task"), Some(&true));
-        assert_eq!(run_cache.get("feature"), Some(&true));
+        assert_eq!(run_cache.dest_ref_exists.get("task"), Some(&true));
+        assert_eq!(run_cache.dest_ref_exists.get("feature"), Some(&true));
 
         // "A later resync": task is completely unchanged, no rewrite — a
         // fresh cache, since decisions/0043 is explicit this is an
         // ordinary later resync, not part of the run above.
-        let mut later_cache = HashMap::new();
+        let mut later_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -10452,7 +10574,7 @@ mod tests {
 
         // Wrong order, same as above: task mirrors first and falls back to
         // the baseline, then feature mirrors.
-        let mut run_cache = HashMap::new();
+        let mut run_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),
@@ -10505,7 +10627,7 @@ mod tests {
             .unwrap();
         add_commit(&source_repo, "task", &[("task.txt", "rewritten\n")]);
 
-        let mut later_cache = HashMap::new();
+        let mut later_cache = RunCache::default();
         sync_pair_to_dest(
             &repo,
             source_dir.path(),

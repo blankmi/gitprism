@@ -1999,3 +1999,34 @@ now describe grouping and per-candidate resolution instead of
 collapse-then-try-one, and Consequences documents the new failure mode.
 `cargo test` (239 passed), `cargo clippy --workspace --all-targets
 --all-features --locked -- -D warnings`, and `cargo fmt --check` all clean.
+
+**Update**: A fifth review finding on the same implementation: trying every
+member of an equal-`cbase` group (the fix above) fetches each one with a
+real `git fetch` subprocess, once per group member per branch searched —
+with N sibling branches sharing one fork point, later branches inspect
+growing groups, roughly `1 + 2 + ... + N` fetches. The same quadratic shape
+the step-2 `ls-remote` cache was built to eliminate, reintroduced one
+correctness fix later via a more expensive subprocess.
+
+Fixed by widening the existing per-run cache (`DestRefCache`, renamed
+`RunCache`) to also remember a fetched candidate's dest tip, not just
+whether its dest ref exists — a cache hit in step 5's loop now costs
+nothing, a miss fetches once and is remembered for every later lookup this
+run, including a later branch's own search landing on the same sibling. The
+main sync loop's own dest fetch (for the branch currently being synced, not
+a sibling) also populates this cache as a side benefit, since that fetch is
+already paid for. A successful push updates both the ref-existence and
+dest-tip cache entries directly, without a further fetch.
+
+New test proves the cache is actually consulted, not just present:
+`fetch_dest_tip_cached_hits_the_cache_without_fetching_again` calls the
+function twice for the same branch, pointing the *second* call at a
+deliberately unreachable remote — it must still succeed with the identical
+oid, which is only possible if it never touched the remote. Confirmed
+failing before the fix (a temporarily disabled cache check reproduces the
+exact "fetching ... failed" error) and passing after. decisions/0043
+revised: step 5 and Consequences describe the shared cache and note that a
+correctness fix touching this search's candidate loop must have its cost
+re-checked every time, not assumed preserved. `cargo test` (240 passed),
+`cargo clippy --workspace --all-targets --all-features --locked -- -D
+warnings`, and `cargo fmt --check` all clean.
