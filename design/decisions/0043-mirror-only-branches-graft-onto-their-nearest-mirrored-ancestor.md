@@ -70,13 +70,18 @@ a more specific anchor among sibling branches:
    warn-and-continue path, untouched).
 2. Enumerate every other branch discovered on source this run
    ([decisions/0017](0017-source-to-dest-mirrors-every-branch.md)'s existing
-   discovery, not a new listing mechanism) whose dest ref already exists
-   (`git::remote_ref_exists`, already computed per-branch today). Round-tripped
-   and mirror-only branches are both eligible candidates — no special-casing;
-   the algorithm only ever resolves to the real historical merge-base with a
-   candidate, never to that candidate's current tip, so anchoring on a
-   round-tripped branch here is exactly as safe as anchoring on a mirror-only
-   one.
+   discovery, not a new listing mechanism) whose dest ref already exists.
+   Round-tripped and mirror-only branches are both eligible candidates — no
+   special-casing; the algorithm only ever resolves to the real historical
+   merge-base with a candidate, never to that candidate's current tip, so
+   anchoring on a round-tripped branch here is exactly as safe as anchoring
+   on a mirror-only one. Dest-ref existence for every branch is resolved
+   through one cache, populated once per `run()` invocation and updated
+   in-memory after each successful push, not a fresh `git::remote_ref_exists`
+   subprocess per candidate per branch — this search runs once per
+   newly-discovered-or-rewritten branch, so querying per candidate would be
+   O(branch count²) real network round trips per run instead of O(branch
+   count).
 3. For each candidate `C`, `cbase = repo.merge_base(new_branch_tip, C_tip)`;
    skip `C` on no shared history (same guard `already_merged_into_a_landing_branch`
    already uses). Discard any `cbase` that is not a descendant of (or equal
@@ -99,7 +104,13 @@ a more specific anchor among sibling branches:
    [decisions/0023](0023-setup-reconciles-pre-existing-branches-via-merge-base.md)).
    Without excluding baseline-ties first, two unrelated siblings that each
    merely share `boundary_base` itself (offering nothing beyond what the
-   baseline already found) would read as a spurious ambiguity.
+   baseline already found) would read as a spurious ambiguity. Two or more
+   survivors sharing the exact same `cbase` (not just tying `boundary_base`,
+   but tying *each other*) are likewise not ambiguous — equal is the
+   opposite of incomparable. Collapse them to one representative (the
+   lexicographically smallest branch name, for determinism) before the
+   domination comparison; only survivors whose `cbase`s are genuinely
+   incomparable after that collapse are ambiguous.
 5. For the winning candidate `C`, locate the dest-space anchor: walk `C`'s
    fetched dest tip's history, first-parent
    ([decisions/0019](0019-marker-scans-are-first-parent-only.md)'s idiom,
@@ -115,11 +126,28 @@ a more specific anchor among sibling branches:
 
 **Not solved here — accepted, same as decisions/0038/0039's own accepted
 hazards:** if `C` (e.g. `feature`) hasn't been mirrored to dest yet in *this*
-run when `task` is discovered, `task` still falls back to the baseline this
-run; it self-corrects on the run after `feature` gets a dest ref, through
-this same mechanism (or through decisions/0039's rewrite-rebuild path if
-`feature` was itself just force-rebuilt). No branch-processing-order
-guarantee is added.
+run when `task` is discovered, `task` falls back to the baseline this run —
+and this search only ever runs again for `task` on a brand-new branch's
+first mirror or on a positively *detected rewrite* of `task`'s own source
+history (decisions/0039). An ordinary later resync of `task`, with `task`
+itself unchanged, takes `dest_resume_point_for_branch`'s path instead
+(`task`'s existing dest chain is still self-consistent, just anchored on the
+coarser baseline), which never re-examines siblings. So **`task` does not
+self-correct automatically once `feature` is mirrored** — deliberately not
+solved here, since the only way to make it self-correct would be a new
+automatic trigger ("a sibling's topology improved, force-rebuild onto it")
+beyond decisions/0039's four-condition rewrite detection, and that trigger
+would force-rewrite an already-open PR's history with no signal from
+`task`'s own developer that anything about `task` should change — exactly
+the "novel automation" this project's operator-intervention default
+(`AGENTS.md`) reserves for an explicit decision, not a default. The operator
+workaround is the same one decisions/0039's rewrite detection is already
+built to recognize: `git commit --amend --no-edit` or `git rebase
+--force-rebase` on `task` (or any other real change to `task`'s own source
+history) is a positively detected rewrite, and that rebuild picks up the
+now-available, more specific sibling anchor through this same search. No
+branch-processing-order guarantee is added, and none is implied by
+"self-corrects."
 
 # Why
 
@@ -162,18 +190,35 @@ guarantee is added.
   incomparable most-specific mirrored ancestors hard-fails the branch (not
   the whole run — matching decisions/0024's per-branch-warning precedent
   for other structural surprises), naming both candidates.
-* **Ordering hazard, accepted**: a branch discovered before its own parent
-  branch has a dest ref falls back to the coarser baseline for that run only.
+* **Ordering hazard, accepted, permanently absent a later rewrite of the
+  misanchored branch itself** — see "Not solved here" above. A branch
+  discovered before its own parent branch has a dest ref falls back to the
+  coarser baseline, and an ordinary later resync does not retry the search;
+  only a positively detected rewrite of the branch itself does.
+* **Dest-ref existence is a per-run cache**, not a fresh subprocess per
+  sibling candidate — required to keep this search's cost linear rather than
+  quadratic in branch count (see Decision step 2). A cache entry for the
+  branch currently being synced must be invalidated on decisions/0009's own
+  `RejectedRefMoved` race-retry, or a stale "no dest ref yet" entry from
+  before a concurrent writer's push would survive into the retry and defeat
+  it — this is decisions/0009's existing race-recompute invariant, not new
+  behavior; the cache must not regress it.
 * Tests the implementation commit must add:
   * `task` branched from mirror-only `feature` branched from round-tripped
     `main`: `task`'s dest chain anchors on `feature`'s dest tip, not `main`'s;
     a PR-shaped diff (`task`'s commits only) is asserted via the resulting
     dest tree/history, not just final content;
   * the same topology processed in the "wrong" order (`task` mirrored before
-    `feature` has a dest ref): falls back to the baseline this run, and
-    corrects itself once `feature` is mirrored and `task` syncs again;
+    `feature` has a dest ref): falls back to the baseline, and a real second
+    sync of `task` (unchanged, not rewritten) stays on the baseline too — the
+    absence of self-correction is itself the behavior under test;
+  * a rewrite of `task` itself, after the wrong-order case above, does pick
+    up `feature` as the more specific anchor — the documented operator
+    workaround actually works;
   * a genuinely ambiguous case (two mirror-only branches, neither an ancestor
     of the other in `task`'s history) hard-fails naming both;
+  * two sibling candidates that share the exact same `cbase` are *not*
+    reported as ambiguous;
   * a round-tripped candidate correctly used as the anchor when no more
     specific mirror-only candidate exists (baseline and the new search agree,
     confirming no regression on the common case);

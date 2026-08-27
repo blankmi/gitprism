@@ -1916,3 +1916,46 @@ test, folded back into the decision doc rather than left as an undocumented
 implementation detail. Six new tests (real dest-side ancestry assertions,
 not just content), `cargo test` (233 passed), `cargo clippy --all-targets`,
 and `cargo fmt --check` all clean. Decision 0043 marked `stable`/verified.
+
+**Update**: Code review of the implementation surfaced three real defects,
+all fixed:
+
+* Two candidates with the exact same merge-base (equal, not incomparable)
+  were reported `Ambiguous` — a plain algorithm bug against decision 0043's
+  own definition. Fixed: survivors sharing a `cbase` collapse to one
+  representative (lexicographically smallest name) before the domination
+  comparison. New test:
+  `dest_anchor_for_branch_equal_cbase_siblings_are_resolved_not_ambiguous`.
+* `dest_anchor_for_branch` queried `git ls-remote` once per sibling
+  candidate per newly-discovered/rewritten branch — O(branch count²)
+  subprocesses per run. Fixed: one dest-ref-existence cache per `run()`
+  invocation, threaded through, updated in-memory after each successful
+  push. While implementing this, a further regression was caught in review
+  before commit: a stale cache entry for the branch's own top-of-loop check
+  would have survived decisions/0009's `RejectedRefMoved` race-retry,
+  defeating it. Fixed by invalidating that branch's cache entry on retry.
+  New regression test (written failing first, confirmed it fails without
+  the fix, then passes with it):
+  `sync_pair_to_dest_recovers_from_a_stale_no_dest_ref_cache_entry_on_a_race_retry`.
+* Decision 0043's own "self-corrects on the run after" claim didn't hold:
+  once a branch has any dest ref, an ordinary resync never re-invokes the
+  anchor search — only a positively detected rewrite of the branch's own
+  source history does (decisions/0039). Automatically re-triggering a
+  rebuild whenever a sibling's topology merely improves would be a new
+  automatic force-rewrite trigger with no signal from the affected branch's
+  own developer — exactly the "novel automation" this project's
+  operator-intervention default reserves for an explicit decision, not a
+  silent add. Decided in conversation to weaken the guarantee instead:
+  decision 0043 now states plainly that ordinary resync does not reconsider
+  an anchor, self-correction is limited to decisions/0039's existing rewrite
+  detection, and documents the operator workaround (`git commit --amend
+  --no-edit` / `git rebase --force-rebase` on the misanchored branch). The
+  test that used to imply automatic end-to-end correction was renamed
+  (`dest_anchor_for_branch_is_stateless_and_finds_a_sibling_mirrored_since_its_last_call`)
+  and two new tests added:
+  `sync_pair_to_dest_wrong_order_task_does_not_self_correct_on_an_ordinary_resync`
+  and
+  `sync_pair_to_dest_wrong_order_rewrite_of_task_picks_up_feature_as_the_anchor`.
+
+`cargo test` (237 passed), `cargo clippy --workspace --all-targets
+--all-features --locked -- -D warnings`, and `cargo fmt --check` all clean.
