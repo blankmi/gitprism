@@ -3,8 +3,10 @@ type: Decision
 title: A discovered branch's dest anchor prefers the nearest already-mirrored branch over the Setup/DestToSource baseline
 description: scan_for_dest_marker's Setup/DestToSource-trailer scan stays the fallback, but a branch forked from another already-mirrored branch (round-tripped or mirror-only) now anchors its dest chain on that branch's own mirror at their real merge-base, via git merge_base plus graph_descendant_of specificity comparison, instead of always falling back to the nearest round-tripped marker. Ambiguous ties (two candidates whose merge-bases are neither ancestor nor descendant of each other) hard-fail, naming both.
 tags: [architecture, branches, merge-base, filtering]
-status: draft
+status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-27T00:00:00Z }
+verified:
+  - { by: "human:michael.blank@evia.de", at: 2026-08-27T00:00:00Z }
 ---
 
 # Context
@@ -81,16 +83,23 @@ a more specific anchor among sibling branches:
    to) `boundary_base` — a candidate less specific than what the baseline
    already found is never an improvement, and this bounds the search to
    real refinements only.
-4. Among the survivors, find the unique most-specific one: `C`'s `cbase`
-   must be a descendant of (or equal to) every other survivor's `cbase`,
-   via `graph_descendant_of` (the same primitive
+4. A survivor whose `cbase` merely *ties* `boundary_base` exactly offers no
+   refinement at all — only survivors strictly beyond `boundary_base` are
+   real candidates to disambiguate among. If none exist, use the baseline
+   unchanged, same as "no survivors." Otherwise, among the survivors that do
+   go beyond `boundary_base`, find the unique most-specific one: `C`'s
+   `cbase` must be a descendant of (or equal to) every other survivor's
+   `cbase`, via `graph_descendant_of` (the same primitive
    [decisions/0039](0039-mirror-only-source-rewrites-rebuild-the-projection.md)'s
-   condition 4 already uses). No survivors → use the baseline, unchanged.
-   Exactly one maximal survivor → use it. **Two or more incomparable maximal
-   survivors → hard-fail**, naming both candidate branches and their `cbase`
-   oids; no guessing, matching this project's existing no-merge-base and
-   no-lease precedent ([decisions/0007](0007-conflict-policy-hard-stop.md),
+   condition 4 already uses). Exactly one maximal survivor → use it. **Two or
+   more incomparable maximal survivors → hard-fail**, naming both candidate
+   branches and their `cbase` oids; no guessing, matching this project's
+   existing no-merge-base and no-lease precedent
+   ([decisions/0007](0007-conflict-policy-hard-stop.md),
    [decisions/0023](0023-setup-reconciles-pre-existing-branches-via-merge-base.md)).
+   Without excluding baseline-ties first, two unrelated siblings that each
+   merely share `boundary_base` itself (offering nothing beyond what the
+   baseline already found) would read as a spurious ambiguity.
 5. For the winning candidate `C`, locate the dest-space anchor: walk `C`'s
    fetched dest tip's history, first-parent
    ([decisions/0019](0019-marker-scans-are-first-parent-only.md)'s idiom,

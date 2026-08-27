@@ -169,10 +169,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // mismatch halts (nothing is pushed for it) but doesn't stop the loop —
     // every other branch still gets its turn, matching decisions/0024's
     // precedent for not letting one branch's problem cost every other
-    // branch its sync. The failure is accumulated instead and turned into a
-    // non-zero exit only once every branch has been processed, so CI can't
-    // mistake a halted branch for a clean run.
-    let mut any_branch_halted_for_policy_mismatch = false;
+    // branch its sync. decisions/0043 extends the same halt-and-continue
+    // signal to a discovered branch whose dest anchor is genuinely
+    // ambiguous between two equally specific mirrored siblings. Either
+    // failure is accumulated instead and turned into a non-zero exit only
+    // once every branch has been processed, so CI can't mistake a halted
+    // branch for a clean run.
+    let mut any_branch_halted = false;
     for branch in &source_branches {
         let halted = sync_pair_to_dest_with_key(
             &repo,
@@ -185,7 +188,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             &ignore_raw,
         )
         .with_context(|| format!("syncing {branch:?} source -> dest"))?;
-        any_branch_halted_for_policy_mismatch |= halted;
+        any_branch_halted |= halted;
     }
 
     // Every branch is accounted for — clear the pinned bar rather than
@@ -193,13 +196,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // (decisions/0020's own Context cites clearing transient UI once a step
     // is done). The completed lines already printed above it are the
     // permanent record of the run, not the bar itself. Done before the
-    // policy-mismatch bail below too, for the same reason the conflict
+    // halted-branch bail below too, for the same reason the conflict
     // hard-stop already clears it before its own `anyhow::bail!`.
     reporter.finish();
 
-    if any_branch_halted_for_policy_mismatch {
+    if any_branch_halted {
         anyhow::bail!(
-            "gitprism sync: one or more branches halted because a replayed commit's control file disagreed with the pinned policy — see the branch lines above for the affected commit(s) and remedy"
+            "gitprism sync: one or more branches halted — either a replayed commit's control file disagreed with the pinned policy, or a discovered branch's dest anchor was ambiguous between equally specific mirrored siblings — see the branch lines above for the affected commit(s)/branch(es) and remedy"
         );
     }
 
@@ -283,10 +286,12 @@ fn sync_pair_to_dest(
     )
 }
 
-/// Returns `Ok(true)` if this branch halted with nothing pushed because a
-/// replayed commit's control file disagreed with the pinned policy
-/// (decisions/0037) — `Ok(false)` for every other outcome (done, skipped, or
-/// decisions/0024's warning).
+/// Returns `Ok(true)` if this branch halted with nothing pushed — either
+/// because a replayed commit's control file disagreed with the pinned
+/// policy (decisions/0037), or because a discovered branch's dest anchor
+/// was genuinely ambiguous between two or more equally specific mirrored
+/// sibling branches (decisions/0043) — `Ok(false)` for every other outcome
+/// (done, skipped, or decisions/0024's warning).
 #[allow(clippy::too_many_arguments)]
 fn sync_pair_to_dest_with_key(
     repo: &Repository,
@@ -410,12 +415,28 @@ fn sync_pair_to_dest_with_key(
                     // rewrite means dest's own ref can no longer answer "what
                     // does source's ancestry say the boundary is," which is
                     // exactly the condition that arm was already built for.
-                    let Some((boundary, rebuild_dest_tip)) =
-                        newest_dest_marker_opt_for_branch(repo, source_tip, branch, state_key)?
-                    else {
-                        anyhow::bail!(
+                    let (boundary, rebuild_dest_tip) = match dest_anchor_for_branch(
+                        repo,
+                        source_root,
+                        &dest_url,
+                        branch,
+                        source_tip,
+                        state_key,
+                    )? {
+                        DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
+                        DestAnchor::Ambiguous(candidates) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&ambiguous_anchor_message(branch, &candidates)),
+                            );
+                            return Ok(true);
+                        }
+                        DestAnchor::None => anyhow::bail!(
                             "gitprism sync: detected a rewritten mirror-only branch {branch:?} but found no Gitprism-Dest-Commit trailer to rebuild from — has `gitprism setup` been run for this pair?"
-                        )
+                        ),
                     };
                     // The lease is a compare-and-swap against dest's actual
                     // fetched tip, never against `rebuild_dest_tip` — a
@@ -451,9 +472,32 @@ fn sync_pair_to_dest_with_key(
             // shape: an operator never asked gitprism to manage a branch
             // decisions/0017 merely discovered, so one such branch warns and
             // the run moves on rather than stopping every other branch too.
-            let Some((boundary, dest_tip)) =
-                newest_dest_marker_opt_for_branch(repo, source_tip, branch, state_key)?
-            else {
+            let (boundary, dest_tip) = match dest_anchor_for_branch(
+                repo,
+                source_root,
+                &dest_url,
+                branch,
+                source_tip,
+                state_key,
+            )? {
+                DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
+                // decisions/0043: two or more sibling branches are equally
+                // specific mirrored ancestors of `branch` and neither is an
+                // ancestor of the other — gitprism won't guess which to
+                // anchor onto. A per-branch halt (decisions/0024's own
+                // precedent for a structural surprise this function merely
+                // discovered, not one an operator directly asked gitprism to
+                // manage), not a whole-run abort.
+                DestAnchor::Ambiguous(candidates) => {
+                    reporter.complete(
+                        Outcome::Error,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&ambiguous_anchor_message(branch, &candidates)),
+                    );
+                    return Ok(true);
+                }
                 // decisions/0024: a genuinely pre-existing, unrelated local
                 // branch (e.g. decisions/0021's `ai-setup` example) has no
                 // `Gitprism-Dest-Commit` trailer anywhere in its first-parent
@@ -468,16 +512,18 @@ fn sync_pair_to_dest_with_key(
                 // pre-pass could use the same boundary), so a branch with no
                 // marker at all reports this warning even where the older
                 // ordering would have recognized it as already merged.
-                reporter.complete(
-                    Outcome::Warning,
-                    branch,
-                    Direction::SourceToDest,
-                    round_tripped,
-                    Some(&format!(
-                        "{branch:?} has no shared history with anything `gitprism setup` or a prior sync ever produced — combining unrelated histories is a manual `git merge --allow-unrelated-histories` job, not something gitprism will do"
-                    )),
-                );
-                return Ok(false);
+                DestAnchor::None => {
+                    reporter.complete(
+                        Outcome::Warning,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&format!(
+                            "{branch:?} has no shared history with anything `gitprism setup` or a prior sync ever produced — combining unrelated histories is a manual `git merge --allow-unrelated-histories` job, not something gitprism will do"
+                        )),
+                    );
+                    return Ok(false);
+                }
             };
             (dest_tip, boundary)
         };
@@ -2137,6 +2183,244 @@ fn newest_dest_marker_opt_for_branch(
     key: &marker::StateKey,
 ) -> Result<Option<(Oid, Oid)>> {
     scan_for_dest_marker(repo, source_tip, branch, key)
+}
+
+/// decisions/0043: `branch`'s dest-space anchor — [`newest_dest_marker_opt_for_branch`]'s
+/// own baseline scan, refined by a search for a more specific anchor among
+/// sibling branches discovered this run. A branch forked from another
+/// already-mirrored branch (round-tripped or mirror-only) anchors its dest
+/// chain on that branch's own mirror at their real merge-base, instead of
+/// always falling back to the nearest round-tripped marker the baseline
+/// scan finds by walking straight past every unmarked commit in between.
+///
+/// Shared by both of [`sync_pair_to_dest_with_key`]'s call sites — a
+/// brand-new branch's own first mirror, and decisions/0039's rewrite-rebuild
+/// arm — so both benefit with no second implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DestAnchor {
+    /// The baseline scan itself found nothing — decisions/0024's existing
+    /// warn-and-continue path, untouched.
+    None,
+    /// The `(boundary, dest_tip)` pair to build the pending chain onto —
+    /// either the baseline, untouched, or a sibling branch's more specific
+    /// one.
+    Resolved(Oid, Oid),
+    /// Two or more sibling candidates are equally specific mirrored
+    /// ancestors and neither is an ancestor of the other — gitprism won't
+    /// guess which to anchor onto. Carries every such candidate's branch
+    /// name and merge-base oid, for the caller to name in a hard-fail
+    /// message.
+    Ambiguous(Vec<(String, Oid)>),
+}
+
+fn dest_anchor_for_branch(
+    repo: &Repository,
+    source_root: &Path,
+    dest_url: &str,
+    branch: &str,
+    source_tip: Oid,
+    key: &marker::StateKey,
+) -> Result<DestAnchor> {
+    let Some((boundary_base, dest_tip_base)) =
+        newest_dest_marker_opt_for_branch(repo, source_tip, branch, key)?
+    else {
+        return Ok(DestAnchor::None);
+    };
+
+    // decisions/0017's existing discovery, not a new listing mechanism —
+    // every other local branch on source is a candidate, round-tripped or
+    // mirror-only alike (no special-casing: the search only ever resolves
+    // to a candidate's real historical merge-base, never its current tip,
+    // which is exactly what makes anchoring on a round-tripped candidate
+    // here as safe as a mirror-only one).
+    let mut survivors: Vec<(String, Oid)> = Vec::new();
+    for candidate in list_source_branches(repo)? {
+        if candidate == branch {
+            continue;
+        }
+        if !git::remote_ref_exists(source_root, dest_url, &candidate)
+            .with_context(|| format!("checking whether {candidate:?} has a dest ref"))?
+        {
+            continue;
+        }
+        let candidate_tip = repo
+            .find_branch(&candidate, git2::BranchType::Local)
+            .with_context(|| format!("resolving sibling candidate {candidate:?}"))?
+            .get()
+            .peel_to_commit()
+            .with_context(|| format!("resolving sibling candidate {candidate:?} to a commit"))?
+            .id();
+        // No shared history at all with this candidate — same guard
+        // `already_merged_into_a_landing_branch` already uses.
+        let Ok(cbase) = repo.merge_base(source_tip, candidate_tip) else {
+            continue;
+        };
+        // A candidate less specific than what the baseline already found is
+        // never an improvement — bounds the search to real refinements only.
+        let at_least_as_specific = cbase == boundary_base
+            || repo
+                .graph_descendant_of(cbase, boundary_base)
+                .with_context(|| {
+                    format!("checking whether {cbase} descends from {boundary_base}")
+                })?;
+        if !at_least_as_specific {
+            continue;
+        }
+        survivors.push((candidate, cbase));
+    }
+
+    // A survivor whose merge-base merely ties `boundary_base` exactly offers
+    // no refinement over the baseline at all — only a survivor strictly
+    // beyond it is a real candidate to disambiguate among. Without this,
+    // two or more candidates that both happen to share nothing beyond the
+    // baseline (e.g. two unrelated siblings forked from the same graft
+    // point as `branch` itself) would spuriously read as "ambiguous,"
+    // despite neither actually proposing anything more specific than what
+    // the baseline already found.
+    if !survivors.iter().any(|(_, cbase)| *cbase != boundary_base) {
+        return Ok(DestAnchor::Resolved(boundary_base, dest_tip_base));
+    }
+
+    // The unique most-specific survivor: undominated by any other
+    // survivor's merge-base, via `graph_descendant_of` — the same primitive
+    // decisions/0039's own condition 4 already uses. A tie strictly at
+    // `boundary_base` is always dominated by any real refinement above (per
+    // the check just above, at least one exists here), so it never reaches
+    // `maximal`. Two or more genuinely incomparable *refinements* are what
+    // leaves more than one maximal survivor, handled below.
+    let mut maximal: Vec<(String, Oid)> = Vec::new();
+    for (index, candidate) in survivors.iter().enumerate() {
+        let mut dominated = false;
+        for (other_index, other) in survivors.iter().enumerate() {
+            if index == other_index || other.1 == candidate.1 {
+                continue;
+            }
+            if repo
+                .graph_descendant_of(other.1, candidate.1)
+                .with_context(|| {
+                    format!(
+                        "comparing sibling candidate merge-bases {} and {}",
+                        other.1, candidate.1
+                    )
+                })?
+            {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            maximal.push(candidate.clone());
+        }
+    }
+
+    let (winner, cbase) = match maximal.len() {
+        // Every survivor dominated by another is impossible for a nonempty
+        // list under git's acyclic ancestry order, but treated as "the
+        // search found nothing better" rather than panicking.
+        0 => return Ok(DestAnchor::Resolved(boundary_base, dest_tip_base)),
+        1 => maximal.into_iter().next().expect("checked len == 1"),
+        _ => return Ok(DestAnchor::Ambiguous(maximal)),
+    };
+
+    git::fetch(source_root, dest_url, &winner)
+        .with_context(|| format!("fetching sibling candidate {winner:?} from configured remote"))?;
+    let winner_dest_tip = repo
+        .find_reference("FETCH_HEAD")
+        .context("reading FETCH_HEAD after fetching a sibling candidate")?
+        .peel_to_commit()
+        .context("resolving a fetched sibling candidate to a commit")?
+        .id();
+
+    match newest_source_marker_at_or_before(repo, winner_dest_tip, &winner, cbase, key)? {
+        Some((found_dest_oid, found_source_oid)) => {
+            Ok(DestAnchor::Resolved(found_source_oid, found_dest_oid))
+        }
+        // The winning candidate's own dest history carries nothing at or
+        // before the shared merge-base (e.g. it's a round-tripped candidate
+        // that has never itself been synced beyond `setup`'s own graft) —
+        // degrades to the existing baseline rather than to a worse or
+        // unsafe result (decisions/0043's own "Why": a bug in the new
+        // search must never produce something less safe than today).
+        None => Ok(DestAnchor::Resolved(boundary_base, dest_tip_base)),
+    }
+}
+
+/// decisions/0043 step 5: [`newest_source_marker`]'s own first-parent walk
+/// over a *sibling candidate's* dest history, narrowed to only accept a
+/// `Gitprism-Source-Commit` trailer naming `cbase` itself or an ancestor of
+/// it — not just the newest trailer found at all, since a sibling
+/// candidate's dest history can carry later syncs that postdate the real
+/// fork point being anchored on. Returns the found commit's own oid
+/// (dest-space) alongside the source oid its trailer names.
+fn newest_source_marker_at_or_before(
+    repo: &Repository,
+    dest_tip: Oid,
+    branch: &str,
+    cbase: Oid,
+    key: &marker::StateKey,
+) -> Result<Option<(Oid, Oid)>> {
+    let mut revwalk = repo
+        .revwalk()
+        .context("starting a sibling candidate's resume-point scan")?;
+    revwalk
+        .push(dest_tip)
+        .context("seeding a sibling candidate's resume-point scan")?;
+    revwalk
+        .set_sorting(git2::Sort::TOPOLOGICAL)
+        .context("ordering a sibling candidate's resume-point scan newest-first")?;
+    revwalk.simplify_first_parent().context(
+        "restricting a sibling candidate's resume-point scan to first-parent history (decisions/0019)",
+    )?;
+
+    for (scanned, oid) in revwalk.enumerate() {
+        if scanned >= limits::MAX_MARKER_SCAN_COMMITS {
+            anyhow::bail!(
+                "sibling candidate resume-point scan exceeds the {} commit limit",
+                limits::MAX_MARKER_SCAN_COMMITS
+            );
+        }
+        let oid = oid.context("walking a sibling candidate's history for a resume point")?;
+        let commit = repo
+            .find_commit(oid)
+            .context("resolving a commit in a sibling candidate's history")?;
+        let Some(source_oid) =
+            marker::verify(&commit, branch, &[MarkerDirection::SourceToDest], None, key)
+        else {
+            continue;
+        };
+        let qualifies = source_oid == cbase
+            || (repo.find_commit(source_oid).is_ok()
+                && repo
+                    .graph_descendant_of(cbase, source_oid)
+                    .with_context(|| {
+                        format!("checking whether {cbase} descends from {source_oid}")
+                    })?);
+        if qualifies {
+            return Ok(Some((oid, source_oid)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// decisions/0043's per-branch hard-fail message for
+/// [`DestAnchor::Ambiguous`] — names every equally specific candidate and
+/// its merge-base oid, matching decisions/0007's and decisions/0023's own
+/// hard-fail precedent of naming exactly what's ambiguous rather than
+/// guessing, but surfaced as a per-branch halt (decisions/0024's
+/// precedent), not a whole-run abort.
+fn ambiguous_anchor_message(branch: &str, candidates: &[(String, Oid)]) -> String {
+    let list = candidates
+        .iter()
+        .map(|(name, cbase)| format!("{name:?} (merge-base {cbase})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{branch:?} halted — its dest anchor is ambiguous: {list} are equally specific \
+         mirrored ancestors, none an ancestor of any other; gitprism won't guess which one \
+         to anchor onto — merge or rebase to establish a real order between them, then \
+         re-run gitprism sync"
+    )
 }
 
 /// dest's own resume boundary for [`pending_commits`]: the most recent
@@ -8525,5 +8809,489 @@ mod tests {
                 "every variant must still point to the remedy: {message}"
             );
         }
+    }
+
+    // decisions/0043: mirror-only branches graft onto their nearest
+    // mirrored ancestor.
+
+    #[test]
+    fn ambiguous_anchor_message_names_every_candidate_and_its_merge_base() {
+        let oid_a = Oid::from_str("4eb55376359199a3a77cd9f2e3aad225b78ea671").unwrap();
+        let oid_b = Oid::from_str("7beb3580803dc21f883872ca2d9e010ff0078638").unwrap();
+        let message = ambiguous_anchor_message(
+            "task",
+            &[
+                ("feature-a".to_string(), oid_a),
+                ("feature-b".to_string(), oid_b),
+            ],
+        );
+        assert!(
+            message.contains("\"task\""),
+            "must name the branch: {message}"
+        );
+        assert!(
+            message.contains("\"feature-a\"") && message.contains(&oid_a.to_string()),
+            "must name feature-a and its merge-base: {message}"
+        );
+        assert!(
+            message.contains("\"feature-b\"") && message.contains(&oid_b.to_string()),
+            "must name feature-b and its merge-base: {message}"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_anchors_a_task_branch_on_its_mirror_only_parent_feature_branch() {
+        // task branched from mirror-only feature branched from round-tripped
+        // main: task's dest chain must anchor on feature's own dest tip, not
+        // on main's original graft — decisions/0043's central case.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+        let feature_tip = source_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch(
+                "task",
+                &source_repo.find_commit(feature_tip).unwrap(),
+                false,
+            )
+            .unwrap();
+        add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature", &reporter)
+            .expect("feature must mirror to dest first");
+        let dest_feature_tip = dest_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "task", &reporter)
+            .expect("task must mirror to dest, anchored on feature's own dest tip");
+        let dest_task_tip = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .expect("task must be mirrored to dest")
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        // Real shared ancestry: task's dest commit is built directly onto
+        // feature's own dest tip, not re-flattened onto main's graft.
+        assert_eq!(
+            dest_task_tip.parent_id(0).unwrap(),
+            dest_feature_tip.id(),
+            "task's dest commit must be built directly onto feature's own dest tip, \
+             not re-mirrored from main's graft"
+        );
+
+        // A PR-shaped diff: exactly one new commit beyond feature's own
+        // tip — task's own task.txt commit, not a second copy of feature's
+        // history.
+        let mut walk = dest_repo.revwalk().unwrap();
+        walk.push(dest_task_tip.id()).unwrap();
+        walk.hide(dest_feature_tip.id()).unwrap();
+        let commits_since_feature: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
+        assert_eq!(
+            commits_since_feature.len(),
+            1,
+            "task's dest chain must add exactly one commit onto feature's own dest tip"
+        );
+
+        let task_tree = dest_task_tip.tree().unwrap();
+        assert!(
+            task_tree.get_name("feature.txt").is_some(),
+            "task's dest tree must still carry feature.txt, inherited from feature's own tip"
+        );
+        assert!(task_tree.get_name("task.txt").is_some());
+    }
+
+    #[test]
+    fn dest_anchor_for_branch_falls_back_to_baseline_then_finds_a_freshly_mirrored_sibling() {
+        // The same task/feature/main topology, processed in the "wrong"
+        // order: task's own anchor search runs before feature has a dest
+        // ref, and must fall back to the coarser baseline (main's graft).
+        // The identical search, run again once feature has since been
+        // mirrored, self-corrects onto feature's own dest tip — decisions/0043's
+        // own "no branch-processing-order guarantee, but corrects the run
+        // after the sibling gets a dest ref."
+        //
+        // Exercises `dest_anchor_for_branch` directly rather than through a
+        // full `sync_pair_to_dest` round trip: once task itself has a dest
+        // ref, only a positively detected rewrite (decisions/0039) ever
+        // re-invokes this search for it — an ordinary no-op resync does
+        // not — so a direct call is what actually demonstrates the search
+        // itself self-correcting run over run, without depending on
+        // whichever rewrite shape happens to trigger a rebuild.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+        let feature_tip = source_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch(
+                "task",
+                &source_repo.find_commit(feature_tip).unwrap(),
+                false,
+            )
+            .unwrap();
+        add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
+        let task_tip = source_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        let dest_url = dest_dir.path().display().to_string();
+        let key = marker::load_key().unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+
+        // feature has no dest ref yet — task's search falls back to the
+        // baseline (main's graft) exactly.
+        let anchor =
+            dest_anchor_for_branch(&repo, source_dir.path(), &dest_url, "task", task_tip, &key)
+                .unwrap();
+        assert_eq!(
+            anchor,
+            DestAnchor::Resolved(graft, dest_tip),
+            "with feature not yet mirrored, task's anchor must fall back to the baseline"
+        );
+
+        // feature is mirrored now — a clean, independent sync with no other
+        // sibling holding a dest ref yet to interact with.
+        let config = Config::load(write_config("unused", &dest_url, &["main"]).path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature", &reporter)
+            .expect("feature must mirror to dest");
+        let dest_feature_tip = dest_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // The identical search, run again for task, now finds feature as
+        // the more specific anchor — self-correcting the earlier fallback.
+        let anchor =
+            dest_anchor_for_branch(&repo, source_dir.path(), &dest_url, "task", task_tip, &key)
+                .unwrap();
+        assert_eq!(
+            anchor,
+            DestAnchor::Resolved(feature_tip, dest_feature_tip),
+            "once feature is mirrored, task's anchor must self-correct onto feature's own dest tip"
+        );
+    }
+
+    #[test]
+    fn run_hard_fails_only_the_branch_with_two_incomparable_mirrored_ancestors() {
+        // Two mirror-only branches, feature-a and feature-b, both branched
+        // directly from the graft and mirrored independently — neither an
+        // ancestor of the other. task is a real two-parent merge of both:
+        // decisions/0043's anchor search finds two equally specific,
+        // incomparable candidates and must hard-fail — but only task's own
+        // line, not the whole run (decisions/0024's per-branch precedent).
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature-a", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-a", &[("a.txt", "line1\n")]);
+        let feature_a_tip = source_repo
+            .find_branch("feature-a", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        source_repo
+            .branch("feature-b", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature-b", &[("b.txt", "line1\n")]);
+        let feature_b_tip = source_repo
+            .find_branch("feature-b", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        // task: a real two-parent merge of feature-a and feature-b.
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let merge_oid = source_repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "merge feature-a and feature-b",
+                &feature_a_tip.tree().unwrap(),
+                &[&feature_a_tip, &feature_b_tip],
+            )
+            .unwrap();
+        source_repo
+            .branch("task", &source_repo.find_commit(merge_oid).unwrap(), false)
+            .unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let err = run(source_dir.path(), config.path())
+            .expect_err("an ambiguous dest anchor must fail the overall run");
+        // The run's own aggregate message stays deliberately generic
+        // (decisions/0037's own precedent — the per-branch reporter line,
+        // asserted via `ambiguous_anchor_message`'s own unit test below,
+        // carries the specific candidate names and merge-base oids).
+        assert!(
+            format!("{err:#}").to_lowercase().contains("ambiguous"),
+            "the run's own error should mention the ambiguous anchor: {err:#}"
+        );
+
+        // Other branches were unaffected: both siblings still mirrored.
+        assert!(
+            dest_repo
+                .find_branch("feature-a", git2::BranchType::Local)
+                .is_ok()
+        );
+        assert!(
+            dest_repo
+                .find_branch("feature-b", git2::BranchType::Local)
+                .is_ok()
+        );
+        let dest_main_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            dest_main_tip, dest_tip,
+            "main's own sync must proceed normally alongside the halted branch"
+        );
+
+        // task itself was never pushed to dest.
+        assert!(
+            dest_repo
+                .find_branch("task", git2::BranchType::Local)
+                .is_err(),
+            "a branch with an ambiguous dest anchor must never be pushed to dest"
+        );
+    }
+
+    #[test]
+    fn sync_pair_to_dest_agrees_with_the_baseline_when_no_sibling_candidate_is_more_specific() {
+        // Regression check: a mirror-only branch forked straight from
+        // round-tripped main, with no other mirrored sibling more specific
+        // than main's own graft — the new search must agree with the
+        // baseline exactly, not produce anything different.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature", &reporter)
+            .expect("feature must mirror to dest");
+
+        let dest_feature_tip = dest_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            dest_feature_tip.parent_id(0).unwrap(),
+            dest_tip,
+            "with no sibling candidate more specific than main's own graft, the refined \
+             search must agree with the baseline exactly"
+        );
+        let mut walk = dest_repo.revwalk().unwrap();
+        walk.push(dest_feature_tip.id()).unwrap();
+        walk.hide(dest_tip).unwrap();
+        let commits_since_graft: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
+        assert_eq!(commits_since_graft.len(), 1);
+    }
+
+    #[test]
+    fn sync_pair_to_dest_rewrite_rebuild_anchors_on_a_sibling_mirror_only_branch_too() {
+        // decisions/0039's rewrite-rebuild arm shares dest_anchor_for_branch
+        // with the brand-new-branch arm — a rewritten mirror-only branch
+        // with a more specific mirrored sibling available must rebuild onto
+        // that sibling, not onto main's graft, with no second
+        // implementation.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
+            .unwrap();
+        add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
+        let feature_tip = source_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        source_repo
+            .branch(
+                "task",
+                &source_repo.find_commit(feature_tip).unwrap(),
+                false,
+            )
+            .unwrap();
+        add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
+
+        let config = Config::load(
+            write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        )
+        .unwrap();
+        let repo = Repository::open(source_dir.path()).unwrap();
+        let reporter = Reporter::new(1, std::iter::empty());
+
+        // feature mirrors first, then task correctly anchors on it.
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "feature", &reporter)
+            .expect("feature must mirror to dest");
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "task", &reporter)
+            .expect("task must mirror, anchored on feature's dest tip");
+        let dest_task_tip_before = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        // Rewrite task itself (amend-shaped): reset to feature's tip and
+        // give it a brand-new commit, triggering decisions/0039's
+        // rewrite-rebuild arm on the next sync.
+        source_repo
+            .branch("task", &source_repo.find_commit(feature_tip).unwrap(), true)
+            .unwrap();
+        add_commit(&source_repo, "task", &[("task.txt", "rewritten\n")]);
+
+        sync_pair_to_dest(&repo, source_dir.path(), &config, "task", &reporter)
+            .expect("a rewritten mirror-only branch must rebuild, anchored on its sibling");
+
+        let dest_feature_tip = dest_repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let dest_task_tip_after = dest_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        assert_ne!(
+            dest_task_tip_after.id(),
+            dest_task_tip_before.id(),
+            "the pre-rewrite mirror history must be replaced, not built upon"
+        );
+        assert_eq!(
+            dest_task_tip_after.parent_id(0).unwrap(),
+            dest_feature_tip.id(),
+            "the rebuild must anchor on feature's own dest tip, not on main's graft, \
+             confirming the shared call site benefits with no second implementation"
+        );
+        let tree = dest_task_tip_after.tree().unwrap();
+        let blob = dest_repo
+            .find_blob(tree.get_name("task.txt").unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), b"rewritten\n");
     }
 }

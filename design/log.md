@@ -1899,3 +1899,20 @@ its live tip (keeps round-tripped candidates safe too, no special-casing
 needed). Ambiguous ties hard-fail, naming both candidates — decided
 explicitly in conversation over silently falling back, per this project's
 standing no-guessing default. Not yet implemented; no code changed.
+
+**Update**: Implemented decisions/0043 in `src/commands/sync.rs` — new
+`dest_anchor_for_branch` (refines `newest_dest_marker_opt_for_branch`'s
+baseline against every sibling branch with an existing dest ref) and
+`newest_source_marker_at_or_before` (step 5's bounded walk over the winning
+sibling's own dest history), wired into both of
+`sync_pair_to_dest_with_key`'s call sites — the brand-new-branch arm and
+decisions/0039's rewrite-rebuild arm. An `Ambiguous` anchor halts only the
+affected branch (decisions/0024's per-branch precedent), not the whole run.
+Clarified decision 0043 itself during implementation: candidates whose
+merge-base merely *ties* the baseline exactly are excluded before the
+ambiguity check, since two unrelated siblings that both tie the baseline
+(offering no refinement) are not actually ambiguous — caught by a failing
+test, folded back into the decision doc rather than left as an undocumented
+implementation detail. Six new tests (real dest-side ancestry assertions,
+not just content), `cargo test` (233 passed), `cargo clippy --all-targets`,
+and `cargo fmt --check` all clean. Decision 0043 marked `stable`/verified.
