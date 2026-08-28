@@ -50,7 +50,7 @@ project owner's answer: "configuration similar to `.gitignore` or so."
 
 # Addendum (2026-08-28): a directory-only pattern also matches a submodule gitlink
 
-A repository review (finding F-10) found `filter_tree` (`src/commands/sync.rs`)
+A repository review (finding F-10) found `filter_tree` (now `src/commands/sync/filter.rs`)
 computing whether a tree entry counts as a directory purely from
 `entry.kind() == Some(git2::ObjectType::Tree)`. Real `.gitignore` syntax — and
 `git check-ignore` itself — maps a submodule gitlink to `DT_DIR` for matching

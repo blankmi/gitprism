@@ -1277,12 +1277,12 @@ own walks"). Also corrects this file's earlier claim, in the entry
 documenting decisions/0016, that the interleaved-branch churn had
 "disappear[ed]" — it hadn't; the test comment in
 `run_does_not_duplicate_a_no_ff_merges_content_on_dest`
-(`src/commands/sync.rs`, ~lines 3281-3288) still records it as an open
+(now `src/commands/sync/tests/source_to_dest.rs`, ~lines 3281-3288 at the time) still records it as an open
 design question, and this decision is what actually removes it. No code
 changed in this commit; the implementation and its test coverage are a
 follow-up.
 
-**Update**: Implemented. `pending_commits` (`src/commands/sync.rs`) gained
+**Update**: Implemented. `pending_commits` (now `src/commands/sync/mod.rs`) gained
 `revwalk.simplify_first_parent()` between `hide()` and `set_sorting()` — the
 one-line change decisions/0035 specified, following the same
 `.context(...)` idiom as the two `simplify_first_parent()` calls decisions/0019
@@ -1324,8 +1324,8 @@ it as an open design question.
 **Update**: Added [decisions/0036](decisions/0036-branch-additive-exclusions.md).
 An external security review found a real disclosure path: decisions/0026
 loads one verified `ExcludeList` from the working tree per `sync` run and
-never loads a branch-tip version, confirmed in `src/commands/sync.rs::run`
-(~lines 101-103). A feature branch that adds sensitive content and
+never loads a branch-tip version, confirmed in `src/commands/sync/mod.rs::run`
+(~lines 101-103 at the time). A feature branch that adds sensitive content and
 correctly adds its own `.gitprismignore` entry excluding it has that
 instruction discarded — the content is mirrored to dest anyway — and per
 this file's own still-open "a file that already reached dest and is later
@@ -1383,7 +1383,7 @@ of a control file is not a mismatch, since the trusted policy already applies
 regardless of a commit's own content; only present-and-different is
 ambiguous. No second policy source is introduced: decisions/0026's one
 verified `ExcludeList` for every branch stands unchanged, and
-`already_merged_into_a_landing_branch` (`src/commands/sync.rs`, ~line 641) is
+`already_merged_into_a_landing_branch` (now `src/commands/sync/mod.rs`, ~line 1042) is
 confirmed untouched, so 0036's leak-moves-to-silent-non-mirroring side effect
 does not recur — a mismatching branch now halts loudly instead of vanishing.
 Also notes the sanctioned `GITPRISM_POLICY_SHA256`-change workflow (a
@@ -1468,8 +1468,8 @@ is exhausted — decisions/0009 itself is unchanged, this only defines what
 happens after its retries run out. Force is made opt-in and visible via an
 explicit two-variant `PushMode` every push call site must declare, rather
 than a separate force helper. Classified the four existing `git::push` call
-sites by branch authority: `src/commands/sync.rs:509` (source→dest, role
-depends on current `config.branches` membership), `src/commands/sync.rs:1404`
+sites by branch authority: `src/commands/sync/mod.rs:736` (source→dest, role
+depends on current `config.branches` membership), `src/commands/sync/mod.rs:1418`
 (dest→source, always round-tripped), `src/commands/resolve.rs:335` and
 `:579` (dest pushes in source→dest resolve — must be classified by
 `config.branches` membership too, since `Direction::SourceToDest` accepts
@@ -1578,7 +1578,7 @@ count. On a detected rewrite, the rebuild target comes from the existing
 `newest_dest_marker_opt_for_branch(repo, source_tip, ...)` call the
 `!dest_ref_exists` arm already uses — no second base-finding path.
 
-The exhausted-retries message (`sync.rs:519`, `sync.rs:1404` before this
+The exhausted-retries message (`sync/mod.rs:519`, `sync/mod.rs:1404` before this
 change) is now built by one pure function,
 `divergence_after_exhausted_retries_message(branch, ff_target)`: names the
 branch, says the two sides diverged, and defers to the operator via
@@ -1828,7 +1828,7 @@ missing," which on a non-shallow clone now resolves to a confirmed rewrite
 and a force-push — a transient ODB error or corruption would be misread as a
 rewrite instead of failing loudly, against AGENTS.md's own "fail clearly and
 let the operator resolve it" default. Narrowed to `Err(error) if error.code()
-== git2::ErrorCode::NotFound`, the same guard already used at `sync.rs:1618`
+== git2::ErrorCode::NotFound`, the same guard already used at `sync/anchor.rs:1618` at the time
 for an unrelated missing-object case; every other `Err` now propagates with
 context. Investigated empirically what `find_commit` actually returns for a
 present-but-wrong-type object (a tree/blob oid): also `ErrorCode::NotFound`
@@ -2233,3 +2233,65 @@ old branch-specific bail text). `cargo test` (248 passed), `cargo clippy
 `cargo test --workspace --all-features` (258 passed), `cargo clippy
 --workspace --all-targets --all-features -- -D warnings`, and `cargo fmt
 --all -- --check` all clean.
+
+## 2026-08-28 — sync.rs split into submodules; test fixtures deduplicated (P2)
+
+**Update**: Implemented the 2026-08-27 review's P2 refactor (§10/§11):
+behaviour-preserving split of `src/commands/sync.rs` (12054 lines). Production
+code (~3.1k lines) is now `src/commands/sync/mod.rs` (orchestration — `run`,
+the two per-branch loops, branch listing, the build/push helpers) plus
+`sync/marker_scan.rs` (the shared first-parent marker revwalks), `sync/anchor.rs`
+(decisions/0043/0044's dest anchor search, `RunCache`), `sync/local_advance.rs`
+(dest→source's local ref preflight/compare-and-swap), `sync/policy_check.rs`
+(decisions/0037's per-commit control-file check), and `sync/filter.rs`
+(`filter_tree`). The pure alias `newest_dest_marker_opt_for_branch` was
+removed; its one caller now calls `scan_for_dest_marker` directly. The three
+near-identical marker revwalks were moved as-is, not unified into one
+generic walker — their accept predicates and starting points differ enough
+that collapsing them wouldn't obviously be behaviour-preserving.
+`resolve.rs`'s `use` paths were updated for the items that moved into a
+submodule; everything that stayed directly in `mod.rs` kept its old
+`crate::commands::sync::*` path.
+
+The crate is a binary with no `lib` target, so the ~8.9k lines of inline
+`#[cfg(test)] mod tests` moved to `src/commands/sync/tests/` (`mod.rs` plus
+`source_to_dest.rs`, `dest_to_source.rs`, `anchor.rs`, `local_advance.rs`,
+`policy_check.rs`, `filter.rs`, `run_entrypoint.rs`, and `limit_tests.rs` —
+named to avoid shadowing `crate::limits`, since `mod limits;` would otherwise
+win module-name resolution over the glob-imported crate module for every
+descendant). A new `src/testutil.rs` (`#[cfg(test)] pub(crate) mod testutil;`
+in `main.rs`) now holds the fixtures that were byte-for-byte (or near enough)
+duplicated between `sync`'s and `resolve`'s own test modules:
+`bare_repo_with_a_commit_on`, `write_config`, `bare_source_remote_seeded_at`,
+`source_grafted_onto`, and a new `checkout_head_exact` factored out of
+`resolve`'s own copy. Two divergences were kept separate rather than forced
+together: `resolve`'s `add_commit` does a real, forced checkout (plus the
+decisions/0034 control-file restore) after each commit, because its
+cherry-pick is a real `git` subprocess that refuses to run against a stale
+working tree, while `sync`'s own commit fixtures never need that (their
+merge/cherry-pick work happens entirely against the object database) and
+instead opportunistically refresh the checkout via their own
+`refresh_checked_out_branch`; and `setup`'s own `repo_with_a_commit_on`/
+`commit_on_top`/`write_config` stayed local to `setup.rs` — its "dest"
+fixture is deliberately non-bare (`setup` only ever fetches from dest, never
+pushes to it) and its config has no `[source]` section at all, so forcing
+either onto the shared shapes would have changed what's being tested, not
+just deduplicated it.
+
+`#[test]` count is unchanged at 292 across the crate (112 of them under
+`commands::sync::tests`) before and after both commits. `cargo test
+--workspace --all-features`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, and `cargo fmt --all -- --check` all clean
+after each commit.
+
+File/line references in `design/decisions/` and this log that pointed at
+`src/commands/sync.rs` paths were updated to the new file (and, where
+precisely known, the new line) — decisions/0011, 0018, 0019, 0020, 0023
+(except its pre-existing, unrelated `trailer_value` inaccuracy, left alone),
+0024, 0035, 0036, 0037, 0038, 0039, 0040, 0041, 0042, 0043, 0044, 0045, and
+this file's own 2026-08-19/20/21 entries. A citation whose exact new line
+wasn't independently re-verified is marked "at the time" rather than given a
+guessed number. Some of this file's older, deeply narrative entries (e.g.
+"Six tests added to `src/commands/sync.rs`") were left as plain historical
+record — they describe the file as it was on that date, before this split
+existed, not a live reference.

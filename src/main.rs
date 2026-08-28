@@ -8,6 +8,8 @@ mod lock;
 mod marker;
 mod policy;
 mod progress;
+#[cfg(test)]
+pub(crate) mod testutil;
 
 use std::path::Path;
 

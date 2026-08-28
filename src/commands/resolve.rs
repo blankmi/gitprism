@@ -1438,39 +1438,13 @@ fn finish(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::tempdir;
 
     use super::*;
-
-    fn write_config(source_url: &str, dest_url: &str, branches: &[&str]) -> NamedTempFile {
-        let branches_toml: String = branches
-            .iter()
-            .map(|branch| format!("{branch:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let mut file = NamedTempFile::new().unwrap();
-        write!(
-            file,
-            r#"
-            branches = [{branches_toml}]
-
-            [committer]
-            name = "gitprism"
-            email = "gitprism@example.com"
-
-            [source]
-            url = '{source_url}'
-
-            [dest]
-            url = '{dest_url}'
-            "#,
-        )
-        .unwrap();
-        file
-    }
+    use crate::testutil::{
+        bare_repo_with_a_commit_on, bare_source_remote_seeded_at, checkout_head_exact,
+        source_grafted_onto, write_config,
+    };
 
     #[test]
     fn hostile_branch_names_are_displayed_outside_literal_operator_commands() {
@@ -1644,89 +1618,6 @@ mod tests {
         let error = conflicted_paths(&repo)
             .expect_err("one byte over the cumulative path-byte limit must be rejected");
         assert!(error.to_string().contains("byte limit"));
-    }
-
-    fn bare_repo_with_a_commit_on(dir: &Path, branch: &str, files: &[(&str, &str)]) -> Oid {
-        let repo = Repository::init_bare(dir).unwrap();
-        let mut builder = repo.treebuilder(None).unwrap();
-        for (name, contents) in files {
-            let blob = repo.blob(contents.as_bytes()).unwrap();
-            builder
-                .insert(*name, blob, git2::FileMode::Blob.into())
-                .unwrap();
-        }
-        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
-        let signature = git2::Signature::now("Dest Author", "author@example.com").unwrap();
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap()
-    }
-
-    /// Same shape as `commands::sync`'s own `source_grafted_onto` fixture —
-    /// a source repo grafted onto `dest`'s tip, exactly `gitprism setup`'s
-    /// output (decisions/0006), checked out on `branch`.
-    fn source_grafted_onto(
-        source_dir: &Path,
-        branch: &str,
-        dest_tip: Oid,
-        dest_repo: &Repository,
-    ) -> Repository {
-        let repo = Repository::init(source_dir).unwrap();
-        let dest_tip_commit = dest_repo.find_commit(dest_tip).unwrap();
-        git::fetch(source_dir, &dest_repo.path().to_string_lossy(), branch).unwrap();
-        let fetched_tip_id = repo
-            .find_reference("FETCH_HEAD")
-            .unwrap()
-            .peel_to_commit()
-            .unwrap()
-            .id();
-        {
-            let fetched_tip = repo.find_commit(fetched_tip_id).unwrap();
-            let signature = git2::Signature::now("gitprism", "gitprism@example.com").unwrap();
-            let tree = fetched_tip.tree().unwrap();
-            let message = marker::build_message(
-                &format!("gitprism setup: graft ({})", source_dir.display()),
-                marker::Direction::Setup,
-                branch,
-                dest_tip_commit.id(),
-                "Gitprism-Dest-Commit",
-                &[fetched_tip.id()],
-                tree.id(),
-                &signature,
-                &signature,
-                &marker::load_key().unwrap(),
-            );
-            repo.commit(
-                Some(&format!("refs/heads/{branch}")),
-                &signature,
-                &signature,
-                &message,
-                &tree,
-                &[&fetched_tip],
-            )
-            .unwrap();
-        }
-        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
-        checkout_head_exact(&repo);
-        repo
-    }
-
-    /// Forced checkout of HEAD followed by decisions/0034's byte-exact
-    /// control-file restore — what a real `setup`/`sync` leaves on disk.
-    /// Without it, a host with `core.autocrlf=true` (Windows CI) checks out
-    /// `.gitprismignore` with CRLF and decisions/0037's policy check sees the
-    /// pinned bytes disagree with an identical blob.
-    fn checkout_head_exact(repo: &Repository) {
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
-        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
-        policy::restore_control_files_exact(repo, &head_tree).unwrap();
     }
 
     /// Unlike `commands::sync`'s own `add_commit` fixture (which never needs
@@ -2195,27 +2086,6 @@ mod tests {
                 .is_err(),
             "a refused resolve must not leave an in-progress operation behind"
         );
-    }
-
-    /// A bare repo standing in for source's own remote, seeded at `tip` —
-    /// same convention as `commands::sync`'s own fixture of the same name.
-    fn bare_source_remote_seeded_at(
-        source_repo: &Repository,
-        branch: &str,
-        tip: Oid,
-    ) -> tempfile::TempDir {
-        let dir = tempdir().unwrap();
-        Repository::init_bare(dir.path()).unwrap();
-        let outcome = git::push(
-            source_repo.workdir().unwrap(),
-            &dir.path().display().to_string(),
-            tip,
-            branch,
-            PushMode::FastForwardOnly,
-        )
-        .unwrap();
-        assert_eq!(outcome, git::PushOutcome::Accepted);
-        dir
     }
 
     #[test]

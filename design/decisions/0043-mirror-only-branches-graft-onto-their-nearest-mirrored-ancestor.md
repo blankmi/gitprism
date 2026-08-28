@@ -21,7 +21,7 @@ Every commit gitprism writes to dest is single-parent
 first-parent-only ([decisions/0035](0035-pending-history-is-first-parent.md)).
 So when `task` is discovered ([decisions/0017](0017-source-to-dest-mirrors-every-branch.md)),
 what dest-space point its new chain gets built onto is decided entirely by
-`scan_for_dest_marker` (`src/commands/sync.rs`, feeding
+`scan_for_dest_marker` (now `src/commands/sync/marker_scan.rs`, feeding
 `newest_dest_marker_opt_for_branch`), which walks `task`'s own first-parent
 source history for the nearest commit carrying a `MarkerDirection::Setup` or
 `MarkerDirection::DestToSource` trailer. Both trailers exist only on
@@ -51,7 +51,7 @@ tools (josh, Copybara, git-subtree, git-filter-repo, jujutsu) discover ad-hoc
 branches the way [decisions/0017](0017-source-to-dest-mirrors-every-branch.md)
 does, so none has an equivalent "which mirrored branch did this one fork
 from" question to answer. The nearest existing precedent inside this
-codebase is `already_merged_into_a_landing_branch` (`sync.rs:984`), which
+codebase is `already_merged_into_a_landing_branch` (now `sync/mod.rs:1042`), which
 already uses `repo.merge_base` plus `git::merge_tree` to compare a branch
 against a *fixed* candidate set (`config.branches`) for a different question
 (is this branch fully absorbed, safe to stop mirroring). This decision reuses
@@ -409,7 +409,7 @@ requires), that marker:
 
 ## Consequences
 
-* One new shared helper, `loop_prevented` (`src/commands/sync.rs`), used by
+* One new shared helper, `loop_prevented` (`src/commands/sync/mod.rs`), used by
   both `build_pending_dest_tip` and `find_control_file_policy_mismatch` —
   one definition of "already on dest," not two that could drift.
 * One new function, `newest_dest_to_source_marker_at_or_before`, alongside
@@ -425,12 +425,12 @@ requires), that marker:
   claim is unaffected.
 * **Tests added:**
   * `run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it`
-    (`src/commands/sync.rs`) — the full reproduction, via `run()` end to
+    (`src/commands/sync/mod.rs`) — the full reproduction, via `run()` end to
     end: dest-native *X*, imported as *M* on `main`, `task` forked
     afterward. Confirmed failing (two commits beyond dest `main`'s tip
     instead of one) against the pre-fix code, and passing after.
   * `build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch`
-    (`src/commands/sync.rs`) — isolates loop prevention from the step-5
+    (`src/commands/sync/mod.rs`) — isolates loop prevention from the step-5
     fix by forcing the wrong-order baseline fallback (`main` hidden from
     the sibling search via `RunCache::dest_ref_exists`, so *M* is
     necessarily inside `task`'s own `pending_commits` range regardless of

@@ -17,7 +17,7 @@ strategy only fetches/checks out the single ref that triggered the pipeline — 
 to `feature-x` leaves that job's checkout with no local branch for `develop` at all,
 even though `develop` is named in `config.branches`.
 
-`sync_pair_from_dest_with_key` (`src/commands/sync.rs`) resolved a round-tripped
+`sync_pair_from_dest_with_key` (`src/commands/sync/mod.rs`) resolved a round-tripped
 branch's source tip, on its first attempt, purely from the local checkout:
 
 ```rust

@@ -18,15 +18,15 @@ four direct conditions before any push is attempted.
 **The defect.** `PushMode::ForceMirrorOnly` (`src/git.rs`'s `push_refspec`)
 currently builds `+<commit>:refs/heads/<branch>` — an unconditional force,
 sent via `push` (`src/git.rs`). The sequence in
-`sync_pair_to_dest` (`src/commands/sync.rs`) is: fetch dest's tip `D`
-(`sync.rs:353-361`), positively detect the mirror-only rewrite via
-`mirror_only_rewrite_detected` (`sync.rs:387-389`, defined at
-`sync.rs:1214`), build replacement projection `N` from the graft-derived
-`(boundary, dest_tip)` (`sync.rs:401-409`), and push `N`
-(`sync.rs:555`). If another writer advances dest from `D` to `D2` between
+`sync_pair_to_dest_with_key` (`src/commands/sync/mod.rs`, since split) is: fetch dest's tip `D`
+(`sync/mod.rs:353-361`), positively detect the mirror-only rewrite via
+`mirror_only_rewrite_detected` (`sync/mod.rs:387-389` at the time, defined at
+`sync/anchor.rs:1214` now), build replacement projection `N` from the graft-derived
+`(boundary, dest_tip)` (`sync/mod.rs:401-409`), and push `N`
+(`sync/mod.rs:555`). If another writer advances dest from `D` to `D2` between
 the fetch and the push, the `+`-prefixed refspec replaces `D2` with `N`
 outright and git reports success — no rejection is produced. Decisions/0009's
-refetch-and-recompute retry arm (`sync.rs:557-570`,
+refetch-and-recompute retry arm (`sync/mod.rs:557-570`,
 `git::PushOutcome::RejectedNotFastForward if attempt < MAX_RACE_RETRIES`) is
 therefore unreachable for this specific race, which makes decisions/0039's
 own Decision-section flow diagram ("if dest moves during the operation,
@@ -77,11 +77,11 @@ Flow, replacing today's unconditional-force sequence:
 3. Push `N` only if dest still equals `D` — the lease's job.
 4. If the lease fails (stale info), refetch, re-evaluate branch authority
    and rewrite detection from scratch, rebuild `N` again, and retry within
-   decisions/0009's existing bound (`MAX_RACE_RETRIES`, `sync.rs:80`) — the
+   decisions/0009's existing bound (`MAX_RACE_RETRIES`, `sync/mod.rs:80` at the time) — the
    same loop `sync_pair_to_dest` already runs, since a stale lease is
    classified identically to any other non-fast-forward rejection.
 5. After retries are exhausted, stop for operator intervention
-   (`divergence_after_exhausted_retries_message`, `sync.rs:90`) — never fall
+   (`divergence_after_exhausted_retries_message`, `sync/mod.rs:90` at the time) — never fall
    back to an unconditional force.
 
 **The lease does not decide whether forcing is authorized.**
@@ -154,11 +154,11 @@ server side of the ref update.
 
 * **The payload is load-bearing: `expected_dest` must be the dest tip as
   actually fetched.** In `sync_pair_to_dest`'s `match
-  dest_resume_point_for_branch(...)` (`sync.rs:375-414`), the rewrite arm
-  (`sync.rs:401-409`) rebinds the outer `dest_tip` binding to
+  dest_resume_point_for_branch(...)` (`sync/mod.rs:375-414` at the time; `dest_resume_point_for_branch` itself now lives in `sync/anchor.rs`), the rewrite arm
+  (`sync/mod.rs:401-409`) rebinds the outer `dest_tip` binding to
   `rebuild_dest_tip` — the graft-derived rebuild base
   `newest_dest_marker_opt_for_branch` returns — not to the value fetched at
-  `sync.rs:356-361`. The implementation must capture the fetched dest OID
+  `sync/mod.rs:356-361`. The implementation must capture the fetched dest OID
   into its own variable *before* that `match` rebinds `dest_tip`, and pass
   that captured value as `expected_dest`. Using the post-match value would
   make every lease compare against `rebuild_dest_tip` instead of dest's

@@ -28,7 +28,7 @@ decisions/0020 built for a real conflict: `reporter.complete(Outcome::Error, ...
 Real usage surfaced two problems with that:
 
 1. **Doubled, badly-wrapped output.** `run()` wraps every `sync_pair_to_dest` call in
-   `.with_context(|| format!("syncing {branch:?} source -> dest"))?` (`sync.rs`). When
+   `.with_context(|| format!("syncing {branch:?} source -> dest"))?` (`sync/mod.rs`). When
    the hard-fail's `anyhow::bail!` propagates through that, `main`'s default `Result`
    printing shows the *exact same detail text* twice: once as the `Reporter`'s own
    colored, scannable line (the entire reason decisions/0020 exists), and again as a
@@ -68,7 +68,7 @@ that actually calls for attention inside the one that doesn't. This is the real 
 
 `sync_pair_to_dest`'s `!dest_ref_exists` branch, on finding no `Gitprism-Dest-Commit`
 marker anywhere in the branch's first-parent history, is handled the same way
-`already_merged_into_a_landing_branch`'s existing skip is structured (`sync.rs` ~line
+`already_merged_into_a_landing_branch`'s existing skip is structured (`sync/mod.rs` ~line
 240-254) — build a note stating the branch has no shared history with anything
 `gitprism setup` or a prior sync ever produced, and that combining unrelated histories
 is a manual `git merge --allow-unrelated-histories` job if it's ever wanted — but report

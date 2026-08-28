@@ -86,14 +86,14 @@ evaluated.]**
 command modules — `git::push` takes no force flag today
 (`src/git.rs:496-542`, doc comment: "Deliberately no `--force`"):
 
-* `src/commands/sync.rs:509` — source→dest, `build_pending_dest_tip`'s
+* `src/commands/sync/mod.rs:736` — source→dest, `build_pending_dest_tip`'s
   result pushed to dest. `branch` here may or may not be in
   `config.branches` (decisions/0017: every source branch is discovered and
   mirrored, not just round-tripped ones).
-* `src/commands/sync.rs:1404` — dest→source, `build_pending_source_tip`'s
+* `src/commands/sync/mod.rs:1418` — dest→source, `build_pending_source_tip`'s
   result pushed to source. `branch` here is always in `config.branches` —
   `run()`'s dest→source loop only ever iterates that list (confirmed also
-  by the comment at `sync.rs:1430-1433`, "branch here is always named in
+  by the comment at `sync/mod.rs:1449-1452`, "branch here is always named in
   config.branches ... no mirror-only case for this direction").
 * `src/commands/resolve.rs:335` and `src/commands/resolve.rs:579` — both
   inside `resolve_source_to_dest`, pushing a resolved dest commit. Read
@@ -102,13 +102,13 @@ command modules — `git::push` takes no force flag today
   `config.branches` — unlike `Direction::DestToSource`, which does look the
   branch up in `config.branches` and errors if absent. So these two dest
   pushes are exactly as likely to target a mirror-only branch as sync's own
-  `sync.rs:509`, and cannot be assumed round-tripped.
+  `sync/mod.rs:736`, and cannot be assumed round-tripped.
 * `src/commands/resolve.rs:1324` — inside `finish` (the dest→source resolve
   path), pushing to source. Always round-tripped, for the same reason as
-  `sync.rs:1404`: reached only through `Direction::DestToSource`, which
+  `sync/mod.rs:1418`: reached only through `Direction::DestToSource`, which
   `run_with_direction:104-111` already restricts to `config.branches`.
 
-(The line numbers in the originating request — `sync.rs` ~430/~1218 — have
+(The line numbers in the originating request — `sync.rs` ~430/~1218 (since split into `sync/mod.rs`) — have
 moved; corrected above. `resolve.rs` 335/579/1324 were accurate.)
 
 # Decision
@@ -165,20 +165,20 @@ is pushing.**
   equivalent explicit `+refspec`); `PushMode::FastForwardOnly` is today's
   existing behavior, unchanged.
 * **Every call site above must be classified, not defaulted:**
-  * `sync.rs:509` (source→dest) — mode depends on whether `branch` is in
+  * `sync/mod.rs:736` (source→dest) — mode depends on whether `branch` is in
     `config.branches` at the time of this run: `FastForwardOnly` if so,
     `ForceMirrorOnly`-eligible (after retries exhaust) if not.
     **[Superseded by decisions/0039: eligibility is a positively detected
     rewrite, not "after retries exhaust."]**
-  * `sync.rs:1404` (dest→source) — always `FastForwardOnly`; never
+  * `sync/mod.rs:1418` (dest→source) — always `FastForwardOnly`; never
     eligible for `ForceMirrorOnly`, since only round-tripped branches reach
     this path.
   * `resolve.rs:335`, `resolve.rs:579` (dest pushes, source→dest resolve)
-    — same `config.branches` membership test as `sync.rs:509`. Must not be
+    — same `config.branches` membership test as `sync/mod.rs:736`. Must not be
     assumed round-tripped just because `resolve` is a human-driven path;
     `Direction::SourceToDest` accepts any local branch.
   * `resolve.rs:1324` (source push, dest→source resolve) — always
-    `FastForwardOnly`, same reasoning as `sync.rs:1404`.
+    `FastForwardOnly`, same reasoning as `sync/mod.rs:1418`.
 * **Role is decided by current config — an operator hazard.** A branch's
   authority is whichever category it falls into by testing membership in
   `config.branches` *right now*, at the time of that run — there is no
@@ -194,7 +194,7 @@ is pushing.**
   hand reconciliation to the operator — without prescribing merge, rebase,
   or cherry-pick.** Choosing among those is exactly the human decision
   gitprism must not automate (`AGENTS.md`'s operator-intervention rule).
-  Today's message at both `sync.rs:519`/`sync.rs:1422-1425` — "kept losing
+  Today's message at both `sync/mod.rs:519` at the time/`sync/mod.rs:1422-1425` at the time — "kept losing
   a fast-forward race after N retries" — states the symptom and gives no
   next step; it must be replaced with one that names `branch`, states that
   source and dest (or dest and source) diverged, and tells the operator to
@@ -286,7 +286,7 @@ is pushing.**
 # Consequences
 
 * **dest→source is entirely unaffected.** Only round-tripped branches ever
-  flow dest→source (decisions/0017); `sync.rs:1404` and `resolve.rs:1324`
+  flow dest→source (decisions/0017); `sync/mod.rs:1418` and `resolve.rs:1324`
   are always `FastForwardOnly` and never gain a force path.
 * **decisions/0009 is unchanged in mechanism.** Refetch-and-recompute,
   bounded retries, and the `[rejected]`-porcelain race-detection idiom
@@ -335,7 +335,7 @@ is pushing.**
     persists past the retry bound: the run fails with a message naming the
     branch and stating the histories diverged, without mentioning merge,
     rebase, or cherry-pick;
-  * a role-aware guard test: round-tripped pushes (both `sync.rs` call
+  * a role-aware guard test: round-tripped pushes (both `sync/mod.rs` call
     sites, both `resolve.rs` round-tripped call sites) never emit
     `--force`, `--force-with-lease`, or a `+`-prefixed refspec; a
     mirror-only source→dest push is permitted to use

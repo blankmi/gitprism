@@ -12,7 +12,7 @@ generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
 [decisions/0036](0036-branch-additive-exclusions.md)'s Context diagnoses a real
 disclosure path and is not repeated here: [decisions/0026](0026-protected-versioned-policy.md)
 loads one verified `ExcludeList` from the working tree per `sync` run, never a
-branch-tip version (`src/commands/sync.rs::run`, ~lines 101-103); a feature
+branch-tip version (`src/commands/sync/mod.rs::run`, ~lines 142-144); a feature
 branch that adds sensitive content and correctly adds its own
 `.gitprismignore` entry excluding it has that instruction discarded, and per
 `design/log.md`'s still-open "a file that already reached dest and is later
@@ -49,7 +49,7 @@ Source→dest replay compares, per pending commit, the exact bytes of that
 commit's tree entry for `.gitprismignore` and `.gitprism.toml` against the
 corresponding bytes of `VerifiedPolicy.ignore_raw`/`config_raw` — the same
 digest-pinned bytes decisions/0026 already verifies and loads once in
-`sync::run` (~lines 101-103) before either sync phase starts. `run` currently
+`sync::run` (~lines 142-144) before either sync phase starts. `run` currently
 only binds `verified_policy.config`/`.exclude_list` out of that struct;
 `config_raw`/`ignore_raw` remain on `verified_policy` unconsumed and must also
 be threaded into `sync_pair_to_dest_with_key`.
@@ -140,11 +140,11 @@ channels, not just the one a human happens to be watching.
 convert the leak into a branch silently never mirrored: a branch whose entire
 remaining content becomes covered by its own new exclusions filters to a
 no-op against a landing branch, so `already_merged_into_a_landing_branch`
-(`src/commands/sync.rs`, ~line 641) classifies it as
+(`src/commands/sync/mod.rs`, ~line 1042) classifies it as
 already-merged-and-cleaned-up and it is never created on dest at all — the
 disclosure moves rather than closes. Fail-closed does not have that side
 effect: `already_merged_into_a_landing_branch` is untouched by this decision
-— confirmed by reading it, ~line 641 — since no filtering behavior changes at
+— confirmed by reading it, ~line 1042 — since no filtering behavior changes at
 all. A branch's filtered content is exactly what it is today; a mismatching
 branch produces an explicit, named, operator-facing halt instead of vanishing
 into a benign-looking skip. This is a real advantage of fail-closed over
@@ -197,7 +197,7 @@ one.
   `ExcludeList` parameter and reads no control file at all; nothing about
   this decision touches it.
 * **`already_merged_into_a_landing_branch` is unchanged**, verified by
-  reading it (`src/commands/sync.rs`, ~line 641) — it still filters all three
+  reading it (`src/commands/sync/mod.rs`, ~line 1042) — it still filters all three
   trees through the one verified `exclude_list` exactly as decisions/0018's
   addendum specifies. This decision adds a check that runs before/alongside
   replay, not a change to what gets filtered or how "already merged" is
@@ -234,7 +234,7 @@ reads the same absence, under the new `AGENTS.md` rule, as the reason not to.
 
 # Addendum: an unreadable control-file entry is that branch's mismatch, not the whole run's
 
-`read_control_file_blob` (`src/commands/sync.rs`) originally only handled two
+`read_control_file_blob` (now `src/commands/sync/policy_check.rs`) originally only handled two
 outcomes for a tree entry: absent, or a blob whose bytes it returned for
 comparison. A pending commit whose `.gitprismignore`/`.gitprism.toml` entry
 was a directory or a submodule gitlink made `repo.find_blob` fail, and a blob
@@ -263,7 +263,7 @@ unaffected — still not a mismatch.
 
 A repository review (finding F-03) found this decision's halt enforced in
 exactly one place: `sync_pair_to_dest_with_key`'s call to
-`find_control_file_policy_mismatch` (`src/commands/sync.rs`), before
+`find_control_file_policy_mismatch` (now `src/commands/sync/policy_check.rs`), before
 `build_pending_dest_tip` builds or pushes anything. `gitprism resolve
 --direction source-to-dest`'s `start_source_to_dest`
 (`src/commands/resolve.rs`) recomputes the identical pending list
@@ -289,7 +289,7 @@ this decision were written to close, via a command documented as
 ## Decision
 
 `find_control_file_policy_mismatch` and `policy_mismatch_message`
-(`src/commands/sync.rs`) become `pub(crate)` — no behavior change, only
+(now `src/commands/sync/policy_check.rs`) become `pub(crate)` — no behavior change, only
 visibility, so `resolve.rs` reports the identical halt in the identical
 words `sync` already uses, rather than a second implementation that could
 drift from it.
