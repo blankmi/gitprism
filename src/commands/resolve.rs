@@ -1527,6 +1527,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_state_file_accepts_a_file_at_the_byte_limit_but_rejects_one_byte_over() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let at_limit = dir.path().join("at-limit");
+        std::fs::write(&at_limit, vec![b'a'; limits::MAX_STATE_FILE_BYTES]).unwrap();
+        let content = read_state_file(&at_limit, "state")
+            .expect("a state file exactly at the byte limit must still be accepted");
+        assert_eq!(content.len(), limits::MAX_STATE_FILE_BYTES);
+
+        let over_limit = dir.path().join("over-limit");
+        std::fs::write(&over_limit, vec![b'a'; limits::MAX_STATE_FILE_BYTES + 1]).unwrap();
+        let error = read_state_file(&over_limit, "state")
+            .expect_err("one byte over the state-file limit must be rejected");
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    /// A single conflict-stage index entry at `path`, added directly rather
+    /// than through a real merge — the cheapest way to synthesize the
+    /// record counts/path-byte volumes `conflicted_paths`'s own limits
+    /// (`MAX_CONFLICT_RECORDS`, `MAX_CONFLICT_PATH_BYTES`) need to actually
+    /// trip, without a fixture with that many genuinely conflicting files.
+    fn add_conflict_stage_entry(index: &mut git2::Index, blob: git2::Oid, path: Vec<u8>) {
+        use git2::{IndexEntry, IndexTime};
+
+        index
+            .add(&IndexEntry {
+                ctime: IndexTime::new(0, 0),
+                mtime: IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: blob,
+                flags: 1u16 << 12, // stage 1 ("ancestor")
+                flags_extended: 0,
+                path,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn conflicted_paths_accepts_the_record_limit_but_rejects_one_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        let mut index = repo.index().unwrap();
+
+        for i in 0..limits::MAX_CONFLICT_RECORDS {
+            add_conflict_stage_entry(
+                &mut index,
+                blob,
+                format!("conflict-{i:07}.txt").into_bytes(),
+            );
+        }
+        index.write().unwrap();
+        let paths = conflicted_paths(&repo)
+            .expect("exactly the conflict-record limit must still be accepted");
+        assert_eq!(paths.len(), limits::MAX_CONFLICT_RECORDS);
+
+        add_conflict_stage_entry(&mut index, blob, b"one-more.txt".to_vec());
+        index.write().unwrap();
+        let error = conflicted_paths(&repo)
+            .expect_err("one more than the conflict-record limit must be rejected");
+        assert!(error.to_string().contains("record limit"));
+    }
+
+    /// A distinct path, exactly `length` bytes long, for the path-byte-limit
+    /// test below. Many moderate-length paths summing to the limit, rather
+    /// than one path anywhere near it: a single index entry with a path in
+    /// the megabyte range trips an unrelated libgit2 index-writer limitation
+    /// (confirmed empirically — `Index::write` fails with a spurious "object
+    /// not found" once a single entry's path passes roughly 8KB), which has
+    /// nothing to do with gitprism's own limit and isn't something gitprism's
+    /// production code ever constructs; many short, distinct paths avoid it
+    /// while still exercising the exact same cumulative-byte check.
+    fn fixed_length_conflict_path(index: usize, length: usize) -> Vec<u8> {
+        let mut path = format!("{index:06}-").into_bytes();
+        assert!(path.len() <= length, "index prefix must fit in `length`");
+        path.resize(length, b'a');
+        path
+    }
+
+    #[test]
+    fn conflicted_paths_accepts_the_path_byte_limit_but_rejects_one_byte_more() {
+        const PER_ENTRY_BYTES: usize = 4096;
+        assert_eq!(limits::MAX_CONFLICT_PATH_BYTES % PER_ENTRY_BYTES, 0);
+        let entries_at_limit = limits::MAX_CONFLICT_PATH_BYTES / PER_ENTRY_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        let mut index = repo.index().unwrap();
+        for i in 0..entries_at_limit {
+            add_conflict_stage_entry(
+                &mut index,
+                blob,
+                fixed_length_conflict_path(i, PER_ENTRY_BYTES),
+            );
+        }
+        index.write().unwrap();
+        let paths = conflicted_paths(&repo)
+            .expect("cumulative path bytes exactly at the limit must still be accepted");
+        assert_eq!(paths.len(), entries_at_limit);
+
+        // One more single-byte path tips the cumulative total one byte past
+        // the limit.
+        add_conflict_stage_entry(&mut index, blob, b"z".to_vec());
+        index.write().unwrap();
+        let error = conflicted_paths(&repo)
+            .expect_err("one byte over the cumulative path-byte limit must be rejected");
+        assert!(error.to_string().contains("byte limit"));
+    }
+
     fn bare_repo_with_a_commit_on(dir: &Path, branch: &str, files: &[(&str, &str)]) -> Oid {
         let repo = Repository::init_bare(dir).unwrap();
         let mut builder = repo.treebuilder(None).unwrap();

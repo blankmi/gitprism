@@ -2410,6 +2410,62 @@ mod tests {
         assert_eq!(path.as_os_str().as_bytes(), b"bad\xff");
     }
 
+    // The four tests below cover the `#[cfg(windows)]` arms of
+    // `path_from_git_bytes` and `subprocess_path`, mirroring the `cfg(unix)`
+    // tests' structure above. They only compile on a Windows target and were
+    // NOT executed anywhere in developing this change (this machine is
+    // darwin) — verified by careful reading of the windows code paths only,
+    // not by a real run.
+
+    #[cfg(windows)]
+    #[test]
+    fn path_from_git_bytes_round_trips_utf8_paths() {
+        let path = path_from_git_bytes("café.txt".as_bytes())
+            .expect("valid UTF-8 bytes must convert to a path on Windows");
+        assert_eq!(path, Path::new("café.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_from_git_bytes_rejects_invalid_utf8_on_windows() {
+        let error = path_from_git_bytes(b"bad\xff")
+            .expect_err("non-UTF-8 git path bytes have no Windows-native representation");
+        let message = error.to_string();
+        assert!(
+            message.contains("is not valid UTF-8"),
+            "expected a UTF-8 rejection message, got: {message}"
+        );
+        assert!(
+            message.contains("bad\\xFF"),
+            "the offending bytes must be shown escaped, got: {message}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subprocess_path_strips_the_verbatim_prefix_for_msys_git() {
+        assert_eq!(
+            subprocess_path(Path::new(r"\\?\C:\Users\test\repo")),
+            PathBuf::from(r"C:\Users\test\repo")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subprocess_path_strips_the_verbatim_unc_prefix_for_msys_git() {
+        assert_eq!(
+            subprocess_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subprocess_path_leaves_an_ordinary_path_unchanged() {
+        let path = Path::new(r"C:\Users\test\repo");
+        assert_eq!(subprocess_path(path), path.to_path_buf());
+    }
+
     #[test]
     fn ensure_merge_tree_supported_accepts_the_git_on_this_machine() {
         ensure_merge_tree_supported().expect("the git on this dev/CI machine must be new enough");
