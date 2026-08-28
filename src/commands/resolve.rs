@@ -33,10 +33,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
+use crate::commands::sync::anchor::dest_resume_point_for_branch;
+use crate::commands::sync::filter::filter_tree;
+use crate::commands::sync::policy_check::{
+    find_control_file_policy_mismatch, policy_mismatch_message,
+};
 use crate::commands::sync::{
-    build_dest_commit, build_source_commit, dest_resume_point_for_branch, filter_tree,
-    find_control_file_policy_mismatch, pending_commits, pending_dest_commits,
-    policy_mismatch_message,
+    build_dest_commit, build_source_commit, pending_commits, pending_dest_commits,
 };
 use crate::config::Config;
 use crate::exclude;
