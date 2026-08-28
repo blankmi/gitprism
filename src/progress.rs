@@ -100,8 +100,22 @@ fn branch_color(round_tripped: bool) -> Option<Color> {
 /// {message}")` call sites, since a step-in-progress message never had a
 /// colored/split form to begin with (only completed lines do — decisions/0020
 /// point 6 is scoped to those).
+///
+/// `branch` is repository-controlled (any name `git check-ref-format`
+/// accepts) and escaped before it ever reaches this format string —
+/// `git check-ref-format` allows C1 controls and Unicode line/paragraph
+/// separators that would otherwise forge terminal output or split a log
+/// line (F-09).
 fn plain_step_line(branch: &str, message: &str) -> String {
-    format!("{branch}: {message}")
+    format!("{}: {message}", escape_branch(branch))
+}
+
+/// The single point every [`Reporter`]-printed line escapes a
+/// repository-controlled branch name through before formatting — reuses
+/// [`crate::git::escape_bytes`] rather than reimplementing its control/
+/// format-character handling.
+fn escape_branch(branch: &str) -> String {
+    crate::git::escape_bytes(branch.as_bytes())
 }
 
 /// The default terminal width `Reporter::step` assumes when the real width
@@ -126,10 +140,14 @@ fn max_branch_len(term_width: u16) -> usize {
 /// Shortens `branch` to at most `max_len` characters, replacing the tail with
 /// a single `…` when it doesn't fit — used only for the pinned bar's one-line
 /// step message, which (unlike the completed lines above it) can't wrap
-/// without visually corrupting the bar.
+/// without visually corrupting the bar. Escapes `branch` first (F-09) — both
+/// of this function's callers ([`tty_step_message`] directly,
+/// [`colored_complete_lines`] via [`pad_branch`]) print the result straight
+/// to the terminal via `Display`.
 fn truncate_branch(branch: &str, max_len: usize) -> String {
+    let branch = escape_branch(branch);
     if branch.chars().count() <= max_len {
-        return branch.to_string();
+        return branch;
     }
     let head: String = branch.chars().take(max_len.saturating_sub(1)).collect();
     format!("{head}…")
@@ -225,6 +243,7 @@ fn plain_complete_line(
     direction: Direction,
     note: Option<&str>,
 ) -> String {
+    let branch = escape_branch(branch);
     match note {
         Some(note) => format!(
             "{branch}: {} ({}) — {note}",
@@ -437,6 +456,13 @@ mod tests {
     }
 
     #[test]
+    fn plain_step_line_escapes_a_c1_control_in_the_branch_name() {
+        let line = plain_step_line("feature/\u{9b}pwn", "fetching dest");
+        assert!(!line.contains('\u{9b}'), "escaped: {line:?}");
+        assert!(line.contains("\\x9B"));
+    }
+
+    #[test]
     fn tty_step_message_names_the_direction_not_just_the_branch() {
         assert_eq!(
             tty_step_message(
@@ -513,6 +539,28 @@ mod tests {
     }
 
     #[test]
+    fn truncate_branch_escapes_a_c1_control_character() {
+        let branch = "feature/\u{9b}pwn";
+        let truncated = truncate_branch(branch, 30);
+        assert!(
+            !truncated.contains('\u{9b}'),
+            "a raw CSI byte must never reach the terminal: {truncated:?}"
+        );
+        assert!(truncated.contains("\\x9B"));
+    }
+
+    #[test]
+    fn truncate_branch_escapes_a_line_separator_character() {
+        let branch = "feature/\u{2028}pwn";
+        let truncated = truncate_branch(branch, 30);
+        assert!(
+            !truncated.contains('\u{2028}'),
+            "a raw U+2028 line separator must never reach the terminal: {truncated:?}"
+        );
+        assert!(truncated.contains("\\u{2028}"));
+    }
+
+    #[test]
     fn truncate_branch_shortens_long_names_with_an_ellipsis() {
         let long = "feature/this-is-a-very-long-branch-name-that-goes-on-and-on";
         let truncated = truncate_branch(long, 20);
@@ -570,6 +618,18 @@ mod tests {
     }
 
     #[test]
+    fn plain_complete_line_escapes_a_line_separator_in_the_branch_name() {
+        let line = plain_complete_line(
+            Outcome::Done,
+            "feature/\u{2028}pwn",
+            Direction::SourceToDest,
+            None,
+        );
+        assert!(!line.contains('\u{2028}'), "escaped: {line:?}");
+        assert!(line.contains("\\u{2028}"));
+    }
+
+    #[test]
     fn plain_complete_line_names_warning_as_its_own_label_not_skipped() {
         assert_eq!(
             plain_complete_line(Outcome::Warning, "ai-setup", Direction::SourceToDest, None),
@@ -614,6 +674,47 @@ mod tests {
             "the full branch name must not appear once truncated: {lines:?}"
         );
         assert!(lines[0].contains('…'));
+    }
+
+    #[test]
+    fn colored_complete_lines_escapes_a_c1_control_and_a_line_separator_in_the_branch_name() {
+        let lines = colored_complete_lines(
+            Outcome::Done,
+            "feature/\u{9b}pwn",
+            Direction::SourceToDest,
+            false,
+            None,
+            false,
+            30,
+        );
+        assert!(!lines[0].contains('\u{9b}'), "escaped: {lines:?}");
+        assert!(lines[0].contains("\\x9B"));
+
+        let lines = colored_complete_lines(
+            Outcome::Done,
+            "feature/\u{2028}pwn",
+            Direction::SourceToDest,
+            false,
+            None,
+            false,
+            30,
+        );
+        assert!(!lines[0].contains('\u{2028}'), "escaped: {lines:?}");
+        assert!(lines[0].contains("\\u{2028}"));
+    }
+
+    #[test]
+    fn colored_complete_lines_leaves_a_plain_ascii_branch_name_unchanged() {
+        let lines = colored_complete_lines(
+            Outcome::Done,
+            "feature/plain-name",
+            Direction::SourceToDest,
+            false,
+            None,
+            false,
+            30,
+        );
+        assert!(lines[0].contains("feature/plain-name"));
     }
 
     #[test]

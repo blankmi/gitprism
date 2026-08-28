@@ -55,6 +55,22 @@ fn git_command() -> Command {
     command.env_remove("GITPRISM_STATE_KEY");
     command.env_remove("GITPRISM_SOURCE_URL");
     command.env_remove("GITPRISM_DEST_URL");
+    // A remote URL only ever reaches configured-remote-shaped `-C repo_dir
+    // fetch/ls-remote/push -- url ...` call sites; `git`'s own `ext::`/`fd::`
+    // transports are already refused by its default `protocol.allow`, but
+    // that default is ambient user/system config, not something gitprism
+    // controls. Pin it here so a policy-approved malicious URL can't gain an
+    // `ext::`/`fd::` transport through an operator's own git config either
+    // (an explicit `protocol.<name>.allow=always` in that config still wins,
+    // same as it would for a real `git` invocation — this closes the
+    // implicit-default gap, not that one). A local path as the configured
+    // remote (this crate's own test suite's primary fixture shape, and a
+    // legitimate deployment shape gitprism itself never rejects) uses the
+    // `file` transport, which shares `ext`'s "ambient user config" default
+    // policy — allow it back explicitly so this hardening doesn't silently
+    // disable a supported remote shape.
+    command.env("GIT_PROTOCOL_FROM_USER", "0");
+    command.arg("-c").arg("protocol.file.allow=always");
     // The repo we operate on (via -C) may be a CI checkout whose .git/config
     // sets credential.interactive=false/never (GitLab Runner does this on its
     // own clones to avoid hangs). That setting makes git refuse to invoke
@@ -118,7 +134,7 @@ fn append_escaped_text(output: &mut String, text: &str) {
     for character in text.chars() {
         match character {
             '\\' => output.push_str("\\\\"),
-            character if character.is_control() => {
+            character if character.is_control() || is_forging_risk(character) => {
                 if (character as u32) <= 0xFF {
                     let _ = write!(output, "\\x{:02X}", character as u32);
                 } else {
@@ -128,6 +144,32 @@ fn append_escaped_text(output: &mut String, text: &str) {
             character => output.push(character),
         }
     }
+}
+
+/// Unicode separator (Zl/Zp) and format (Cf) characters `char::is_control`
+/// does not cover (it's exactly the Cc category, which already includes the
+/// C1 controls U+0080-U+009F) — a terminal or a log line can still be split,
+/// reordered, or hidden by these even though `git check-ref-format` permits
+/// them in a branch name. Scoped to the characters with real spoofing value
+/// (line/paragraph separators, zero-width and bidi-override/isolate
+/// controls, the BOM); the full Cf category also contains obscure
+/// deprecated-annotation and musical-notation codepoints not enumerated
+/// here.
+fn is_forging_risk(character: char) -> bool {
+    matches!(character as u32,
+        0x2028 | 0x2029 // Zl, Zp: LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | 0x00AD // Cf: SOFT HYPHEN
+        | 0x0600..=0x0605 | 0x06DD | 0x070F | 0x08E2 // Cf: Arabic number/format signs
+        | 0x180E // Cf: MONGOLIAN VOWEL SEPARATOR
+        | 0x200B..=0x200F // Cf: zero-width space/non-joiner/joiner, LRM, RLM
+        | 0x202A..=0x202E // Cf: bidi embedding/override controls
+        | 0x2060..=0x2064 // Cf: word joiner, invisible operators
+        | 0x2066..=0x206F // Cf: bidi isolates, other format controls
+        | 0xFEFF // Cf: BOM / zero-width no-break space
+        | 0xFFF9..=0xFFFB // Cf: interlinear annotation controls
+        | 0x1D173..=0x1D17A // Cf: musical notation format controls
+        | 0xE0001 | 0xE0020..=0xE007F // Cf: language tag / tag characters
+    )
 }
 
 /// Convert Git path bytes to a native path without calling git2's Windows
@@ -2114,6 +2156,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn git_commands_refuse_ext_and_fd_transports_independent_of_user_config() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_PROTOCOL_FROM_USER")),
+            Some(&Some(std::ffi::OsStr::new("0"))),
+            "GIT_PROTOCOL_FROM_USER=0 must be set on every git invocation so \
+             ext::/fd:: transports are refused regardless of the operator's \
+             own protocol.allow config"
+        );
+    }
+
     /// A tree built directly via `repo.treebuilder`, no commit needed — the
     /// point of testing `merge_tree` against raw tree oids (decisions/0016).
     fn tree_with(repo: &Repository, files: &[(&str, &str)]) -> git2::Oid {
@@ -2263,6 +2319,39 @@ mod tests {
             "line\\x0A\\x09esc\\x1B\\\\"
         );
         assert_eq!(escape_bytes(b"bad\xff\xfe"), "bad\\xFF\\xFE");
+    }
+
+    #[test]
+    fn escape_bytes_escapes_c1_controls_and_line_paragraph_separators() {
+        // U+009B CSI is a C1 control (already covered by `char::is_control`,
+        // Cc) — `git check-ref-format` permits it in a branch name.
+        assert_eq!(
+            escape_bytes("caf\u{9b}e".as_bytes()),
+            "caf\\x9Be",
+            "a C1 control (e.g. CSI) must not reach the terminal raw"
+        );
+        // U+2028/U+2029 (Zl/Zp) are not Cc, so `char::is_control` alone
+        // wouldn't catch them.
+        assert_eq!(
+            escape_bytes("line1\u{2028}line2".as_bytes()),
+            "line1\\u{2028}line2"
+        );
+        assert_eq!(escape_bytes("a\u{2029}b".as_bytes()), "a\\u{2029}b");
+    }
+
+    #[test]
+    fn escape_bytes_escapes_bidi_override_and_zero_width_format_characters() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE and U+200B ZERO WIDTH SPACE are both
+        // Cf (format), not Cc — real terminal-spoofing vectors in a branch
+        // name that `git check-ref-format` still permits.
+        assert_eq!(escape_bytes("a\u{202e}b".as_bytes()), "a\\u{202E}b");
+        assert_eq!(escape_bytes("a\u{200b}b".as_bytes()), "a\\u{200B}b");
+    }
+
+    #[test]
+    fn escape_bytes_leaves_plain_ascii_and_ordinary_unicode_unchanged() {
+        assert_eq!(escape_bytes(b"feature/my-branch"), "feature/my-branch");
+        assert_eq!(escape_bytes("héllo".as_bytes()), "héllo");
     }
 
     #[cfg(unix)]
