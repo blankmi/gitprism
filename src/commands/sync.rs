@@ -5604,7 +5604,9 @@ mod tests {
         )
         .into_bytes();
         commit.extend_from_slice(message);
-        let mut child = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::git::isolate_test_git_command(&mut command);
+        let mut child = command
             .current_dir(repo.workdir().unwrap())
             .arg("hash-object")
             .arg("-t")

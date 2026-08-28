@@ -68,7 +68,36 @@ fn git_command() -> Command {
     // on for our own invocations, overriding whatever the ambient repo config
     // says -- command-line -c takes precedence over any file-level config.
     command.arg("-c").arg("credential.interactive=true");
+    #[cfg(test)]
+    isolate_test_git_command(&mut command);
     command
+}
+
+/// Test isolation, not a production concern: every subprocess `git`
+/// invocation in the test suite is pointed at an empty global config with
+/// system config disabled, so tests never read the developer's or CI
+/// runner's real `~/.gitconfig`/`/etc/gitconfig`. The empty config file is
+/// created once per test binary and shared by every test via `OnceLock`
+/// rather than per-test, since it's never written to.
+#[cfg(test)]
+static TEST_GIT_CONFIG_GLOBAL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn isolate_test_git_command(command: &mut Command) {
+    let path = TEST_GIT_CONFIG_GLOBAL.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("gitprism-test-global-config")
+            .tempdir()
+            .expect("creating an isolated git config directory");
+        let path = dir.path().join("gitconfig");
+        std::fs::write(&path, b"").expect("creating an empty isolated global git config");
+        // Leaked deliberately: this directory must outlive every test that
+        // shares this path for the rest of the test process.
+        std::mem::forget(dir);
+        path
+    });
+    command.env("GIT_CONFIG_GLOBAL", path);
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
 fn validate_remote(url: &str) -> Result<()> {
@@ -1238,10 +1267,16 @@ mod tests {
 
     #[test]
     fn subprocess_runner_times_out_and_reaps_direct_child() {
+        // The deadline itself (well under the child's 60s sleep) is not what
+        // makes this flaky on a loaded CI runner; it's process-spawn/schedule
+        // latency for re-execing the test binary. 300ms leaves comfortable
+        // headroom for that without weakening what's asserted: the child
+        // still sleeps orders of magnitude longer than the deadline, so this
+        // still only passes if the timeout path actually fires.
         let error = run_git_output_with_timeout(
             runner_child("sleep"),
             SMALL_OUTPUT,
-            Duration::from_millis(50),
+            Duration::from_millis(300),
         )
         .unwrap_err();
         assert!(error.to_string().contains("deadline"));
@@ -2159,6 +2194,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn git_commands_are_isolated_from_the_hosts_global_and_system_git_config() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        let global = envs
+            .get(std::ffi::OsStr::new("GIT_CONFIG_GLOBAL"))
+            .and_then(|value| *value)
+            .expect("every test git invocation must pin GIT_CONFIG_GLOBAL");
+        assert_eq!(
+            std::fs::read(global).expect("the isolated global config file must exist"),
+            b"",
+            "the isolated global config must stay empty"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            Some(&Some(std::ffi::OsStr::new("1"))),
+            "system git config must be disabled for every test git invocation"
+        );
+    }
+
     /// A tree built directly via `repo.treebuilder`, no commit needed — the
     /// point of testing `merge_tree` against raw tree oids (decisions/0016).
     fn tree_with(repo: &Repository, files: &[(&str, &str)]) -> git2::Oid {
@@ -2178,7 +2234,9 @@ mod tests {
         let mut input = format!("100644 blob {blob}\t").into_bytes();
         input.extend_from_slice(path);
         input.push(0);
-        let mut child = Command::new("git")
+        let mut command = Command::new("git");
+        isolate_test_git_command(&mut command);
+        let mut child = command
             .current_dir(repo.workdir().unwrap())
             .arg("mktree")
             .arg("-z")
