@@ -6476,6 +6476,324 @@ mod tests {
     }
 
     #[test]
+    fn run_rejects_a_bare_repo_as_cwd_with_a_clear_message() {
+        let dir = tempdir().unwrap();
+        Repository::init_bare(dir.path()).unwrap();
+
+        let config = write_config("unused", "unused", &["main"]);
+        let error = run(dir.path(), config.path())
+            .expect_err("a bare repo has no working tree for sync to operate in");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a repo with a working tree, not a bare repo"),
+            "expected the bare-repo rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn run_syncs_normally_when_source_is_in_a_detached_head_state() {
+        // No code anywhere consults HEAD to decide which branch to operate
+        // on (branches are always named explicitly, from config or
+        // discovery) — this pins today's actual behavior, that a detached
+        // HEAD in the invoking repo is not special-cased at all and simply
+        // does not get in the way.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        source_repo.set_head_detached(tip).unwrap();
+        assert!(source_repo.head_detached().unwrap());
+
+        add_commit(&source_repo, "main", &[("shared.txt", "v2")]);
+        assert!(
+            source_repo.head_detached().unwrap(),
+            "committing onto the named branch ref must not itself reattach HEAD"
+        );
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path())
+            .expect("a detached HEAD in the invoking repo must not block sync");
+
+        let dest_new_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(
+            dest_new_tip.id(),
+            dest_tip,
+            "dest must still advance despite source's detached HEAD"
+        );
+    }
+
+    #[test]
+    fn run_from_a_linked_worktree_succeeds_and_locks_the_common_directory() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        add_commit(&source_repo, "main", &[("shared.txt", "v2")]);
+        let tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // A detached linked worktree (same primitive `resolve` uses,
+        // decisions/0027) rather than a new branch, so branch discovery
+        // below still sees only "main" — the point here is exercising `cwd`
+        // resolution and lock placement, not adding an incidental second
+        // branch for source→dest to mirror.
+        let worktree_dir = tempdir().unwrap();
+        git::worktree_add(source_dir.path(), worktree_dir.path(), tip).unwrap();
+
+        let common_dir = Repository::discover(worktree_dir.path())
+            .unwrap()
+            .commondir()
+            .to_path_buf();
+        assert_eq!(
+            common_dir,
+            Repository::discover(source_dir.path())
+                .unwrap()
+                .commondir()
+                .to_path_buf(),
+            "a linked worktree must share the main worktree's common directory"
+        );
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(worktree_dir.path(), config.path())
+            .expect("sync must succeed when invoked from a linked worktree");
+
+        let dest_new_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert_ne!(dest_new_tip.id(), dest_tip, "dest must still advance");
+
+        assert!(
+            common_dir.join("gitprism.lock").exists(),
+            "the operation lock must live in the shared common directory"
+        );
+    }
+
+    #[test]
+    fn run_preserves_a_registered_submodule_gitlink_through_source_to_dest_filtering() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let empty_tree = source_repo
+            .find_tree(source_repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let submodule_commit = source_repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "submodule commit",
+                &empty_tree,
+                &[],
+            )
+            .unwrap();
+
+        let tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let gitmodules_blob = source_repo
+            .blob(b"[submodule \"vendor\"]\n\tpath = vendor\n\turl = https://example.invalid/vendor.git\n")
+            .unwrap();
+        let mut builder = source_repo.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+        builder
+            .insert(".gitmodules", gitmodules_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        builder
+            .insert("vendor", submodule_commit, git2::FileMode::Commit.into())
+            .unwrap();
+        let tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "add a submodule",
+                &tree,
+                &[&tip],
+            )
+            .unwrap();
+        refresh_checked_out_branch(&source_repo, "main");
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path())
+            .expect("a submodule gitlink must pass through source→dest filtering, not fail it");
+
+        let dest_new_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let dest_tree = dest_new_tip.tree().unwrap();
+        let entry = dest_tree
+            .get_name("vendor")
+            .expect("the submodule gitlink must reach dest, not be dropped");
+        assert_eq!(
+            entry.filemode(),
+            i32::from(git2::FileMode::Commit),
+            "the gitlink's filemode (160000) must survive unchanged"
+        );
+        assert_eq!(
+            entry.id(),
+            submodule_commit,
+            "the gitlink must still point at the exact same submodule commit, \
+             proving it was copied through opaquely rather than traversed as a tree"
+        );
+    }
+
+    #[test]
+    fn run_preserves_an_unregistered_nested_repository_gitlink_without_a_gitmodules_file() {
+        // Unlike the registered-submodule test above, this tree has no
+        // `.gitmodules` at all — just a bare gitlink entry, the shape git
+        // itself produces automatically for any directory that happens to
+        // contain its own `.git` (a nested repo checked in ad hoc, not a
+        // deliberately registered submodule). gitprism's gitlink handling is
+        // a structural filemode check, not a `.gitmodules` lookup, so this
+        // must be preserved identically.
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let empty_tree = source_repo
+            .find_tree(source_repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let nested_repo_commit = source_repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "nested repo's own commit",
+                &empty_tree,
+                &[],
+            )
+            .unwrap();
+
+        let tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut builder = source_repo.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+        builder
+            .insert(
+                "nested-repo",
+                nested_repo_commit,
+                git2::FileMode::Commit.into(),
+            )
+            .unwrap();
+        let tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "add a nested checkout",
+                &tree,
+                &[&tip],
+            )
+            .unwrap();
+        refresh_checked_out_branch(&source_repo, "main");
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        run(source_dir.path(), config.path()).expect(
+            "an unregistered nested-repo gitlink must pass through filtering just like a \
+             registered submodule's, not be traversed or dropped",
+        );
+
+        let dest_new_tip = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let entry = dest_new_tip
+            .tree()
+            .unwrap()
+            .get_name("nested-repo")
+            .expect("the nested repo's gitlink must reach dest, not be dropped")
+            .to_owned();
+        assert_eq!(entry.filemode(), i32::from(git2::FileMode::Commit));
+        assert_eq!(entry.id(), nested_repo_commit);
+    }
+
+    #[test]
+    fn run_fails_clearly_against_a_completely_empty_dest_repo() {
+        // Documents today's actual behavior for a zero-commit, no-refs dest:
+        // `sync` never seeds dest itself (that's `setup`'s job), and a
+        // round-tripped branch with no ref on dest at all is reported the
+        // same way as one whose ref was deleted after a real setup —
+        // `remote_ref_exists` can't tell "never existed" apart from
+        // "existed, then vanished."
+        let dest_dir = tempdir().unwrap();
+        Repository::init_bare(dest_dir.path()).unwrap();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+        let tree = source_repo
+            .find_tree(source_repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "initial",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        source_repo.set_head("refs/heads/main").unwrap();
+        source_repo.checkout_head(None).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let error = run(source_dir.path(), config.path())
+            .expect_err("a round-tripped branch missing from a completely empty dest must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("has no ref on dest anymore"),
+            "expected the missing-dest-ref rejection, got: {message}"
+        );
+    }
+
+    #[test]
     fn list_source_branches_lists_every_local_branch_sorted() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
