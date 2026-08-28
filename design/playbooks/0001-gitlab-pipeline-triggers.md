@@ -26,6 +26,32 @@ not a secret. Keep it protected and update it deliberately whenever the
 versioned `.gitprism.toml` or root `.gitprismignore` changes. `policy-hash` is
 read-only and does not require `GITPRISM_STATE_KEY`.
 
+## Checked-out branch determines which policy is trusted
+
+`GITPRISM_POLICY_SHA256` is one static value with no per-branch dimension
+([decisions/0026](../decisions/0026-protected-versioned-policy.md)) — it's
+verified against whatever `.gitprism.toml`/`.gitprismignore` bytes are
+currently on disk in the working tree gitprism is invoked against
+([decisions/0012](../decisions/0012-config-versioned-in-source.md): "resolves
+against the checked-out source tree"), not fetched per-branch from source.
+
+With push-triggered CI checking out whatever branch was pushed, a branch
+whose `.gitprism.toml`/`.gitprismignore` differs from the branch the digest
+was pinned against fails the check — and since that verification runs before
+any branch is even looked at, this refuses the **entire** `sync` invocation
+for that run, not a per-branch halt like
+[decisions/0037](../decisions/0037-branch-policy-mismatch-fails-closed.md)'s
+`.gitprismignore` mismatch handling.
+
+Fix this in the job, not by trying to make gitprism per-branch policy-aware:
+after fetching, reset the working tree to the one branch holding the approved
+policy (e.g. `develop`) before invoking gitprism, regardless of which branch
+triggered the pipeline. Pin any branch-discovery ref (e.g. GitLab's
+`git branch -f "$CI_COMMIT_BRANCH" HEAD` workaround for its detached-HEAD
+checkout) to the pushed commit's SHA *before* switching the working tree —
+otherwise the checkout reassigns `HEAD` first and the pinned branch ref ends
+up pointing at the wrong commit.
+
 # source → dest
 
 Ordinary push-triggered GitLab CI on source's own repo. No special infrastructure:
