@@ -2299,3 +2299,7 @@ existed, not a live reference.
 ## 2026-08-28 — document the Git child environment (0031 addendum)
 
 **Update**: [decisions/0031](decisions/0031-centralized-git-process-runner.md) gained an addendum tabulating every environment variable and forced `-c` setting `git_command()` applies — the three scrubbed `GITPRISM_*` variables, `GIT_TERMINAL_PROMPT=0`, the new `GIT_PROTOCOL_FROM_USER=0` + `-c protocol.file.allow=always` pair (review F-20), `-c credential.interactive=true` (review F-16), `GIT_EDITOR=true` on cherry-pick, and the policy committer identity on commit-creating calls — plus the test-only `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM` isolation. Future overrides update that table and the README paragraph together.
+
+## 2026-08-28 — review F-15 (resolution worktree under `temp_dir()`) left as is
+
+**Decision**: Not changing the worktree location. Conflicts are never resolved on the CI runner (a conflict fails the pipeline, decisions/0007); resolution happens on a workstation and is expected to take hours, not the days a tmp-aging cleaner needs to become a factor. A swept worktree fails closed ("worktree not registered") and the state ref survives, so the worst case is redoing a short manual merge. Revisit only if resolution turnaround changes.
