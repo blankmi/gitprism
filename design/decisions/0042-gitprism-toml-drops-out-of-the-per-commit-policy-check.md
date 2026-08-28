@@ -37,7 +37,7 @@ stale `.gitprism.toml` can't leak anything by being replayed.
 
 # Decision
 
-`find_control_file_policy_mismatch` (`src/commands/sync.rs`) now compares only
+`find_control_file_policy_mismatch` (now `src/commands/sync/policy_check.rs`) now compares only
 `.gitprismignore` per pending commit. `.gitprism.toml` is removed from that
 per-commit loop entirely. It keeps exactly the check it already had —
 decisions/0026's single, global, digest-verified read before either sync phase

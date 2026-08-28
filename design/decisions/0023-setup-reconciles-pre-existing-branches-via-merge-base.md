@@ -43,9 +43,9 @@ end of that same operation — not a reason to invent a second mechanism (and
 purpose is to bypass a safety check is a foot-gun once it exists, liable to get
 reached for out of habit rather than genuine intent). [decisions/0016](0016-both-directions-merge-via-real-git-merge-tree.md)
 already gives this codebase exactly the primitive a real reconciliation needs —
-`git merge-tree --write-tree --merge-base=<base> <ours> <theirs>` — and `sync.rs`
+`git merge-tree --write-tree --merge-base=<base> <ours> <theirs>` — and `sync/mod.rs`
 already computes merge-base via git2's own `Repository::merge_base` in more than one
-place (`graft_point`, `already_merged_into_a_landing_branch`). Real prior art for the
+place (`graft_point`, now in `sync/anchor.rs`; `already_merged_into_a_landing_branch`, in `sync/mod.rs`). Real prior art for the
 *edge* this raises — two histories with literally no shared ancestor — is git's own
 `--allow-unrelated-histories` flag: proof that git itself treats "no merge-base"
 as a distinct, deliberately-gated case, not something a 3-way merge algorithm should
@@ -132,8 +132,8 @@ rather than separately-implemented) instance of the general merge-base rule.
   as an unresolvable conflict, not as something to merge through cleanly just because
   the trees happen not to overlap.
 * **No new git primitive needed.** `Repository::merge_base` is already used
-  elsewhere in this codebase (`sync.rs`'s `graft_point`,
-  `already_merged_into_a_landing_branch`) for exactly this "do these share history"
+  elsewhere in this codebase (`sync/anchor.rs`'s `graft_point`,
+  `sync/mod.rs`'s `already_merged_into_a_landing_branch`) for exactly this "do these share history"
   question; `merge_tree` is already 0016's shared mechanism for both sync
   directions. This decision only wires existing primitives into `setup`, rather
   than introducing a new one.

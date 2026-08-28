@@ -19,7 +19,7 @@ the two functions with the actual bug." That statement about
 `pending_commits` is correct as far as it goes, but it leaves a second,
 distinct bug in place that this decision now closes.
 
-`pending_commits` (`src/commands/sync.rs`, around line 875) walks the
+`pending_commits` (now `src/commands/sync/mod.rs`, around line 875 at the time) walks the
 complete DAG between `boundary` and `tip`: `revwalk.push(tip)`,
 `revwalk.hide(boundary)`, `Sort::TOPOLOGICAL | Sort::REVERSE`. For a merge
 commit reachable in that range, it emits the merge's own side-branch
@@ -65,7 +65,7 @@ shape that actually reproduces the bug.
 
 `design/log.md` (the entry documenting decisions/0016) states that
 decision made the interleaved-branch churn "disappear". It didn't, fully:
-the test comment at `src/commands/sync.rs`, in
+the test comment at (now) `src/commands/sync/tests/source_to_dest.rs`, in
 `run_carries_a_merge_of_two_diverged_source_branches_to_dest_exactly_once`,
 still records
 that "whichever branch the revwalk ... emits second yields a dest commit
@@ -85,7 +85,7 @@ set in the first place.
 # Decision
 
 `pending_commits` calls `revwalk.simplify_first_parent()`, mirroring the
-idiom already used at `src/commands/sync.rs` lines ~1583 and ~1694
+idiom already used at `src/commands/sync.rs` (at the time; now split across `sync/marker_scan.rs` and `sync/anchor.rs`) lines ~1583 and ~1694
 (decisions/0019). Because both sync directions share `pending_commits`,
 one change covers source→dest and dest→source alike. A merge commit is
 now carried through the apply step as a single net change against its

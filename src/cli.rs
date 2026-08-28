@@ -113,4 +113,77 @@ mod tests {
         };
         assert_eq!(direction, ResolveDirection::SourceToDest);
     }
+
+    #[test]
+    fn setup_is_a_recognized_subcommand_with_no_arguments_of_its_own() {
+        let cli = Cli::try_parse_from(["gitprism", "setup"]).unwrap();
+        assert!(matches!(cli.command, Commands::Setup));
+    }
+
+    #[test]
+    fn sync_is_a_recognized_subcommand_with_no_arguments_of_its_own() {
+        let cli = Cli::try_parse_from(["gitprism", "sync"]).unwrap();
+        assert!(matches!(cli.command, Commands::Sync));
+    }
+
+    #[test]
+    fn resolve_dispatches_with_its_branch_direction_and_continue_flag() {
+        let cli = Cli::try_parse_from([
+            "gitprism",
+            "resolve",
+            "feature",
+            "--direction",
+            "source-to-dest",
+            "--continue",
+        ])
+        .unwrap();
+        let Commands::Resolve {
+            branch,
+            direction,
+            r#continue,
+        } = cli.command
+        else {
+            panic!("expected resolve command");
+        };
+        assert_eq!(branch, "feature");
+        assert_eq!(direction, ResolveDirection::SourceToDest);
+        assert!(r#continue);
+    }
+
+    #[test]
+    fn resolve_continue_defaults_to_false() {
+        let cli = Cli::try_parse_from(["gitprism", "resolve", "main"]).unwrap();
+        let Commands::Resolve { r#continue, .. } = cli.command else {
+            panic!("expected resolve command");
+        };
+        assert!(!r#continue);
+    }
+
+    #[test]
+    fn resolve_continue_without_a_branch_is_rejected() {
+        // `--continue` never substitutes for the required positional
+        // `branch` argument — there's no reasonable default to resume
+        // "whichever branch," so this must fail to parse rather than pick
+        // one.
+        let error = Cli::try_parse_from(["gitprism", "resolve", "--continue"])
+            .expect_err("--continue must not make the branch argument optional");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_an_unknown_direction_value() {
+        let error = Cli::try_parse_from(["gitprism", "resolve", "main", "--direction", "sideways"])
+            .expect_err("an unrecognized --direction value must not silently pick a default");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_rejected() {
+        let error = Cli::try_parse_from(["gitprism", "frobnicate"])
+            .expect_err("an unrecognized subcommand must not be silently accepted");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
 }

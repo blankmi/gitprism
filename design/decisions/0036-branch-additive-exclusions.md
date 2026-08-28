@@ -12,7 +12,7 @@ generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
 [decisions/0026](0026-protected-versioned-policy.md) states plainly: "One
 `sync` invocation uses one verified `ExcludeList` for every source-to-dest
 branch. It does not load branch-tip versions of the ignore file." Confirmed
-in `src/commands/sync.rs::run` (~lines 101-103): `verified_policy.exclude_list`
+in `src/commands/sync/mod.rs::run` (~lines 142-144): `verified_policy.exclude_list`
 is loaded once, from the working tree, before either sync phase starts, and
 the same `ExcludeList` value is passed into every branch's
 `sync_pair_to_dest_with_key` call.
@@ -122,7 +122,7 @@ behind the digest would reintroduce the disclosure this decision closes.
   branch can add its own exclusions, a branch whose entire content is
   covered by those new exclusions filters to a no-op against a landing
   branch's tree. `already_merged_into_a_landing_branch`
-  (`src/commands/sync.rs`, ~line 641) then finds the filtered trees equal
+  (`src/commands/sync/mod.rs`, ~line 1042) then finds the filtered trees equal
   and classifies the branch as already-merged-and-cleaned-up (decisions/0018,
   Case 2), so it is never created on dest at all. This moves the failure
   mode rather than removing it: the same branch that leaks today becomes a
@@ -143,7 +143,7 @@ behind the digest would reintroduce the disclosure this decision closes.
 * **Implementation shape.** `ExcludeList` (`src/exclude.rs`) gains the
   ability to hold more than one matcher; `is_excluded` returns true if *any*
   held matcher excludes the path. Every existing `filter_tree` call site
-  (`src/commands/sync.rs`) is unchanged — each already just calls
+  (now `src/commands/sync/filter.rs`) is unchanged — each already just calls
   `exclude_list.is_excluded`.
 * **Control-file self-exclusion is unchanged.** `.gitprismignore` and
   `.gitprism.toml` remain unconditionally and un-negatably excluded

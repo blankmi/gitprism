@@ -55,6 +55,11 @@ fn git_command() -> Command {
     command.env_remove("GITPRISM_STATE_KEY");
     command.env_remove("GITPRISM_SOURCE_URL");
     command.env_remove("GITPRISM_DEST_URL");
+    // Refuse `ext::`/`fd::` transports independent of ambient protocol.allow
+    // config. `file` shares the same "user" default and is a supported remote
+    // shape, so it is allowed back explicitly.
+    command.env("GIT_PROTOCOL_FROM_USER", "0");
+    command.arg("-c").arg("protocol.file.allow=always");
     // The repo we operate on (via -C) may be a CI checkout whose .git/config
     // sets credential.interactive=false/never (GitLab Runner does this on its
     // own clones to avoid hangs). That setting makes git refuse to invoke
@@ -63,7 +68,36 @@ fn git_command() -> Command {
     // on for our own invocations, overriding whatever the ambient repo config
     // says -- command-line -c takes precedence over any file-level config.
     command.arg("-c").arg("credential.interactive=true");
+    #[cfg(test)]
+    isolate_test_git_command(&mut command);
     command
+}
+
+/// Test isolation, not a production concern: every subprocess `git`
+/// invocation in the test suite is pointed at an empty global config with
+/// system config disabled, so tests never read the developer's or CI
+/// runner's real `~/.gitconfig`/`/etc/gitconfig`. The empty config file is
+/// created once per test binary and shared by every test via `OnceLock`
+/// rather than per-test, since it's never written to.
+#[cfg(test)]
+static TEST_GIT_CONFIG_GLOBAL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn isolate_test_git_command(command: &mut Command) {
+    let path = TEST_GIT_CONFIG_GLOBAL.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("gitprism-test-global-config")
+            .tempdir()
+            .expect("creating an isolated git config directory");
+        let path = dir.path().join("gitconfig");
+        std::fs::write(&path, b"").expect("creating an empty isolated global git config");
+        // Leaked deliberately: this directory must outlive every test that
+        // shares this path for the rest of the test process.
+        std::mem::forget(dir);
+        path
+    });
+    command.env("GIT_CONFIG_GLOBAL", path);
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
 fn validate_remote(url: &str) -> Result<()> {
@@ -118,7 +152,7 @@ fn append_escaped_text(output: &mut String, text: &str) {
     for character in text.chars() {
         match character {
             '\\' => output.push_str("\\\\"),
-            character if character.is_control() => {
+            character if character.is_control() || is_forging_risk(character) => {
                 if (character as u32) <= 0xFF {
                     let _ = write!(output, "\\x{:02X}", character as u32);
                 } else {
@@ -128,6 +162,32 @@ fn append_escaped_text(output: &mut String, text: &str) {
             character => output.push(character),
         }
     }
+}
+
+/// Unicode separator (Zl/Zp) and format (Cf) characters `char::is_control`
+/// does not cover (it's exactly the Cc category, which already includes the
+/// C1 controls U+0080-U+009F) — a terminal or a log line can still be split,
+/// reordered, or hidden by these even though `git check-ref-format` permits
+/// them in a branch name. Scoped to the characters with real spoofing value
+/// (line/paragraph separators, zero-width and bidi-override/isolate
+/// controls, the BOM); the full Cf category also contains obscure
+/// deprecated-annotation and musical-notation codepoints not enumerated
+/// here.
+fn is_forging_risk(character: char) -> bool {
+    matches!(character as u32,
+        0x2028 | 0x2029 // Zl, Zp: LINE SEPARATOR, PARAGRAPH SEPARATOR
+        | 0x00AD // Cf: SOFT HYPHEN
+        | 0x0600..=0x0605 | 0x06DD | 0x070F | 0x08E2 // Cf: Arabic number/format signs
+        | 0x180E // Cf: MONGOLIAN VOWEL SEPARATOR
+        | 0x200B..=0x200F // Cf: zero-width space/non-joiner/joiner, LRM, RLM
+        | 0x202A..=0x202E // Cf: bidi embedding/override controls
+        | 0x2060..=0x2064 // Cf: word joiner, invisible operators
+        | 0x2066..=0x206F // Cf: bidi isolates, other format controls
+        | 0xFEFF // Cf: BOM / zero-width no-break space
+        | 0xFFF9..=0xFFFB // Cf: interlinear annotation controls
+        | 0x1D173..=0x1D17A // Cf: musical notation format controls
+        | 0xE0001 | 0xE0020..=0xE007F // Cf: language tag / tag characters
+    )
 }
 
 /// Convert Git path bytes to a native path without calling git2's Windows
@@ -1207,10 +1267,16 @@ mod tests {
 
     #[test]
     fn subprocess_runner_times_out_and_reaps_direct_child() {
+        // The deadline itself (well under the child's 60s sleep) is not what
+        // makes this flaky on a loaded CI runner; it's process-spawn/schedule
+        // latency for re-execing the test binary. 300ms leaves comfortable
+        // headroom for that without weakening what's asserted: the child
+        // still sleeps orders of magnitude longer than the deadline, so this
+        // still only passes if the timeout path actually fires.
         let error = run_git_output_with_timeout(
             runner_child("sleep"),
             SMALL_OUTPUT,
-            Duration::from_millis(50),
+            Duration::from_millis(300),
         )
         .unwrap_err();
         assert!(error.to_string().contains("deadline"));
@@ -2114,6 +2180,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn git_commands_refuse_ext_and_fd_transports_independent_of_user_config() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_PROTOCOL_FROM_USER")),
+            Some(&Some(std::ffi::OsStr::new("0"))),
+            "GIT_PROTOCOL_FROM_USER=0 must be set on every git invocation so \
+             ext::/fd:: transports are refused regardless of the operator's \
+             own protocol.allow config"
+        );
+    }
+
+    #[test]
+    fn git_commands_are_isolated_from_the_hosts_global_and_system_git_config() {
+        let command = git_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        let global = envs
+            .get(std::ffi::OsStr::new("GIT_CONFIG_GLOBAL"))
+            .and_then(|value| *value)
+            .expect("every test git invocation must pin GIT_CONFIG_GLOBAL");
+        assert_eq!(
+            std::fs::read(global).expect("the isolated global config file must exist"),
+            b"",
+            "the isolated global config must stay empty"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            Some(&Some(std::ffi::OsStr::new("1"))),
+            "system git config must be disabled for every test git invocation"
+        );
+    }
+
     /// A tree built directly via `repo.treebuilder`, no commit needed — the
     /// point of testing `merge_tree` against raw tree oids (decisions/0016).
     fn tree_with(repo: &Repository, files: &[(&str, &str)]) -> git2::Oid {
@@ -2133,7 +2234,9 @@ mod tests {
         let mut input = format!("100644 blob {blob}\t").into_bytes();
         input.extend_from_slice(path);
         input.push(0);
-        let mut child = Command::new("git")
+        let mut command = Command::new("git");
+        isolate_test_git_command(&mut command);
+        let mut child = command
             .current_dir(repo.workdir().unwrap())
             .arg("mktree")
             .arg("-z")
@@ -2265,6 +2368,39 @@ mod tests {
         assert_eq!(escape_bytes(b"bad\xff\xfe"), "bad\\xFF\\xFE");
     }
 
+    #[test]
+    fn escape_bytes_escapes_c1_controls_and_line_paragraph_separators() {
+        // U+009B CSI is a C1 control (already covered by `char::is_control`,
+        // Cc) — `git check-ref-format` permits it in a branch name.
+        assert_eq!(
+            escape_bytes("caf\u{9b}e".as_bytes()),
+            "caf\\x9Be",
+            "a C1 control (e.g. CSI) must not reach the terminal raw"
+        );
+        // U+2028/U+2029 (Zl/Zp) are not Cc, so `char::is_control` alone
+        // wouldn't catch them.
+        assert_eq!(
+            escape_bytes("line1\u{2028}line2".as_bytes()),
+            "line1\\u{2028}line2"
+        );
+        assert_eq!(escape_bytes("a\u{2029}b".as_bytes()), "a\\u{2029}b");
+    }
+
+    #[test]
+    fn escape_bytes_escapes_bidi_override_and_zero_width_format_characters() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE and U+200B ZERO WIDTH SPACE are both
+        // Cf (format), not Cc — real terminal-spoofing vectors in a branch
+        // name that `git check-ref-format` still permits.
+        assert_eq!(escape_bytes("a\u{202e}b".as_bytes()), "a\\u{202E}b");
+        assert_eq!(escape_bytes("a\u{200b}b".as_bytes()), "a\\u{200B}b");
+    }
+
+    #[test]
+    fn escape_bytes_leaves_plain_ascii_and_ordinary_unicode_unchanged() {
+        assert_eq!(escape_bytes(b"feature/my-branch"), "feature/my-branch");
+        assert_eq!(escape_bytes("héllo".as_bytes()), "héllo");
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_from_git_bytes_preserves_invalid_unix_path_bytes() {
@@ -2272,6 +2408,62 @@ mod tests {
 
         let path = path_from_git_bytes(b"bad\xff").expect("Unix paths preserve raw bytes");
         assert_eq!(path.as_os_str().as_bytes(), b"bad\xff");
+    }
+
+    // The four tests below cover the `#[cfg(windows)]` arms of
+    // `path_from_git_bytes` and `subprocess_path`, mirroring the `cfg(unix)`
+    // tests' structure above. They only compile on a Windows target and were
+    // NOT executed anywhere in developing this change (this machine is
+    // darwin) — verified by careful reading of the windows code paths only,
+    // not by a real run.
+
+    #[cfg(windows)]
+    #[test]
+    fn path_from_git_bytes_round_trips_utf8_paths() {
+        let path = path_from_git_bytes("café.txt".as_bytes())
+            .expect("valid UTF-8 bytes must convert to a path on Windows");
+        assert_eq!(path, Path::new("café.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_from_git_bytes_rejects_invalid_utf8_on_windows() {
+        let error = path_from_git_bytes(b"bad\xff")
+            .expect_err("non-UTF-8 git path bytes have no Windows-native representation");
+        let message = error.to_string();
+        assert!(
+            message.contains("is not valid UTF-8"),
+            "expected a UTF-8 rejection message, got: {message}"
+        );
+        assert!(
+            message.contains("bad\\xFF"),
+            "the offending bytes must be shown escaped, got: {message}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subprocess_path_strips_the_verbatim_prefix_for_msys_git() {
+        assert_eq!(
+            subprocess_path(Path::new(r"\\?\C:\Users\test\repo")),
+            PathBuf::from(r"C:\Users\test\repo")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subprocess_path_strips_the_verbatim_unc_prefix_for_msys_git() {
+        assert_eq!(
+            subprocess_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subprocess_path_leaves_an_ordinary_path_unchanged() {
+        let path = Path::new(r"C:\Users\test\repo");
+        assert_eq!(subprocess_path(path), path.to_path_buf());
     }
 
     #[test]

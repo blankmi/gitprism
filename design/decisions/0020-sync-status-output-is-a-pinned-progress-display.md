@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: Sync's status output becomes a pinned progress bar over colored, scannable branch/result lines
-description: sync's five eprintln! call sites (all in src/commands/sync.rs) are replaced with an indicatif-backed display, Gradle rich-console-style — a pinned bottom region (overall progress bar plus a current branch/step line) with every completed branch-operation printed as a permanent line above it once it finishes. Each completed line is a short colored summary (done/skipped/error in green/yellow/red; the branch name in cyan if it's round-tripped per config.branches, plain if it's a decisions/0017 mirror-only branch) with any explanatory "why" text demoted to an indented note line beneath it, Cargo's verb/noun-plus-note convention. The overall total is computed upfront — source's branch list is read once before either phase starts, not discovered mid-run — so the bar's denominator is accurate from the very first line. Falls back to today's plain sequential lines whenever stderr isn't a terminal (CI, redirected logs), the same non-interactive case design/playbooks/0001 already documents.
+description: sync's five eprintln! call sites (all in src/commands/sync.rs at the time, since split into src/commands/sync/mod.rs) are replaced with an indicatif-backed display, Gradle rich-console-style — a pinned bottom region (overall progress bar plus a current branch/step line) with every completed branch-operation printed as a permanent line above it once it finishes. Each completed line is a short colored summary (done/skipped/error in green/yellow/red; the branch name in cyan if it's round-tripped per config.branches, plain if it's a decisions/0017 mirror-only branch) with any explanatory "why" text demoted to an indented note line beneath it, Cargo's verb/noun-plus-note convention. The overall total is computed upfront — source's branch list is read once before either phase starts, not discovered mid-run — so the bar's denominator is accurate from the very first line. Falls back to today's plain sequential lines whenever stderr isn't a terminal (CI, redirected logs), the same non-interactive case design/playbooks/0001 already documents.
 tags: [ux, cli, output, sync]
 status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-18T00:00:00Z }
@@ -12,7 +12,7 @@ verified:
 # Context
 
 `sync`'s only status output today is five `eprintln!` call sites in
-`src/commands/sync.rs`, all plain sentences with no color or structure, e.g.:
+`src/commands/sync.rs` at the time (now `src/commands/sync/mod.rs`), all plain sentences with no color or structure, e.g.:
 
 ```
 main: fetching dest (finding resume point before merging from source)
@@ -82,7 +82,7 @@ Prior art checked before designing this:
 3. **Total (`n`) is computed upfront, not discovered mid-run.** Today,
    `run()` only lists source's local branches (for the source→dest phase)
    *after* the dest→source phase for `config.branches` has already finished
-   (`sync.rs:122`–`134`). That listing moves earlier — read once, before
+   (`sync/mod.rs:122`–`134` at the time). That listing moves earlier — read once, before
    either phase starts, purely to size the bar — so `n =
    config.branches.len() + <source's branch count>` is known and fixed from
    the very first line, rather than the bar's denominator jumping once
@@ -158,7 +158,7 @@ Prior art checked before designing this:
 * **New dependency**: `indicatif` (plus `console` transitively, and possibly
   as a direct dependency too for the text-styling calls that aren't part of
   a progress-bar template).
-* **All five `eprintln!` call sites in `src/commands/sync.rs` are replaced**,
+* **All five `eprintln!` call sites in `src/commands/sync.rs` (now `src/commands/sync/mod.rs`) are replaced**,
   routed through a small new formatting layer (module/function shape to be
   decided at implementation time, test-first per this project's TDD
   convention). `setup.rs` and `resolve.rs` are unaffected — they have no
@@ -169,7 +169,7 @@ Prior art checked before designing this:
   today. Still one listing, not two.
 * **Purely a presentation-layer change**: no effect on merge/push/conflict
   logic, trailers, resume semantics, or any existing regression test in
-  `sync.rs`'s `#[cfg(test)]` module — those assert on real git state (oids,
+  `sync`'s test modules (now `src/commands/sync/tests/`) — those assert on real git state (oids,
   refs, trailer contents), never on stderr text, so none of them are expected
   to need updating for this alone.
 * **CI/log-file output keeps today's plain-line shape** (Decision, point 6),

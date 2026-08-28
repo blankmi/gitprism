@@ -169,6 +169,17 @@ have a 1 MiB capture limit before their terminal-safe 8 KiB presentation
 frame. Exceeding a limit or deadline fails the operation rather than parsing
 truncated Git data.
 
+Every git subprocess also carries `-c credential.interactive=true`,
+overriding a CI checkout's own `credential.interactive=false`/`never` (GitLab
+Runner sets this on its own clones to avoid hangs), which would otherwise make
+Git refuse to invoke `GIT_ASKPASS` at all before gitprism's own credential
+helper gets a chance to run — command-line `-c` wins over that ambient
+config. It also sets `GIT_PROTOCOL_FROM_USER=0` with `-c
+protocol.file.allow=always`, so an `ext::`/`fd::`-style transport stays
+refused regardless of an operator's own `protocol.allow` config, independent
+of Git's own already-refusing default, while a local-path source/dest URL
+keeps working.
+
 ```sh
 cargo build --release
 # binary at target/release/gitprism
@@ -289,6 +300,16 @@ configuration, credential helpers, and repository hooks are still a trusted
 boundary. User-supplied `Gitprism-*` lines are stripped from generated messages
 to prevent a second trusted marker; use ordinary prose for literal
 documentation of those names.
+
+`dest → source` imports dest-authored content unfiltered: `.gitprismignore`
+only ever excludes source's own commits from reaching dest, it is never
+applied against dest's independent commits on the way back. An add/add
+conflict protects an *existing* excluded file — dest editing it in a way that
+would collide is a real conflict, not a silent overwrite — but dest can still
+introduce a brand-new file under a path source excludes entirely (a CI config
+directory, say). That file lands in source exactly as dest committed it and
+may run in source's own CI. Treat dest as capable of adding, not just
+reflecting, content in source.
 
 ## Excluding paths: `.gitprismignore`
 

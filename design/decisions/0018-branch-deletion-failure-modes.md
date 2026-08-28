@@ -14,7 +14,7 @@ verified:
 [decisions/0017](0017-source-to-dest-mirrors-every-branch.md) settled that gitprism
 never deletes a branch on either side, and explicitly deferred "what happens to a
 branch deleted on [dest]... any other deletion-adjacent edge case" as "not something
-the described workflow currently needs." Manual testing against `src/commands/sync.rs`
+the described workflow currently needs." Manual testing against `src/commands/sync.rs` (since split into `src/commands/sync/{mod,anchor,...}.rs`)
 surfaced two concrete cases of exactly that, with opposite correct answers:
 
 **Case 1 — a round-tripped branch's dest ref disappears.** `sync_pair_from_dest`
@@ -178,7 +178,7 @@ git-trim's own classification.
 
 **What was wrong.** `already_merged_into_a_landing_branch`'s three-way merge compared
 `base_tree`/`landing_tree`/`branch_tree` straight off each commit's raw, unfiltered
-source-side tree. Every other cross-side content comparison in `sync.rs` —
+source-side tree. Every other cross-side content comparison in `sync/mod.rs` —
 `build_pending_dest_tip` most directly, the function this one exists alongside —
 filters each tree through `filter_tree`/the current exclude-list first, because dest
 only ever sees the filtered subset of source (decisions/0004, 0011). This function
@@ -211,7 +211,7 @@ code.
 
 Regression test:
 `run_does_not_resurrect_a_mirror_only_branch_merged_except_for_excluded_paths`
-(`src/commands/sync.rs`) — same fixture shape as
+(now `src/commands/sync/tests/source_to_dest.rs`) — same fixture shape as
 `run_does_not_resurrect_a_mirror_only_branch_already_merged_and_deleted_on_dest`, with
 `.gitprismignore` on `main` excluding `secret.txt` and `feature-x`'s own commit
 touching both `feature.txt` and `secret.txt` together. Confirmed to fail against the

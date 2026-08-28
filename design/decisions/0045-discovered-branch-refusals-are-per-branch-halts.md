@@ -21,7 +21,7 @@ it merely discovered, so one such branch's problem shouldn't cost every
 other branch, including every properly configured one, its sync this run.
 
 A repository review (finding F-05) found two refusal sites in
-`sync_pair_to_dest_with_key` (`src/commands/sync.rs`) that this pattern
+`sync_pair_to_dest_with_key` (`src/commands/sync/mod.rs`) that this pattern
 missed:
 
 1. The unconditional `None => anyhow::bail!("...isn't at a point this
@@ -155,7 +155,7 @@ decisions/0043's ambiguous anchor.
   still an immediate fatal `anyhow::bail!`, still stops the run right
   there, unchanged wording.
 * `graft_point`'s signature change (`Result<Oid>` → `Result<Option<Oid>>`)
-  is internal to `src/commands/sync.rs`; both of its call sites are updated
+  is internal to `src/commands/sync.rs` at the time (`graft_point` now lives in `src/commands/sync/anchor.rs`); both of its call sites are updated
   in the same commit, no other module depends on it.
 * **Tests the implementation commit adds:** a dest-native branch sharing a
   name with a discovered source branch, genuinely no shared history — that

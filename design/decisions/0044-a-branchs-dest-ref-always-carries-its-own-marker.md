@@ -16,7 +16,7 @@ Under 0043, a discovered branch's dest anchor may be a *sibling* branch's
 own dest tip — e.g. `task`, forked from mirror-only `feature` with no
 commits of its own yet, anchors on `feature`'s own dest commit rather than
 falling back to the coarser graft. `sync_pair_to_dest_with_key`
-(`src/commands/sync.rs`) then computed the new dest tip as:
+(`src/commands/sync/mod.rs`) then computed the new dest tip as:
 
 ```rust
 let new_dest_tip = build
@@ -32,7 +32,7 @@ used verbatim as `task`'s new ref.
 That commit carries a gitprism marker for `feature`, not for `task`
 ([decisions/0003](0003-mapping-state-in-commit-trailers.md): markers are
 branch-scoped, `marker::verify` checks the branch name). On `task`'s very
-next sync, `dest_tip_accounted_for` (`src/commands/sync.rs`) checks three
+next sync, `dest_tip_accounted_for` (now `src/commands/sync/anchor.rs`) checks three
 cases for `task`'s dest tip, all against the same commit:
 
 1. Case 1 (`marker::verify(..., "task", ...)`) fails — the marker names

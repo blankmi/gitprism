@@ -13,7 +13,7 @@ verified:
 
 [decisions/0003](0003-mapping-state-in-commit-trailers.md) established
 commit-message trailers as the sole mapping/resume state, read back by two
-scans in `src/commands/sync.rs`: `newest_source_marker(repo, dest_tip)` walks
+scans in `src/commands/sync.rs` (since split; `newest_source_marker` now lives in `src/commands/sync/marker_scan.rs`): `newest_source_marker(repo, dest_tip)` walks
 dest's ancestry from `dest_tip` for the newest `Gitprism-Source-Commit`
 trailer, and `newest_dest_marker(repo, source_tip)` walks source's ancestry
 from `source_tip` for the newest `Gitprism-Dest-Commit` trailer. Both have

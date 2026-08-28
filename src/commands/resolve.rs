@@ -33,10 +33,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
+use crate::commands::sync::anchor::dest_resume_point_for_branch;
+use crate::commands::sync::filter::filter_tree;
+use crate::commands::sync::policy_check::{
+    find_control_file_policy_mismatch, policy_mismatch_message,
+};
 use crate::commands::sync::{
-    build_dest_commit, build_source_commit, dest_resume_point_for_branch, filter_tree,
-    find_control_file_policy_mismatch, pending_commits, pending_dest_commits,
-    policy_mismatch_message,
+    build_dest_commit, build_source_commit, pending_commits, pending_dest_commits,
 };
 use crate::config::Config;
 use crate::exclude;
@@ -76,14 +79,16 @@ pub fn run_with_direction(
     r#continue: bool,
     direction: Direction,
 ) -> Result<()> {
-    // Validate before fetching or changing the working tree.
-    let state_key = marker::load_key()?;
+    // Repository discovery first, so a wrong cwd reports that, not a
+    // missing/malformed state key (F-14) — both are validated before
+    // fetching or changing the working tree either way.
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism resolve must be run inside an existing git repository (none found at or above {}) — has `gitprism setup` been run?",
             cwd.display()
         )
     })?;
+    let state_key = marker::load_key()?;
     let source_root = repo
         .workdir()
         .context("gitprism resolve requires a repo with a working tree, not a bare repo")?
@@ -255,6 +260,16 @@ fn resolve_source_to_dest(
             policy_digest,
         )
     }
+}
+
+/// Deletes `refname` (the resolve state ref [`start_source_to_dest`] just
+/// created) as part of cleaning up after a failed start — named and
+/// separated out, rather than an inline closure, so a real deletion failure
+/// (e.g. an unwritable refs directory) is independently testable (F-12).
+fn delete_resolve_state_ref(repo: &Repository, refname: &str) -> Result<()> {
+    repo.find_reference(refname)
+        .and_then(|mut reference| reference.delete())
+        .with_context(|| format!("deleting resolve state ref {refname:?} during cleanup"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,26 +467,46 @@ fn start_source_to_dest(
     let refname = format!("refs/gitprism/resolve/source-to-dest/{branch}");
     repo.reference(&refname, state_commit, true, "gitprism resolve: start")?;
     if let Err(error) = reserve_resolution_worktree_path(&path) {
-        let _ = repo
-            .find_reference(&refname)
-            .and_then(|mut reference| reference.delete());
-        return Err(error);
+        let mut recovery = Vec::new();
+        if let Err(cleanup_error) = delete_resolve_state_ref(repo, &refname) {
+            recovery.push(cleanup_error);
+        }
+        return Err(crate::commands::setup::with_recovery_failures(
+            error, recovery,
+        ));
     }
     if let Err(error) = git::worktree_add(source_root, &path, state_commit) {
-        let _ = repo
-            .find_reference(&refname)
-            .and_then(|mut reference| reference.delete());
-        let _ = fs::remove_dir(&path);
-        return Err(error);
+        let mut recovery = Vec::new();
+        if let Err(cleanup_error) = delete_resolve_state_ref(repo, &refname) {
+            recovery.push(cleanup_error);
+        }
+        if let Err(remove_error) = fs::remove_dir(&path) {
+            recovery.push(anyhow::Error::new(remove_error).context(format!(
+                "removing reserved resolution worktree path {} during cleanup",
+                path.display()
+            )));
+        }
+        return Err(crate::commands::setup::with_recovery_failures(
+            error, recovery,
+        ));
     }
     let worktree_repo = match validate_registered_worktree(repo, &path) {
         Ok(worktree_repo) => worktree_repo,
         Err(error) => {
-            let _ = repo
-                .find_reference(&refname)
-                .and_then(|mut reference| reference.delete());
-            let _ = git::worktree_remove(source_root, &path);
-            return Err(error).context("validating newly-created resolution worktree");
+            let mut recovery = Vec::new();
+            if let Err(cleanup_error) = delete_resolve_state_ref(repo, &refname) {
+                recovery.push(cleanup_error);
+            }
+            if let Err(remove_error) = git::worktree_remove(source_root, &path) {
+                recovery.push(remove_error.context(format!(
+                    "removing resolution worktree at {} during cleanup",
+                    path.display()
+                )));
+            }
+            return Err(crate::commands::setup::with_recovery_failures(
+                error.context("validating newly-created resolution worktree"),
+                recovery,
+            ));
         }
     };
     match git::cherry_pick_no_commit(&path, synthetic, None) {
@@ -1403,39 +1438,13 @@ fn finish(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::tempdir;
 
     use super::*;
-
-    fn write_config(source_url: &str, dest_url: &str, branches: &[&str]) -> NamedTempFile {
-        let branches_toml: String = branches
-            .iter()
-            .map(|branch| format!("{branch:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let mut file = NamedTempFile::new().unwrap();
-        write!(
-            file,
-            r#"
-            branches = [{branches_toml}]
-
-            [committer]
-            name = "gitprism"
-            email = "gitprism@example.com"
-
-            [source]
-            url = '{source_url}'
-
-            [dest]
-            url = '{dest_url}'
-            "#,
-        )
-        .unwrap();
-        file
-    }
+    use crate::testutil::{
+        bare_repo_with_a_commit_on, bare_source_remote_seeded_at, checkout_head_exact,
+        source_grafted_onto, write_config,
+    };
 
     #[test]
     fn hostile_branch_names_are_displayed_outside_literal_operator_commands() {
@@ -1495,87 +1504,120 @@ mod tests {
         );
     }
 
-    fn bare_repo_with_a_commit_on(dir: &Path, branch: &str, files: &[(&str, &str)]) -> Oid {
-        let repo = Repository::init_bare(dir).unwrap();
-        let mut builder = repo.treebuilder(None).unwrap();
-        for (name, contents) in files {
-            let blob = repo.blob(contents.as_bytes()).unwrap();
-            builder
-                .insert(*name, blob, git2::FileMode::Blob.into())
-                .unwrap();
-        }
-        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
-        let signature = git2::Signature::now("Dest Author", "author@example.com").unwrap();
-        repo.commit(
-            Some(&format!("refs/heads/{branch}")),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap()
+    #[test]
+    fn read_state_file_accepts_a_file_at_the_byte_limit_but_rejects_one_byte_over() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let at_limit = dir.path().join("at-limit");
+        std::fs::write(&at_limit, vec![b'a'; limits::MAX_STATE_FILE_BYTES]).unwrap();
+        let content = read_state_file(&at_limit, "state")
+            .expect("a state file exactly at the byte limit must still be accepted");
+        assert_eq!(content.len(), limits::MAX_STATE_FILE_BYTES);
+
+        let over_limit = dir.path().join("over-limit");
+        std::fs::write(&over_limit, vec![b'a'; limits::MAX_STATE_FILE_BYTES + 1]).unwrap();
+        let error = read_state_file(&over_limit, "state")
+            .expect_err("one byte over the state-file limit must be rejected");
+        assert!(error.to_string().contains("byte limit"));
     }
 
-    /// Same shape as `commands::sync`'s own `source_grafted_onto` fixture —
-    /// a source repo grafted onto `dest`'s tip, exactly `gitprism setup`'s
-    /// output (decisions/0006), checked out on `branch`.
-    fn source_grafted_onto(
-        source_dir: &Path,
-        branch: &str,
-        dest_tip: Oid,
-        dest_repo: &Repository,
-    ) -> Repository {
-        let repo = Repository::init(source_dir).unwrap();
-        let dest_tip_commit = dest_repo.find_commit(dest_tip).unwrap();
-        git::fetch(source_dir, &dest_repo.path().to_string_lossy(), branch).unwrap();
-        let fetched_tip_id = repo
-            .find_reference("FETCH_HEAD")
-            .unwrap()
-            .peel_to_commit()
-            .unwrap()
-            .id();
-        {
-            let fetched_tip = repo.find_commit(fetched_tip_id).unwrap();
-            let signature = git2::Signature::now("gitprism", "gitprism@example.com").unwrap();
-            let tree = fetched_tip.tree().unwrap();
-            let message = marker::build_message(
-                &format!("gitprism setup: graft ({})", source_dir.display()),
-                marker::Direction::Setup,
-                branch,
-                dest_tip_commit.id(),
-                "Gitprism-Dest-Commit",
-                &[fetched_tip.id()],
-                tree.id(),
-                &signature,
-                &signature,
-                &marker::load_key().unwrap(),
+    /// A single conflict-stage index entry at `path`, added directly rather
+    /// than through a real merge — the cheapest way to synthesize the
+    /// record counts/path-byte volumes `conflicted_paths`'s own limits
+    /// (`MAX_CONFLICT_RECORDS`, `MAX_CONFLICT_PATH_BYTES`) need to actually
+    /// trip, without a fixture with that many genuinely conflicting files.
+    fn add_conflict_stage_entry(index: &mut git2::Index, blob: git2::Oid, path: Vec<u8>) {
+        use git2::{IndexEntry, IndexTime};
+
+        index
+            .add(&IndexEntry {
+                ctime: IndexTime::new(0, 0),
+                mtime: IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: blob,
+                flags: 1u16 << 12, // stage 1 ("ancestor")
+                flags_extended: 0,
+                path,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn conflicted_paths_accepts_the_record_limit_but_rejects_one_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        let mut index = repo.index().unwrap();
+
+        for i in 0..limits::MAX_CONFLICT_RECORDS {
+            add_conflict_stage_entry(
+                &mut index,
+                blob,
+                format!("conflict-{i:07}.txt").into_bytes(),
             );
-            repo.commit(
-                Some(&format!("refs/heads/{branch}")),
-                &signature,
-                &signature,
-                &message,
-                &tree,
-                &[&fetched_tip],
-            )
-            .unwrap();
         }
-        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
-        checkout_head_exact(&repo);
-        repo
+        index.write().unwrap();
+        let paths = conflicted_paths(&repo)
+            .expect("exactly the conflict-record limit must still be accepted");
+        assert_eq!(paths.len(), limits::MAX_CONFLICT_RECORDS);
+
+        add_conflict_stage_entry(&mut index, blob, b"one-more.txt".to_vec());
+        index.write().unwrap();
+        let error = conflicted_paths(&repo)
+            .expect_err("one more than the conflict-record limit must be rejected");
+        assert!(error.to_string().contains("record limit"));
     }
 
-    /// Forced checkout of HEAD followed by decisions/0034's byte-exact
-    /// control-file restore — what a real `setup`/`sync` leaves on disk.
-    /// Without it, a host with `core.autocrlf=true` (Windows CI) checks out
-    /// `.gitprismignore` with CRLF and decisions/0037's policy check sees the
-    /// pinned bytes disagree with an identical blob.
-    fn checkout_head_exact(repo: &Repository) {
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
-        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
-        policy::restore_control_files_exact(repo, &head_tree).unwrap();
+    /// A distinct path, exactly `length` bytes long, for the path-byte-limit
+    /// test below. Many moderate-length paths summing to the limit, rather
+    /// than one path anywhere near it: a single index entry with a path in
+    /// the megabyte range trips an unrelated libgit2 index-writer limitation
+    /// (confirmed empirically — `Index::write` fails with a spurious "object
+    /// not found" once a single entry's path passes roughly 8KB), which has
+    /// nothing to do with gitprism's own limit and isn't something gitprism's
+    /// production code ever constructs; many short, distinct paths avoid it
+    /// while still exercising the exact same cumulative-byte check.
+    fn fixed_length_conflict_path(index: usize, length: usize) -> Vec<u8> {
+        let mut path = format!("{index:06}-").into_bytes();
+        assert!(path.len() <= length, "index prefix must fit in `length`");
+        path.resize(length, b'a');
+        path
+    }
+
+    #[test]
+    fn conflicted_paths_accepts_the_path_byte_limit_but_rejects_one_byte_more() {
+        const PER_ENTRY_BYTES: usize = 4096;
+        assert_eq!(limits::MAX_CONFLICT_PATH_BYTES % PER_ENTRY_BYTES, 0);
+        let entries_at_limit = limits::MAX_CONFLICT_PATH_BYTES / PER_ENTRY_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob = repo.blob(b"x").unwrap();
+        let mut index = repo.index().unwrap();
+        for i in 0..entries_at_limit {
+            add_conflict_stage_entry(
+                &mut index,
+                blob,
+                fixed_length_conflict_path(i, PER_ENTRY_BYTES),
+            );
+        }
+        index.write().unwrap();
+        let paths = conflicted_paths(&repo)
+            .expect("cumulative path bytes exactly at the limit must still be accepted");
+        assert_eq!(paths.len(), entries_at_limit);
+
+        // One more single-byte path tips the cumulative total one byte past
+        // the limit.
+        add_conflict_stage_entry(&mut index, blob, b"z".to_vec());
+        index.write().unwrap();
+        let error = conflicted_paths(&repo)
+            .expect_err("one byte over the cumulative path-byte limit must be rejected");
+        assert!(error.to_string().contains("byte limit"));
     }
 
     /// Unlike `commands::sync`'s own `add_commit` fixture (which never needs
@@ -1725,6 +1767,135 @@ mod tests {
             .unwrap()
             .delete()
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_resolve_state_ref_reports_a_real_deletion_failure_instead_of_swallowing_it() {
+        // F-12: `start_source_to_dest`'s cleanup used to discard this same
+        // failure with `let _ =`. Deleting a ref requires write access to
+        // its containing directory (an unlink, not just a write to the ref
+        // file itself), so revoking that is a real, deterministic failure —
+        // no timing race and no process-global state, unlike forcing the
+        // full `start_source_to_dest` flow's own randomized worktree path
+        // to collide with injected content would require.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let oid = repo
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        let refname = "refs/gitprism/resolve/source-to-dest/feature";
+        repo.reference(refname, oid, true, "test").unwrap();
+
+        let refs_dir = repo.path().join("refs/gitprism/resolve/source-to-dest");
+        fs::set_permissions(&refs_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = delete_resolve_state_ref(&repo, refname);
+
+        fs::set_permissions(&refs_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unwritable refs directory must fail ref deletion");
+        assert!(
+            format!("{error:#}").contains(refname),
+            "the error must name the ref it failed to delete: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_source_to_dest_reports_a_worktree_add_failure_without_a_spurious_recovery_wrapper() {
+        // F-12's cleanup-aggregation change must not alter the ordinary case
+        // where cleanup itself succeeds: the primary error should surface
+        // exactly as before, with no "recovery also failed" wrapping.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "base")]);
+        dest_repo
+            .reference(
+                "refs/heads/feature",
+                dest_tip,
+                true,
+                "test mirror-only branch",
+            )
+            .unwrap();
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let main_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        source_repo.branch("feature", &main_tip, false).unwrap();
+        source_repo.set_head("refs/heads/feature").unwrap();
+        checkout_head_exact(&source_repo);
+        let source_change = add_commit(&source_repo, "feature", &[("f.txt", "source")]);
+        let dest_feature =
+            add_independent_dest_commit_on(&dest_repo, dest_tip, "feature", ("f.txt", "dest"));
+        let source_parent = source_repo.find_commit(source_change).unwrap();
+        let marker_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let marker_message = marker::build_message(
+            "gitprism test: dest -> source",
+            marker::Direction::DestToSource,
+            "feature",
+            dest_feature,
+            "Gitprism-Dest-Commit",
+            &[source_change],
+            source_parent.tree_id(),
+            &marker_signature,
+            &marker_signature,
+            &marker::load_key().unwrap(),
+        );
+        source_repo
+            .commit(
+                Some("refs/heads/feature"),
+                &marker_signature,
+                &marker_signature,
+                &marker_message,
+                &source_parent.tree().unwrap(),
+                &[&source_parent],
+            )
+            .unwrap();
+        checkout_head_exact(&source_repo);
+
+        // Made unwritable so the real `git worktree add` subprocess fails
+        // deterministically, before it ever touches the reserved worktree
+        // path — a plain, recoverable failure (state-ref delete and
+        // `remove_dir` both still succeed).
+        let worktrees_dir = source_repo.path().join("worktrees");
+        fs::create_dir(&worktrees_dir).unwrap();
+        fs::set_permissions(&worktrees_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
+        let result = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        );
+
+        fs::set_permissions(&worktrees_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error =
+            result.expect_err("an unwritable `.git/worktrees` must fail `git worktree add`");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("git worktree add failed"),
+            "expected the worktree-add failure to remain the primary error, got: {message}"
+        );
+        assert!(
+            !message.contains("recovery also failed"),
+            "cleanup succeeded cleanly here and must not be wrapped as a recovery failure: {message}"
+        );
     }
 
     #[test]
@@ -1917,25 +2088,26 @@ mod tests {
         );
     }
 
-    /// A bare repo standing in for source's own remote, seeded at `tip` —
-    /// same convention as `commands::sync`'s own fixture of the same name.
-    fn bare_source_remote_seeded_at(
-        source_repo: &Repository,
-        branch: &str,
-        tip: Oid,
-    ) -> tempfile::TempDir {
+    #[test]
+    fn run_reports_the_repository_error_for_a_wrong_cwd_not_the_state_key_error() {
+        // F-14: repository discovery must run before state-key validation,
+        // so a wrong cwd reports "not a git repository," never a state-key
+        // complaint (`marker::load_key` uses a fixed test key and can't
+        // itself fail here, but the ordering this guards is the same either
+        // way — see the F-14 report note in this commit).
         let dir = tempdir().unwrap();
-        Repository::init_bare(dir.path()).unwrap();
-        let outcome = git::push(
-            source_repo.workdir().unwrap(),
-            &dir.path().display().to_string(),
-            tip,
-            branch,
-            PushMode::FastForwardOnly,
-        )
-        .unwrap();
-        assert_eq!(outcome, git::PushOutcome::Accepted);
-        dir
+
+        let error = run(dir.path(), Path::new(".gitprism.toml"), "main", false)
+            .expect_err("running outside any git repository must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be run inside an existing git repository"),
+            "expected the repository-discovery error, got: {message}"
+        );
+        assert!(
+            !message.to_uppercase().contains("GITPRISM_STATE_KEY"),
+            "the repository error must not be shadowed by a state-key complaint: {message}"
+        );
     }
 
     #[test]

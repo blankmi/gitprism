@@ -13,21 +13,21 @@ generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
 permits force-updating a mirror-only dest branch to match a deliberately
 rewritten source branch. Starting its implementation surfaced that the
 existing code refuses such a branch before any push is attempted, so 0038's
-force path is currently unreachable. Traced against `src/commands/sync.rs`
+force path is currently unreachable. Traced against `src/commands/sync.rs` (since split into `src/commands/sync/{mod,anchor,marker_scan}.rs`, see below)
 for a rewritten mirror-only branch that already has a dest ref:
 
 * `dest_ref_exists` is true, so `dest_tip` is the old, pre-rewrite mirrored
-  tip, fetched at `sync.rs:316-340`.
-* `dest_resume_point_for_branch` (`sync.rs:1003`) is called for `boundary`
-  (`sync.rs:354-365`).
-* `dest_tip_is_accounted_for` (`sync.rs:939`) **passes**, via its Case 1: the
+  tip, fetched at `sync/mod.rs:316-340` (line numbers as of this decision's own sync.rs, since split).
+* `dest_resume_point_for_branch` (now `sync/anchor.rs:1003`) is called for `boundary`
+  (`sync/mod.rs:354-365`).
+* `dest_tip_is_accounted_for` (now `sync/anchor.rs:939`) **passes**, via its Case 1: the
   old dest tip still carries gitprism's own `SourceToDest` marker from the
   earlier sync.
-* `newest_source_marker` (`sync.rs:1867`) then returns the **pre-rewrite**
+* `newest_source_marker` (now `sync/marker_scan.rs:1867`) then returns the **pre-rewrite**
   source tip as `boundary` — the newest `Gitprism-Source-Commit` trailer
   reachable from the old dest tip.
 * `boundary != source_tip`, so `dest_resume_point_for_branch` runs
-  `repo.graph_descendant_of(source_tip, boundary)` (`sync.rs:1040`) — false,
+  `repo.graph_descendant_of(source_tip, boundary)` (now `sync/anchor.rs:1040`) — false,
   because a rewrite (rebase, amend, reset) gives the branch a new commit off
   the same parent rather than a descendant of the old one.
 * `dest_resume_point_for_branch` returns `Ok(None)`, and the caller's
@@ -115,7 +115,7 @@ rewrite is recognized.
 
 **What is rebuilt from.** The rebuild base is not new base-finding logic.
 It is the same path `sync_pair_to_dest` already takes when `!dest_ref_exists`
-(`sync.rs:387-388`): `newest_dest_marker_opt_for_branch(repo, source_tip,
+(`sync/mod.rs:387-388` at the time — that pure alias, `newest_dest_marker_opt_for_branch`, was later removed; its one caller now calls `scan_for_dest_marker` in `sync/marker_scan.rs` directly): `newest_dest_marker_opt_for_branch(repo, source_tip,
 branch, state_key)`, which scans source's own first-parent history for the
 nearest `Gitprism-Dest-Commit` trailer and returns `(boundary, dest_tip)`
 straight from that trailer — the graft-derived shared ancestry
@@ -159,7 +159,7 @@ on a mirror-only branch is dest's own independent contribution gitprism is
 obligated to preserve. If a branch is in `config.branches`, this whole
 mechanism does not apply to it — the four-condition check's first clause
 exists precisely to keep the two branch classes from being conflated at the
-one call site (`sync.rs:354-365`) where they currently share code.
+one call site (`sync/mod.rs:354-365`) where they currently share code.
 
 **Config-role hazard, restated by reference.** [decisions/0038](0038-branch-authority-determines-whether-history-may-be-rewritten.md)
 already records that branch authority is decided by current
@@ -254,7 +254,7 @@ describes.
     condition shape coincidentally holds except for `config.branches`
     membership;
   * role-aware guard assertions, extended from 0038's: round-tripped pushes
-    (both `sync.rs` call sites, both round-tripped `resolve.rs` call sites)
+    (both `sync/mod.rs` call sites, both round-tripped `resolve.rs` call sites)
     never emit `--force`, `--force-with-lease`, or a `+`-prefixed refspec;
     additionally, **every** `resolve.rs` push — including a mirror-only
     branch reached via `resolve_source_to_dest` — never emits them either,
@@ -341,8 +341,8 @@ nothing to build from them.
 non-shallow clone
 
 A real deployment hit condition 4's `repo.find_commit(boundary).is_err()`
-branch (`sync.rs:1278`, mirrored in `dest_resume_point_for_branch`'s own
-`sync.rs:1220`) on an ordinary `git commit --amend && git push --force` of a
+branch (now `sync/anchor.rs:1278`, mirrored in `dest_resume_point_for_branch`'s own
+`sync/anchor.rs:1220`) on an ordinary `git commit --amend && git push --force` of a
 mirror-only branch — exactly the case this decision names as in scope
 ("a mirror-only branch rewritten via `git commit --amend`: ... the old dest
 history is replaced"). The push was refused with the generic resume-point
@@ -428,7 +428,7 @@ detect a rewrite" reasoning.
 documented limitations
 
 A review of the previous addendum's implementation found
-`repo.find_commit(boundary).is_err()` (`sync.rs:1281` at the time) treats
+`repo.find_commit(boundary).is_err()` (`sync/anchor.rs:1281` at the time) treats
 *any* libgit2 error as "object missing," not just a genuinely absent object.
 On a non-shallow clone that misread now resolves to `Ok(true)` — a confirmed
 rewrite, force-pushed via `PushMode::ForceMirrorOnly` — for a transient ODB
@@ -442,7 +442,7 @@ git2::ErrorCode::NotFound` is the only branch read as "missing," taking the
 same `!repo.is_shallow()` path this addendum already established; every
 other `Err` propagates via `.with_context(...)` as a real error instead of
 being guessed either way. This is the same `ErrorCode::NotFound` guard
-already used at `sync.rs:1618` for an unrelated missing-object case,
+already used at `sync/anchor.rs:1618` at the time, for an unrelated missing-object case,
 narrowed here rather than introducing a new pattern.
 
 **Empirically, this rarely matters in practice but is still worth the
@@ -468,7 +468,7 @@ than wrongly force-push) or are already outside gitprism's control:
 
 * **`is_shallow()` is a whole-repository flag, not scoped to the branch
   being evaluated.** One shared `Repository` handle serves every branch in a
-  `sync` run (`sync.rs`'s `run`); if any ref in that checkout was ever
+  `sync` run (`sync/mod.rs`'s `run`); if any ref in that checkout was ever
   shallow-fetched, `is_shallow()` reads `true` for every branch's check that
   run, even a fully-fetched branch with a genuine rewrite — that branch
   falls back to refusal instead of rebuilding. Git and libgit2 don't expose

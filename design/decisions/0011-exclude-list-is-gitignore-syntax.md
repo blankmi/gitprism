@@ -47,3 +47,24 @@ project owner's answer: "configuration similar to `.gitignore` or so."
 * Any future gitprism control files (e.g. if [decisions/0008](0008-ship-resolve-helper.md)'s
   resolve helper needs its own state later) should follow the same
   automatically-excluded convention rather than requiring manual listing.
+
+# Addendum (2026-08-28): a directory-only pattern also matches a submodule gitlink
+
+A repository review (finding F-10) found `filter_tree` (now `src/commands/sync/filter.rs`)
+computing whether a tree entry counts as a directory purely from
+`entry.kind() == Some(git2::ObjectType::Tree)`. Real `.gitignore` syntax — and
+`git check-ignore` itself — maps a submodule gitlink to `DT_DIR` for matching
+purposes, so a pattern like `vendor-secret/` is meant to match a submodule
+named `vendor-secret` exactly as it would match an ordinary directory. Since a
+gitlink's `kind()` is `Commit`, not `Tree`, `filter_tree` silently let such a
+submodule through instead of excluding it — "exactly `.gitignore`'s pattern
+syntax" (this decision's own wording) didn't hold for that one entry type.
+
+`filter_tree` now treats a tree entry as a directory for exclude-matching
+purposes when it is either a real tree *or* a gitlink
+(`entry.filemode() == git2::FileMode::Commit`), while still only ever
+recursing into (and rebuilding) real trees — a gitlink is never traversed,
+matching how a submodule's own history stays opaque to `filter_tree` either
+way. A symlink is unaffected: its `filemode()` is `Link`, not `Commit`, so a
+directory-only pattern still never matches a symlink of the same name, the
+same behavior `git check-ignore` itself shows for a symlink.
