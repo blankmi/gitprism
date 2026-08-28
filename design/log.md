@@ -2295,3 +2295,7 @@ guessed number. Some of this file's older, deeply narrative entries (e.g.
 "Six tests added to `src/commands/sync.rs`") were left as plain historical
 record — they describe the file as it was on that date, before this split
 existed, not a live reference.
+
+## 2026-08-28 — document the Git child environment (0031 addendum)
+
+**Update**: [decisions/0031](decisions/0031-centralized-git-process-runner.md) gained an addendum tabulating every environment variable and forced `-c` setting `git_command()` applies — the three scrubbed `GITPRISM_*` variables, `GIT_TERMINAL_PROMPT=0`, the new `GIT_PROTOCOL_FROM_USER=0` + `-c protocol.file.allow=always` pair (review F-20), `-c credential.interactive=true` (review F-16), `GIT_EDITOR=true` on cherry-pick, and the policy committer identity on commit-creating calls — plus the test-only `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM` isolation. Future overrides update that table and the README paragraph together.
