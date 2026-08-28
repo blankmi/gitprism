@@ -139,7 +139,7 @@ fn run_with_remove_file(
         .context("checking whether source repo's HEAD is detached")?
     {
         anyhow::bail!(
-            "gitprism setup: source repo already has commits and/or branches — setup is a one-time graft onto an empty, freshly-initialized repo, not something to run against existing history"
+            "gitprism setup: source repo's HEAD is detached — check out a branch first (setup reconciles pre-existing branches, decisions/0023, but always needs HEAD attached to one)"
         );
     }
     let mut pre_existing_branches: HashMap<String, git2::Oid> = HashMap::new();
@@ -539,7 +539,14 @@ impl ControlFileState {
     }
 }
 
-fn with_recovery_failures(primary: anyhow::Error, failures: Vec<anyhow::Error>) -> anyhow::Error {
+/// Folds any cleanup failures alongside the primary error that triggered
+/// them, rather than swallowing them with `let _ =` — reused by
+/// `resolve::start_source_to_dest` (F-12) for its own worktree/state-ref
+/// cleanup.
+pub(crate) fn with_recovery_failures(
+    primary: anyhow::Error,
+    failures: Vec<anyhow::Error>,
+) -> anyhow::Error {
     if failures.is_empty() {
         return primary;
     }
@@ -1387,6 +1394,39 @@ mod tests {
             fs::read_to_string(source_dir.path().join(crate::config::FILENAME)).unwrap(),
             config_toml,
             "rejecting an empty branches list must not touch the user's config file"
+        );
+    }
+
+    #[test]
+    fn run_fails_loudly_with_a_detached_head_naming_the_real_condition() {
+        // F-17: the message must name the actual precondition — a detached
+        // HEAD — not "commits and/or branches," which decisions/0023
+        // explicitly allows (a pre-existing branch is reconciled, not
+        // rejected).
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main", &[("a.txt", "a")]);
+
+        let source_dir = tempdir().unwrap();
+        let oid = repo_with_a_commit_on(source_dir.path(), "main", &[("s.txt", "s")]);
+        let repo = Repository::open(source_dir.path()).unwrap();
+        repo.set_head_detached(oid).unwrap();
+
+        let config_toml = format!(
+            "branches = [\"main\"]\n\n[committer]\nname = \"gitprism\"\nemail = \"gitprism@example.com\"\n\n[dest]\nurl = '{}'\n",
+            dest_dir.path().display()
+        );
+        fs::write(source_dir.path().join(crate::config::FILENAME), config_toml).unwrap();
+
+        let err = run(source_dir.path(), Path::new(crate::config::FILENAME))
+            .expect_err("a detached HEAD must hard-fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("HEAD is detached"),
+            "expected the message to name the real condition, got: {message}"
+        );
+        assert!(
+            !message.contains("already has commits and/or branches"),
+            "existing branches are allowed (decisions/0023); the message must not imply otherwise: {message}"
         );
     }
 

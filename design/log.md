@@ -2155,3 +2155,81 @@ old branch-specific bail text). `cargo test` (248 passed), `cargo clippy
   proving it exercises an independent path. `cargo test` (251 passed),
   `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
   clean.
+
+## 2026-08-28 — 2026-08-27 review's P3 findings (F-10, F-11, F-12, F-13, F-14, F-17)
+
+**Update**: Fixed six low/informational findings left open from the
+2026-08-27 review.
+
+* **F-10**: `filter_tree` (`src/commands/sync.rs`) judged an entry a
+  directory purely by `entry.kind() == Tree`, so a directory-only exclude
+  pattern (`vendor-secret/`) silently let a same-named submodule gitlink
+  through — `git check-ignore` maps a gitlink to `DT_DIR` too. Fixed by also
+  treating `FileMode::Commit` as a directory for exclude-matching, while
+  still only ever recursing into real trees; a symlink (`FileMode::Link`) is
+  unaffected. decisions/0011 amended with a dated addendum. Test added
+  (`filter_tree_directory_only_pattern_matches_a_submodule_gitlink_but_not_a_symlink`),
+  confirmed failing against the pre-fix code and passing after.
+* **F-11**: the two `let Ok(x) = repo.merge_base(..) else { continue }`
+  sites (`already_merged_into_a_landing_branch`, `dest_anchor_for_branch`)
+  treated every libgit2 error — corrupt object, I/O failure, not just "no
+  shared history" — as the benign case. Narrowed to
+  `error.code() == git2::ErrorCode::NotFound`; any other error now
+  propagates via a `context`-wrapped `return Err(...)`. Existing tests
+  already cover the `NotFound` path continuing; a unit test fabricating a
+  genuine non-`NotFound` `merge_base` failure was not added; F-04's
+  regression test in `mirror_only_rewrite_detected` already demonstrates the
+  same corrupt-object injection technique against a different call site.
+* **F-12**: `resolve.rs`'s `start_source_to_dest` swallowed state-ref
+  delete/`remove_dir`/`worktree remove` cleanup failures with `let _ =`.
+  `setup.rs`'s `with_recovery_failures`/`RecoveryError` (already used for
+  setup's own rollback aggregation) made `pub(crate)` and reused for all
+  three cleanup sites; the inline ref-delete closure promoted to a named
+  `delete_resolve_state_ref` for direct testability. Two tests added
+  (`src/commands/resolve.rs`):
+  `delete_resolve_state_ref_reports_a_real_deletion_failure_instead_of_swallowing_it`
+  (an unwritable refs directory deterministically fails deletion, no timing
+  race) and
+  `start_source_to_dest_reports_a_worktree_add_failure_without_a_spurious_recovery_wrapper`
+  (confirms the ordinary case — cleanup succeeds — isn't wrapped in a
+  recovery message). A full `start_source_to_dest` reproduction of the
+  `remove_dir`-fails-because-non-empty shape the review's example described
+  was not attempted: the reserved directory's path is randomized
+  (pid+nanosecond timestamp) and only guaranteed empty at the moment
+  `reserve_resolution_worktree_path` creates it, so reliably populating it
+  before the cleanup call without either racing the real `git worktree add`
+  subprocess or mutating the process-global temp directory (unsafe under
+  `cargo test`'s parallel execution) was judged infeasible.
+* **F-13**: `list_source_branches` (`src/commands/sync.rs`) failed the
+  entire run on any local branch with a non-UTF-8 name. Now returns such a
+  branch separately (`SkippedSourceBranch`) instead of via `?`, and `run`
+  reports it as a per-branch `Outcome::Warning` (decisions/0024's
+  precedent) before either phase starts, then continues. `validate_branch_name`
+  failures are unchanged (still a hard error) — out of this finding's scope.
+  cfg(unix) test added
+  (`list_source_branches_warns_about_and_skips_a_non_utf8_branch_name`)
+  using a `packed-refs` entry with raw invalid-UTF-8 bytes, since macOS's
+  filesystem itself rejects a loose-ref filename with invalid UTF-8 bytes
+  (confirmed empirically) — `packed-refs`' content isn't validated by the
+  filesystem, only by git.
+* **F-14**: `sync`/`resolve`'s `run`/`run_with_direction` validated
+  `GITPRISM_STATE_KEY` before `Repository::discover`, so a wrong cwd
+  reported a state-key error instead of "not a git repository." Reordered
+  in both. Tests added in both modules
+  (`run_reports_the_repository_error_for_a_wrong_cwd_not_the_state_key_error`);
+  note `marker::load_key` uses a fixed key under `#[cfg(test)]` (so unit
+  tests never actually hit a real key-validation failure either way) — the
+  tests confirm the required outcome (repository error, no key-error text)
+  but can't flip on the reorder alone within this suite; verifying the
+  ordering as it manifests in a release build would need an integration
+  test spawning the compiled binary, which this project doesn't have.
+* **F-17**: setup's detached-HEAD hard-fail
+  (`src/commands/setup.rs`) said "already has commits and/or branches,"
+  contradicting decisions/0023 (existing branches are reconciled, not
+  rejected). Reworded to name the real condition. Test added
+  (`run_fails_loudly_with_a_detached_head_naming_the_real_condition`), since
+  none previously asserted this message.
+
+`cargo test --workspace --all-features` (258 passed), `cargo clippy
+--workspace --all-targets --all-features -- -D warnings`, and `cargo fmt
+--all -- --check` all clean.

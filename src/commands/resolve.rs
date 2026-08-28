@@ -76,14 +76,16 @@ pub fn run_with_direction(
     r#continue: bool,
     direction: Direction,
 ) -> Result<()> {
-    // Validate before fetching or changing the working tree.
-    let state_key = marker::load_key()?;
+    // Repository discovery first, so a wrong cwd reports that, not a
+    // missing/malformed state key (F-14) — both are validated before
+    // fetching or changing the working tree either way.
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism resolve must be run inside an existing git repository (none found at or above {}) — has `gitprism setup` been run?",
             cwd.display()
         )
     })?;
+    let state_key = marker::load_key()?;
     let source_root = repo
         .workdir()
         .context("gitprism resolve requires a repo with a working tree, not a bare repo")?
@@ -255,6 +257,16 @@ fn resolve_source_to_dest(
             policy_digest,
         )
     }
+}
+
+/// Deletes `refname` (the resolve state ref [`start_source_to_dest`] just
+/// created) as part of cleaning up after a failed start — named and
+/// separated out, rather than an inline closure, so a real deletion failure
+/// (e.g. an unwritable refs directory) is independently testable (F-12).
+fn delete_resolve_state_ref(repo: &Repository, refname: &str) -> Result<()> {
+    repo.find_reference(refname)
+        .and_then(|mut reference| reference.delete())
+        .with_context(|| format!("deleting resolve state ref {refname:?} during cleanup"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,26 +464,46 @@ fn start_source_to_dest(
     let refname = format!("refs/gitprism/resolve/source-to-dest/{branch}");
     repo.reference(&refname, state_commit, true, "gitprism resolve: start")?;
     if let Err(error) = reserve_resolution_worktree_path(&path) {
-        let _ = repo
-            .find_reference(&refname)
-            .and_then(|mut reference| reference.delete());
-        return Err(error);
+        let mut recovery = Vec::new();
+        if let Err(cleanup_error) = delete_resolve_state_ref(repo, &refname) {
+            recovery.push(cleanup_error);
+        }
+        return Err(crate::commands::setup::with_recovery_failures(
+            error, recovery,
+        ));
     }
     if let Err(error) = git::worktree_add(source_root, &path, state_commit) {
-        let _ = repo
-            .find_reference(&refname)
-            .and_then(|mut reference| reference.delete());
-        let _ = fs::remove_dir(&path);
-        return Err(error);
+        let mut recovery = Vec::new();
+        if let Err(cleanup_error) = delete_resolve_state_ref(repo, &refname) {
+            recovery.push(cleanup_error);
+        }
+        if let Err(remove_error) = fs::remove_dir(&path) {
+            recovery.push(anyhow::Error::new(remove_error).context(format!(
+                "removing reserved resolution worktree path {} during cleanup",
+                path.display()
+            )));
+        }
+        return Err(crate::commands::setup::with_recovery_failures(
+            error, recovery,
+        ));
     }
     let worktree_repo = match validate_registered_worktree(repo, &path) {
         Ok(worktree_repo) => worktree_repo,
         Err(error) => {
-            let _ = repo
-                .find_reference(&refname)
-                .and_then(|mut reference| reference.delete());
-            let _ = git::worktree_remove(source_root, &path);
-            return Err(error).context("validating newly-created resolution worktree");
+            let mut recovery = Vec::new();
+            if let Err(cleanup_error) = delete_resolve_state_ref(repo, &refname) {
+                recovery.push(cleanup_error);
+            }
+            if let Err(remove_error) = git::worktree_remove(source_root, &path) {
+                recovery.push(remove_error.context(format!(
+                    "removing resolution worktree at {} during cleanup",
+                    path.display()
+                )));
+            }
+            return Err(crate::commands::setup::with_recovery_failures(
+                error.context("validating newly-created resolution worktree"),
+                recovery,
+            ));
         }
     };
     match git::cherry_pick_no_commit(&path, synthetic, None) {
@@ -1727,6 +1759,135 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn delete_resolve_state_ref_reports_a_real_deletion_failure_instead_of_swallowing_it() {
+        // F-12: `start_source_to_dest`'s cleanup used to discard this same
+        // failure with `let _ =`. Deleting a ref requires write access to
+        // its containing directory (an unlink, not just a write to the ref
+        // file itself), so revoking that is a real, deterministic failure —
+        // no timing race and no process-global state, unlike forcing the
+        // full `start_source_to_dest` flow's own randomized worktree path
+        // to collide with injected content would require.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let oid = repo
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        let refname = "refs/gitprism/resolve/source-to-dest/feature";
+        repo.reference(refname, oid, true, "test").unwrap();
+
+        let refs_dir = repo.path().join("refs/gitprism/resolve/source-to-dest");
+        fs::set_permissions(&refs_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = delete_resolve_state_ref(&repo, refname);
+
+        fs::set_permissions(&refs_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unwritable refs directory must fail ref deletion");
+        assert!(
+            format!("{error:#}").contains(refname),
+            "the error must name the ref it failed to delete: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_source_to_dest_reports_a_worktree_add_failure_without_a_spurious_recovery_wrapper() {
+        // F-12's cleanup-aggregation change must not alter the ordinary case
+        // where cleanup itself succeeds: the primary error should surface
+        // exactly as before, with no "recovery also failed" wrapping.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "base")]);
+        dest_repo
+            .reference(
+                "refs/heads/feature",
+                dest_tip,
+                true,
+                "test mirror-only branch",
+            )
+            .unwrap();
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let main_tip = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        source_repo.branch("feature", &main_tip, false).unwrap();
+        source_repo.set_head("refs/heads/feature").unwrap();
+        checkout_head_exact(&source_repo);
+        let source_change = add_commit(&source_repo, "feature", &[("f.txt", "source")]);
+        let dest_feature =
+            add_independent_dest_commit_on(&dest_repo, dest_tip, "feature", ("f.txt", "dest"));
+        let source_parent = source_repo.find_commit(source_change).unwrap();
+        let marker_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let marker_message = marker::build_message(
+            "gitprism test: dest -> source",
+            marker::Direction::DestToSource,
+            "feature",
+            dest_feature,
+            "Gitprism-Dest-Commit",
+            &[source_change],
+            source_parent.tree_id(),
+            &marker_signature,
+            &marker_signature,
+            &marker::load_key().unwrap(),
+        );
+        source_repo
+            .commit(
+                Some("refs/heads/feature"),
+                &marker_signature,
+                &marker_signature,
+                &marker_message,
+                &source_parent.tree().unwrap(),
+                &[&source_parent],
+            )
+            .unwrap();
+        checkout_head_exact(&source_repo);
+
+        // Made unwritable so the real `git worktree add` subprocess fails
+        // deterministically, before it ever touches the reserved worktree
+        // path — a plain, recoverable failure (state-ref delete and
+        // `remove_dir` both still succeed).
+        let worktrees_dir = source_repo.path().join("worktrees");
+        fs::create_dir(&worktrees_dir).unwrap();
+        fs::set_permissions(&worktrees_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
+        let result = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        );
+
+        fs::set_permissions(&worktrees_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error =
+            result.expect_err("an unwritable `.git/worktrees` must fail `git worktree add`");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("git worktree add failed"),
+            "expected the worktree-add failure to remain the primary error, got: {message}"
+        );
+        assert!(
+            !message.contains("recovery also failed"),
+            "cleanup succeeded cleanly here and must not be wrapped as a recovery failure: {message}"
+        );
+    }
+
     #[test]
     fn source_to_dest_non_fast_forward_requires_restarting_resolution() {
         let dest_dir = tempdir().unwrap();
@@ -1936,6 +2097,28 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, git::PushOutcome::Accepted);
         dir
+    }
+
+    #[test]
+    fn run_reports_the_repository_error_for_a_wrong_cwd_not_the_state_key_error() {
+        // F-14: repository discovery must run before state-key validation,
+        // so a wrong cwd reports "not a git repository," never a state-key
+        // complaint (`marker::load_key` uses a fixed test key and can't
+        // itself fail here, but the ordering this guards is the same either
+        // way — see the F-14 report note in this commit).
+        let dir = tempdir().unwrap();
+
+        let error = run(dir.path(), Path::new(".gitprism.toml"), "main", false)
+            .expect_err("running outside any git repository must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be run inside an existing git repository"),
+            "expected the repository-discovery error, got: {message}"
+        );
+        assert!(
+            !message.to_uppercase().contains("GITPRISM_STATE_KEY"),
+            "the repository error must not be shadowed by a state-key complaint: {message}"
+        );
     }
 
     #[test]

@@ -95,14 +95,16 @@ fn divergence_after_exhausted_retries_message(branch: &str, ff_target: &str) -> 
 }
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
-    // Validate the pair secret before fetching or constructing any commits.
-    let state_key = marker::load_key()?;
+    // Repository discovery first, so a wrong cwd reports that, not a
+    // missing/malformed state key (F-14) — the pair secret is still
+    // validated before fetching or constructing any commits either way.
     let repo = Repository::discover(cwd).with_context(|| {
         format!(
             "gitprism sync must be run inside an existing git repository (none found at or above {}) — has `gitprism setup` been run?",
             cwd.display()
         )
     })?;
+    let state_key = marker::load_key()?;
     let source_root = repo
         .workdir()
         .context("gitprism sync requires a repo with a working tree, not a bare repo")?
@@ -137,15 +139,34 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // discovered mid-run the way this listing used to happen (immediately
     // before the source→dest loop below, and only there). The listing itself
     // is unchanged, just moved earlier and reused below rather than repeated.
-    let source_branches = list_source_branches(&repo)?;
+    let (source_branches, skipped_source_branches) = list_source_branches(&repo)?;
     let reporter = Reporter::new(
-        config.branches.len() + source_branches.len(),
+        config.branches.len() + source_branches.len() + skipped_source_branches.len(),
         config
             .branches
             .iter()
             .map(String::as_str)
-            .chain(source_branches.iter().map(String::as_str)),
+            .chain(source_branches.iter().map(String::as_str))
+            .chain(
+                skipped_source_branches
+                    .iter()
+                    .map(|skipped| skipped.display_name.as_str()),
+            ),
     );
+
+    // Reported up front, before either phase runs, so a per-branch listing
+    // problem never gets buried under every branch's own completed line
+    // (decisions/0024: a warning, not a whole-run abort — `run()` continues
+    // with every branch it *could* list).
+    for skipped in &skipped_source_branches {
+        reporter.complete(
+            Outcome::Warning,
+            &skipped.display_name,
+            Direction::SourceToDest,
+            false,
+            Some(&skipped.reason),
+        );
+    }
 
     // dest→source first, for every explicitly configured branch: any content
     // dest carries that gitprism didn't itself put there (e.g. a merged PR)
@@ -222,14 +243,30 @@ fn load_run_policy(config_path: &Path, source_root: &Path) -> Result<policy::Ver
     policy::load(config_path, &source_root.join(exclude::FILENAME))
 }
 
+/// A local branch [`list_source_branches`] could not read as a mirror
+/// candidate — its escaped display name (never valid UTF-8, or
+/// `validate_branch_name` would have accepted it) plus why it's being
+/// skipped, for [`run`] to report as a per-branch [`Outcome::Warning`]
+/// (decisions/0024's precedent: an operator-controlled oddity on a
+/// discovered branch is a warning that keeps reappearing until fixed, not a
+/// whole-run abort).
+pub(crate) struct SkippedSourceBranch {
+    pub(crate) display_name: String,
+    pub(crate) reason: String,
+}
+
 /// Every local branch that exists on source right now, sorted for
 /// deterministic run order (git2's branch iteration order isn't guaranteed).
 /// Read once by [`run`] — before either sync phase starts, purely to size
 /// [`Reporter`]'s upfront total (decisions/0020, point 3) — and reused for
 /// the source→dest loop rather than listed again. A local, read-only `git
-/// branch` enumeration; no fetch involved.
-fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
+/// branch` enumeration; no fetch involved. A branch whose name isn't valid
+/// UTF-8 is reported back via the second element rather than failing the
+/// whole listing — decisions/0024's precedent for a branch gitprism
+/// discovered but can't act on.
+fn list_source_branches(repo: &Repository) -> Result<(Vec<String>, Vec<SkippedSourceBranch>)> {
     let mut source_branches = Vec::new();
+    let mut skipped = Vec::new();
     for entry in repo
         .branches(Some(git2::BranchType::Local))
         .context("listing source's local branches")?
@@ -244,18 +281,25 @@ fn list_source_branches(repo: &Repository) -> Result<Vec<String>> {
         let name_bytes = branch
             .name_bytes()
             .context("reading a local branch's name")?;
-        let name = std::str::from_utf8(name_bytes).with_context(|| {
-            format!(
-                "a local branch has a non-UTF-8 name gitprism can't mirror by: {}",
-                git::escape_bytes(name_bytes)
-            )
-        })?;
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(name) => name,
+            Err(_) => {
+                let display_name = git::escape_bytes(name_bytes);
+                skipped.push(SkippedSourceBranch {
+                    reason: format!(
+                        "local branch {display_name} has a non-UTF-8 name gitprism can't mirror — skipped this run"
+                    ),
+                    display_name,
+                });
+                continue;
+            }
+        };
         crate::git::validate_branch_name(name)
             .with_context(|| format!("validating local branch {name:?}"))?;
         source_branches.push(name.to_string());
     }
     source_branches.sort();
-    Ok(source_branches)
+    Ok((source_branches, skipped))
 }
 
 /// Pushes `branch`'s pending commits from source to a same-named branch on
@@ -1184,8 +1228,14 @@ fn already_merged_into_a_landing_branch(
         // No shared history at all between this branch and the landing
         // branch — nothing a 3-way merge can evaluate, so this landing branch
         // has nothing to say about whether `branch_tip` is merged.
-        let Ok(merge_base) = repo.merge_base(branch_tip, landing_tip) else {
-            continue;
+        let merge_base = match repo.merge_base(branch_tip, landing_tip) {
+            Ok(oid) => oid,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "finding a merge base between this branch and landing branch {landing:?}"
+                )));
+            }
         };
 
         // `branch_tip` has no commits of its own beyond where it diverged
@@ -1595,13 +1645,19 @@ fn filter_tree_with_budget(
             )
         })?;
         let rel_path = prefix.join(name);
-        let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
+        let is_tree = entry.kind() == Some(git2::ObjectType::Tree);
+        // A submodule gitlink counts as a directory for ignore-pattern
+        // matching, matching `git check-ignore`'s own DT_DIR treatment of
+        // gitlinks, even though it is never recursed into like a tree
+        // (decisions/0011 addendum).
+        let is_gitlink = entry.filemode() == i32::from(git2::FileMode::Commit);
+        let is_dir = is_tree || is_gitlink;
 
         if exclude_list.is_excluded(&rel_path, is_dir) {
             continue;
         }
 
-        if is_dir {
+        if is_tree {
             let subtree = repo
                 .find_tree(entry.id())
                 .with_context(|| format!("reading subtree {}", rel_path.display()))?;
@@ -2467,7 +2523,8 @@ fn dest_anchor_for_branch(
     // which is exactly what makes anchoring on a round-tripped candidate
     // here as safe as a mirror-only one).
     let mut survivors: Vec<(String, Oid)> = Vec::new();
-    for candidate in list_source_branches(repo)? {
+    let (candidates, _skipped) = list_source_branches(repo)?;
+    for candidate in candidates {
         if candidate == branch {
             continue;
         }
@@ -2483,8 +2540,14 @@ fn dest_anchor_for_branch(
             .id();
         // No shared history at all with this candidate — same guard
         // `already_merged_into_a_landing_branch` already uses.
-        let Ok(cbase) = repo.merge_base(source_tip, candidate_tip) else {
-            continue;
+        let cbase = match repo.merge_base(source_tip, candidate_tip) {
+            Ok(oid) => oid,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "finding a merge base between this branch and sibling candidate {candidate:?}"
+                )));
+            }
         };
         // A candidate less specific than what the baseline already found is
         // never an improvement — bounds the search to real refinements only.
@@ -6344,6 +6407,28 @@ mod tests {
     }
 
     #[test]
+    fn run_reports_the_repository_error_for_a_wrong_cwd_not_the_state_key_error() {
+        // F-14: repository discovery must run before state-key validation,
+        // so a wrong cwd reports "not a git repository," never a state-key
+        // complaint (`marker::load_key` uses a fixed test key and can't
+        // itself fail here, but the ordering this guards is the same either
+        // way — see the F-14 report note in this commit).
+        let dir = tempdir().unwrap();
+
+        let error = run(dir.path(), Path::new(".gitprism.toml"))
+            .expect_err("running outside any git repository must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be run inside an existing git repository"),
+            "expected the repository-discovery error, got: {message}"
+        );
+        assert!(
+            !message.to_uppercase().contains("GITPRISM_STATE_KEY"),
+            "the repository error must not be shadowed by a state-key complaint: {message}"
+        );
+    }
+
+    #[test]
     fn run_succeeds_without_a_source_url_when_nothing_needs_pushing_to_source() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
         unsafe {
@@ -6418,13 +6503,72 @@ mod tests {
         repo.branch("zeta", &root_commit, false).unwrap();
         repo.branch("alpha", &root_commit, false).unwrap();
 
-        let branches =
+        let (branches, skipped) =
             list_source_branches(&repo).expect("listing source's local branches should succeed");
 
         assert_eq!(
             branches,
             vec!["alpha".to_string(), "main".to_string(), "zeta".to_string()],
             "every local branch must be listed, sorted for deterministic run order"
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_source_branches_warns_about_and_skips_a_non_utf8_branch_name() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+        let root = repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "root",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        // git2's safe `Repository::branch`/`reference` API requires a valid
+        // `&str` name, and even a raw loose-ref *filename* with invalid
+        // UTF-8 bytes is rejected by some filesystems (macOS's among them).
+        // `packed-refs` sidesteps both: it's one ordinarily-named file whose
+        // *content* — where the ref name lives, not the path — a
+        // filesystem never validates as text, giving the same genuinely
+        // non-UTF-8 ref a real `git gc --aggressive` run can produce
+        // (decisions/0024's precedent is for exactly this kind of
+        // operator-controlled, but gitprism-unreadable, oddity).
+        let mut packed_refs = Vec::new();
+        packed_refs.extend_from_slice(b"# pack-refs with: peeled fully-peeled sorted\n");
+        packed_refs.extend_from_slice(root.to_string().as_bytes());
+        packed_refs.push(b' ');
+        packed_refs.extend_from_slice(b"refs/heads/feature-");
+        packed_refs.extend_from_slice(&[0xFF, 0xFE]);
+        packed_refs.push(b'\n');
+        std::fs::write(repo.path().join("packed-refs"), packed_refs).unwrap();
+
+        let (branches, skipped) = list_source_branches(&repo)
+            .expect("a non-UTF-8 branch name must not fail the whole listing");
+
+        assert_eq!(
+            branches,
+            vec!["main".to_string()],
+            "the non-UTF-8 branch must be skipped, not silently mirrored under some other name"
+        );
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the non-UTF-8 branch must be reported as skipped"
+        );
+        assert!(
+            skipped[0].reason.contains("non-UTF-8"),
+            "the skip reason must explain why: {}",
+            skipped[0].reason
         );
     }
 
@@ -6522,6 +6666,63 @@ mod tests {
         assert!(
             filtered.get_name("secret.txt").is_none(),
             "an excluded file must still be dropped alongside preserving the others' filemodes"
+        );
+    }
+
+    #[test]
+    fn filter_tree_directory_only_pattern_matches_a_submodule_gitlink_but_not_a_symlink() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let exclude_list = ExcludeList::from_contents("vendor-secret/\n").unwrap();
+
+        let gitlink_target = repo
+            .commit(
+                None,
+                &git2::Signature::now("Test", "test@example.com").unwrap(),
+                &git2::Signature::now("Test", "test@example.com").unwrap(),
+                "submodule commit",
+                &repo
+                    .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+                    .unwrap(),
+                &[],
+            )
+            .unwrap();
+        let shared_blob = repo.blob(b"shared").unwrap();
+        let mut gitlink_builder = repo.treebuilder(None).unwrap();
+        gitlink_builder
+            .insert("shared.txt", shared_blob, git2::FileMode::Blob.into())
+            .unwrap();
+        gitlink_builder
+            .insert(
+                "vendor-secret",
+                gitlink_target,
+                git2::FileMode::Commit.into(),
+            )
+            .unwrap();
+        let gitlink_tree = repo.find_tree(gitlink_builder.write().unwrap()).unwrap();
+
+        let filtered_oid = filter_tree(&repo, &gitlink_tree, Path::new(""), &exclude_list)
+            .expect("filtering a tree with a submodule gitlink should succeed");
+        let filtered = repo.find_tree(filtered_oid).unwrap();
+        assert!(filtered.get_name("shared.txt").is_some());
+        assert!(
+            filtered.get_name("vendor-secret").is_none(),
+            "a directory-only exclude pattern must match a submodule gitlink of the same name"
+        );
+
+        let link_blob = repo.blob(b"target.txt").unwrap();
+        let mut symlink_builder = repo.treebuilder(None).unwrap();
+        symlink_builder
+            .insert("vendor-secret", link_blob, git2::FileMode::Link.into())
+            .unwrap();
+        let symlink_tree = repo.find_tree(symlink_builder.write().unwrap()).unwrap();
+
+        let filtered_oid = filter_tree(&repo, &symlink_tree, Path::new(""), &exclude_list)
+            .expect("filtering a tree with a symlink should succeed");
+        let filtered = repo.find_tree(filtered_oid).unwrap();
+        assert!(
+            filtered.get_name("vendor-secret").is_some(),
+            "a directory-only exclude pattern must not match a symlink of the same name"
         );
     }
 
