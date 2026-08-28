@@ -55,20 +55,9 @@ fn git_command() -> Command {
     command.env_remove("GITPRISM_STATE_KEY");
     command.env_remove("GITPRISM_SOURCE_URL");
     command.env_remove("GITPRISM_DEST_URL");
-    // A remote URL only ever reaches configured-remote-shaped `-C repo_dir
-    // fetch/ls-remote/push -- url ...` call sites; `git`'s own `ext::`/`fd::`
-    // transports are already refused by its default `protocol.allow`, but
-    // that default is ambient user/system config, not something gitprism
-    // controls. Pin it here so a policy-approved malicious URL can't gain an
-    // `ext::`/`fd::` transport through an operator's own git config either
-    // (an explicit `protocol.<name>.allow=always` in that config still wins,
-    // same as it would for a real `git` invocation — this closes the
-    // implicit-default gap, not that one). A local path as the configured
-    // remote (this crate's own test suite's primary fixture shape, and a
-    // legitimate deployment shape gitprism itself never rejects) uses the
-    // `file` transport, which shares `ext`'s "ambient user config" default
-    // policy — allow it back explicitly so this hardening doesn't silently
-    // disable a supported remote shape.
+    // Refuse `ext::`/`fd::` transports independent of ambient protocol.allow
+    // config. `file` shares the same "user" default and is a supported remote
+    // shape, so it is allowed back explicitly.
     command.env("GIT_PROTOCOL_FROM_USER", "0");
     command.arg("-c").arg("protocol.file.allow=always");
     // The repo we operate on (via -C) may be a CI checkout whose .git/config
