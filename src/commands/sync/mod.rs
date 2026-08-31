@@ -558,12 +558,12 @@ fn sync_pair_to_dest_with_key(
             // either — this branch's own ancestry already carries dest
             // content, inherited from whichever branch it was created from
             // (typically a branch `setup` grafted), so the nearest
-            // `Gitprism-Dest-Commit` trailer reachable from `source_tip`
-            // names both the dest-space tree to build the new chain onto and
-            // the source-space boundary `pending_commits` should resume
-            // from — the same graft-derived ancestry decisions/0006
-            // established, just read directly off source's own history
-            // instead of off a dest ref that doesn't exist. But unlike a
+            // authenticated mapping reachable from `source_tip` names both
+            // the dest-space tree to build the new chain onto and the
+            // source-space boundary `pending_commits` should resume from —
+            // the same graft-derived ancestry decisions/0006 established,
+            // just read directly from the per-run mapping index instead of
+            // from a dest ref that doesn't exist. But unlike a
             // `config.branches` entry, nothing guarantees this discovered
             // branch (decisions/0017) shares any ancestry with dest at all —
             // handled below (decisions/0024) the same way
@@ -1246,8 +1246,9 @@ pub(crate) fn build_dest_commit(
 /// decisions/0044: the tip to create/rebuild a dest ref at when nothing was
 /// built — `dest_tip` itself if [`anchor::dest_tip_is_accounted_for`]
 /// recognizes it for *this* branch, otherwise a content-empty marker commit
-/// on top of it (a sibling's anchor carries the sibling's marker, not this
-/// branch's).
+/// on top of it. An inherited anchor carries another branch's marker, so the
+/// branch gets its own content-empty marker when branch accounting requires
+/// it.
 fn branch_scoped_dest_tip(
     repo: &Repository,
     config: &Config,

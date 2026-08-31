@@ -62,9 +62,10 @@ pub(crate) fn find_control_file_policy_mismatch(
 
         // Same loop-prevention `build_pending_dest_tip` itself applies (see
         // `super::loop_prevented`): a commit that's already on dest — for
-        // `branch` or, per decisions/0043's addendum, for whichever branch
-        // its own `DestToSource` marker names — is never replayed onto dest
-        // by this branch's sync, so it's not this check's business either.
+        // `branch` or for whichever branch its own `DestToSource` marker
+        // names — is never replayed onto dest by this branch's sync, so it's
+        // not this check's business either. This cross-branch marker rule is
+        // retained by decisions/0046.
         if super::loop_prevented(&commit, branch, key) {
             continue;
         }

@@ -168,7 +168,7 @@ pub(crate) fn dest_resume_point_for_branch(
     }
 
     // The trailer might name a commit this clone doesn't even have — a
-    // sibling clone's own source commit is never transmitted to dest, only
+    // another clone's own source commit is never transmitted to dest, only
     // the filtered commit it produced is, so an unrelated or behind clone has
     // no way to have fetched it. That's just as unsafe to build on as a
     // confirmed non-ancestor, so it's checked (and rejected) before asking
