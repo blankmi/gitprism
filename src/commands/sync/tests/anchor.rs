@@ -956,7 +956,7 @@ fn sync_pair_to_dest_incorporates_a_benign_race_on_a_mirror_only_branch_via_reco
 
 #[test]
 fn sync_pair_to_dest_recovers_from_a_stale_no_dest_ref_cache_entry_on_a_race_retry() {
-    // decisions/0043 step 2's dest-ref cache is a per-run performance
+    // The dest-ref cache is a per-run performance
     // optimization, not license to skip re-detecting a real race: if
     // the cache already (wrongly) believes `feature-x` has no dest ref
     // yet — stands in for an earlier branch's own anchor search having
@@ -1242,35 +1242,10 @@ fn run_halts_only_a_dest_native_branch_colliding_with_a_same_named_discovered_br
 }
 
 #[test]
-fn ambiguous_anchor_message_names_every_candidate_and_its_merge_base() {
-    let oid_a = Oid::from_str("4eb55376359199a3a77cd9f2e3aad225b78ea671").unwrap();
-    let oid_b = Oid::from_str("7beb3580803dc21f883872ca2d9e010ff0078638").unwrap();
-    let message = ambiguous_anchor_message(
-        "task",
-        &[
-            ("feature-a".to_string(), oid_a),
-            ("feature-b".to_string(), oid_b),
-        ],
-    );
-    assert!(
-        message.contains("\"task\""),
-        "must name the branch: {message}"
-    );
-    assert!(
-        message.contains("\"feature-a\"") && message.contains(&oid_a.to_string()),
-        "must name feature-a and its merge-base: {message}"
-    );
-    assert!(
-        message.contains("\"feature-b\"") && message.contains(&oid_b.to_string()),
-        "must name feature-b and its merge-base: {message}"
-    );
-}
-
-#[test]
 fn sync_pair_to_dest_anchors_a_task_branch_on_its_mirror_only_parent_feature_branch() {
     // task branched from mirror-only feature branched from round-tripped
-    // main: task's dest chain must anchor on feature's own dest tip, not
-    // on main's original graft — decisions/0043's central case.
+    // main: task's dest chain must anchor on feature's exact mapped commit,
+    // not on main's original graft — decisions/0046's branch-local case.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -1289,18 +1264,23 @@ fn sync_pair_to_dest_anchors_a_task_branch_on_its_mirror_only_parent_feature_bra
         .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
         .unwrap();
     add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
-    let feature_tip = source_repo
+    let feature_first = source_repo
         .find_branch("feature", git2::BranchType::Local)
         .unwrap()
         .get()
         .peel_to_commit()
         .unwrap()
         .id();
+    add_commit(
+        &source_repo,
+        "feature",
+        &[("feature-second.txt", "line2\n")],
+    );
 
     source_repo
         .branch(
             "task",
-            &source_repo.find_commit(feature_tip).unwrap(),
+            &source_repo.find_commit(feature_first).unwrap(),
             false,
         )
         .unwrap();
@@ -1329,6 +1309,9 @@ fn sync_pair_to_dest_anchors_a_task_branch_on_its_mirror_only_parent_feature_bra
         .get()
         .peel_to_commit()
         .unwrap();
+    let dest_feature_first = dest_repo
+        .find_commit(dest_feature_tip.parent_id(0).unwrap())
+        .unwrap();
 
     sync_pair_to_dest(
         &repo,
@@ -1338,7 +1321,7 @@ fn sync_pair_to_dest_anchors_a_task_branch_on_its_mirror_only_parent_feature_bra
         &reporter,
         &mut dest_ref_cache,
     )
-    .expect("task must mirror to dest, anchored on feature's own dest tip");
+    .expect("task must mirror to dest, anchored on feature's exact mapping");
     let dest_task_tip = dest_repo
         .find_branch("task", git2::BranchType::Local)
         .expect("task must be mirrored to dest")
@@ -1346,32 +1329,36 @@ fn sync_pair_to_dest_anchors_a_task_branch_on_its_mirror_only_parent_feature_bra
         .peel_to_commit()
         .unwrap();
 
-    // Real shared ancestry: task's dest commit is built directly onto
-    // feature's own dest tip, not re-flattened onto main's graft.
+    // Real shared ancestry: task's dest commit is built directly onto the
+    // exact feature commit where task forked, not re-flattened onto main's
+    // graft or feature's later commit.
     assert_eq!(
         dest_task_tip.parent_id(0).unwrap(),
-        dest_feature_tip.id(),
-        "task's dest commit must be built directly onto feature's own dest tip, \
-         not re-mirrored from main's graft"
+        dest_feature_first.id(),
+        "task's dest commit must use the intermediate feature mapping, not \
+         re-mirror feature's earlier commit from main's graft"
     );
 
-    // A PR-shaped diff: exactly one new commit beyond feature's own
-    // tip — task's own task.txt commit, not a second copy of feature's
-    // history.
+    // A PR-shaped diff: exactly one new commit beyond the feature commit
+    // where task forked — task's own task.txt commit.
     let mut walk = dest_repo.revwalk().unwrap();
     walk.push(dest_task_tip.id()).unwrap();
-    walk.hide(dest_feature_tip.id()).unwrap();
+    walk.hide(dest_feature_first.id()).unwrap();
     let commits_since_feature: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
     assert_eq!(
         commits_since_feature.len(),
         1,
-        "task's dest chain must add exactly one commit onto feature's own dest tip"
+        "task's dest chain must add exactly one commit onto its feature fork point"
     );
 
     let task_tree = dest_task_tip.tree().unwrap();
     assert!(
         task_tree.get_name("feature.txt").is_some(),
         "task's dest tree must still carry feature.txt, inherited from feature's own tip"
+    );
+    assert!(
+        task_tree.get_name("feature-second.txt").is_none(),
+        "the child must anchor at the intermediate mapping, before feature's later commit"
     );
     assert!(task_tree.get_name("task.txt").is_some());
 }
@@ -1383,10 +1370,9 @@ fn run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it() 
     // a `DestToSource` marker M (dest→source). `task`, forked from
     // main's tip *after* that import, inherits M as an ancestor. M is
     // scoped to "main", not "task" — `task`'s own resume-boundary scan
-    // and decisions/0043's sibling search both correctly don't accept it
-    // as *task's own* marker, but before the fix, loop prevention didn't
-    // accept it either, so `task`'s sync re-replayed M's filtered
-    // content as a brand-new commit — X duplicated onto dest's task.
+    // and the old sibling search both failed to use it as task's anchor.
+    // The exact mapping index now anchors task at M, while loop prevention
+    // still prevents any inherited marker from being replayed.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -1466,16 +1452,9 @@ fn run_task_forked_from_main_after_a_dest_native_import_does_not_duplicate_it() 
 
 #[test]
 fn build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch() {
-    // decisions/0043's addendum (F-04), isolating loop prevention from
-    // the anchor-search fix above: "main" is deliberately kept out of
-    // `task`'s sibling candidates (decisions/0043's own accepted
-    // "wrong order" ordering hazard, forced here via the cache instead
-    // of real timing), so `task`'s first sync falls all the way back to
-    // the original graft — M ends up inside `pending` regardless of how
-    // precise the anchor search is. Only loop prevention recognizing
-    // M's own `DestToSource` marker (scoped to "main", not "task") can
-    // stop it from being replayed as a duplicate of the already-
-    // imported X.
+    // A dest-to-source marker scoped to "main" is inherited by "task".
+    // The exact mapping index anchors task on that imported destination
+    // commit, so the source-side history is not replayed as a duplicate.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -1543,10 +1522,7 @@ fn build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_anothe
     source_repo.branch("task", &main_tip, false).unwrap();
     add_commit(&source_repo, "task", &[("task.txt", "t\n")]);
 
-    // Forces the baseline fallback for `task`'s first sync: "main" is
-    // excluded from the sibling search's candidates even though its
-    // dest ref really does exist (decisions/0043 step 2's cache, seeded
-    // by hand rather than by real cross-run timing).
+    // Keep this direct helper call independent of the full run's pre-pass.
     let mut task_run_cache = RunCache::default();
     task_run_cache
         .dest_ref_exists
@@ -1573,245 +1549,9 @@ fn build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_anothe
     let commits_since_graft: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
     assert_eq!(
         commits_since_graft.len(),
-        2,
-        "task's flattened chain must replay s1.txt and its own commit only — M must be loop-\
-         prevented even though it's scoped to \"main\", not \"task\""
-    );
-}
-
-#[test]
-fn dest_anchor_for_branch_is_stateless_and_finds_a_sibling_mirrored_since_its_last_call() {
-    // The same task/feature/main topology, processed in the "wrong"
-    // order: task's own anchor search runs before feature has a dest
-    // ref, and must fall back to the coarser baseline (main's graft).
-    // The identical search, called again once feature has since been
-    // mirrored, finds feature as the more specific anchor.
-    //
-    // This proves `dest_anchor_for_branch` itself is stateless and
-    // order-independent — not that an ordinary resync of an
-    // already-mirrored `task` re-invokes it. Decisions/0043 is explicit
-    // that it does not: once `task` has any dest ref, only a positively
-    // detected rewrite of `task`'s own source history (decisions/0039)
-    // ever calls this search again. This test exercises the primitive
-    // directly for exactly that reason — it is what a rewrite-triggered
-    // rebuild relies on to actually pick up the improved anchor once
-    // re-invoked, not a demonstration of automatic self-correction on
-    // an unrelated branch's ordinary resync.
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
-    let feature_tip = source_repo
-        .find_branch("feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch(
-            "task",
-            &source_repo.find_commit(feature_tip).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
-    let task_tip = source_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    let dest_url = dest_dir.path().display().to_string();
-    let key = marker::load_key().unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-
-    // feature has no dest ref yet — task's search falls back to the
-    // baseline (main's graft) exactly. A fresh, empty cache each call
-    // below — the cache is purely a dest-ref-lookup accuracy
-    // optimization (decisions/0043 step 2), not the "memory between
-    // calls" this test disproves, so every call starts knowing nothing
-    // and must still arrive at the right answer from real repo state.
-    let mut anchor_cache_1 = RunCache::default();
-    let anchor = dest_anchor_for_branch(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "task",
-        task_tip,
-        &key,
-        &mut anchor_cache_1,
-    )
-    .unwrap();
-    assert_eq!(
-        anchor,
-        DestAnchor::Resolved(graft, dest_tip),
-        "with feature not yet mirrored, task's anchor must fall back to the baseline"
-    );
-
-    // feature is mirrored now — a clean, independent sync with no other
-    // sibling holding a dest ref yet to interact with.
-    let config = Config::load(write_config("unused", &dest_url, &["main"]).path()).unwrap();
-    let reporter = Reporter::new(1, std::iter::empty());
-    let mut sync_cache = RunCache::default();
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "feature",
-        &reporter,
-        &mut sync_cache,
-    )
-    .expect("feature must mirror to dest");
-    let dest_feature_tip = dest_repo
-        .find_branch("feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    // The identical search, called again for task with another fresh,
-    // empty cache, now finds feature as the more specific anchor —
-    // proving the search itself is stateless, not that anything
-    // re-invokes it automatically for an already-mirrored task (it does
-    // not; see decisions/0043).
-    let mut anchor_cache_2 = RunCache::default();
-    let anchor = dest_anchor_for_branch(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "task",
-        task_tip,
-        &key,
-        &mut anchor_cache_2,
-    )
-    .unwrap();
-    assert_eq!(
-        anchor,
-        DestAnchor::Resolved(feature_tip, dest_feature_tip),
-        "once feature is mirrored, a fresh call to the search must find its own dest tip"
-    );
-}
-
-#[test]
-fn run_hard_fails_only_the_branch_with_two_incomparable_mirrored_ancestors() {
-    // Two mirror-only branches, feature-a and feature-b, both branched
-    // directly from the graft and mirrored independently — neither an
-    // ancestor of the other. task is a real two-parent merge of both:
-    // decisions/0043's anchor search finds two equally specific,
-    // incomparable candidates and must hard-fail — but only task's own
-    // line, not the whole run (decisions/0024's per-branch precedent).
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch("feature-a", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature-a", &[("a.txt", "line1\n")]);
-    let feature_a_tip = source_repo
-        .find_branch("feature-a", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-
-    source_repo
-        .branch("feature-b", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature-b", &[("b.txt", "line1\n")]);
-    let feature_b_tip = source_repo
-        .find_branch("feature-b", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-
-    // task: a real two-parent merge of feature-a and feature-b.
-    let signature = Signature::now("A Developer", "dev@example.com").unwrap();
-    let merge_oid = source_repo
-        .commit(
-            None,
-            &signature,
-            &signature,
-            "merge feature-a and feature-b",
-            &feature_a_tip.tree().unwrap(),
-            &[&feature_a_tip, &feature_b_tip],
-        )
-        .unwrap();
-    source_repo
-        .branch("task", &source_repo.find_commit(merge_oid).unwrap(), false)
-        .unwrap();
-
-    let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
-    let err = run(source_dir.path(), config.path())
-        .expect_err("an ambiguous dest anchor must fail the overall run");
-    // The run's own aggregate message stays deliberately generic
-    // (decisions/0037's own precedent — the per-branch reporter line,
-    // asserted via `ambiguous_anchor_message`'s own unit test below,
-    // carries the specific candidate names and merge-base oids).
-    assert!(
-        format!("{err:#}").to_lowercase().contains("ambiguous"),
-        "the run's own error should mention the ambiguous anchor: {err:#}"
-    );
-
-    // Other branches were unaffected: both siblings still mirrored.
-    assert!(
-        dest_repo
-            .find_branch("feature-a", git2::BranchType::Local)
-            .is_ok()
-    );
-    assert!(
-        dest_repo
-            .find_branch("feature-b", git2::BranchType::Local)
-            .is_ok()
-    );
-    let dest_main_tip = dest_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-    assert_eq!(
-        dest_main_tip, dest_tip,
-        "main's own sync must proceed normally alongside the halted branch"
-    );
-
-    // task itself was never pushed to dest.
-    assert!(
-        dest_repo
-            .find_branch("task", git2::BranchType::Local)
-            .is_err(),
-        "a branch with an ambiguous dest anchor must never be pushed to dest"
+        3,
+        "task's chain must reuse the exact imported destination mapping, retaining the\
+         existing s1 and X projections and adding only task's own commit"
     );
 }
 
@@ -2003,453 +1743,12 @@ fn sync_pair_to_dest_rewrite_rebuild_anchors_on_a_sibling_mirror_only_branch_too
 }
 
 #[test]
-fn dest_anchor_for_branch_equal_cbase_siblings_are_resolved_not_ambiguous() {
-    // feature-a and feature-b both diverge from the exact same shared
-    // commit, and task also branches from that same commit: task's
-    // merge-base against feature-a and against feature-b is literally
-    // the same oid, not merely two candidates that each tie the
-    // baseline independently. Equal is the opposite of incomparable —
-    // this must resolve, not read as ambiguous.
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch("shared", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "shared", &[("shared_feature.txt", "line1\n")]);
-    let shared_tip = source_repo
-        .find_branch("shared", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch(
-            "feature-a",
-            &source_repo.find_commit(shared_tip).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(
-        &source_repo,
-        "feature-a",
-        &[("feature_a_only.txt", "line1\n")],
-    );
-    source_repo
-        .branch(
-            "feature-b",
-            &source_repo.find_commit(shared_tip).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(
-        &source_repo,
-        "feature-b",
-        &[("feature_b_only.txt", "line1\n")],
-    );
-
-    source_repo
-        .branch("task", &source_repo.find_commit(shared_tip).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
-    let task_tip = source_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
-    )
-    .unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-    let reporter = Reporter::new(1, std::iter::empty());
-    let mut dest_ref_cache = RunCache::default();
-
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "feature-a",
-        &reporter,
-        &mut dest_ref_cache,
-    )
-    .expect("feature-a must mirror to dest");
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "feature-b",
-        &reporter,
-        &mut dest_ref_cache,
-    )
-    .expect("feature-b must mirror to dest");
-
-    // feature-a's mirror replays two commits onto the graft (shared's
-    // own commit, then feature-a's own) — its dest tip's parent is the
-    // commit that actually carries the `Gitprism-Source-Commit` trailer
-    // naming `shared_tip` exactly, which is the real dest-space anchor
-    // decisions/0043 step 5 resolves to, not feature-a's live tip.
-    let dest_feature_a_shared_commit = dest_repo
-        .find_branch("feature-a", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .parent_id(0)
-        .unwrap();
-
-    let dest_url = dest_dir.path().display().to_string();
-    let key = marker::load_key().unwrap();
-
-    let mut anchor_cache = RunCache::default();
-    let anchor = dest_anchor_for_branch(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "task",
-        task_tip,
-        &key,
-        &mut anchor_cache,
-    )
-    .unwrap();
-    assert_eq!(
-        anchor,
-        DestAnchor::Resolved(shared_tip, dest_feature_a_shared_commit),
-        "two siblings with the exact same merge-base must resolve, picking the \
-         lexicographically smallest name (\"feature-a\"), not read as ambiguous"
-    );
-
-    // Deterministic: re-running the identical search from scratch
-    // produces the same result every time.
-    let mut anchor_cache_2 = RunCache::default();
-    let anchor_again = dest_anchor_for_branch(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "task",
-        task_tip,
-        &key,
-        &mut anchor_cache_2,
-    )
-    .unwrap();
-    assert_eq!(
-        anchor, anchor_again,
-        "the equal-cbase tie-break must be deterministic across repeated calls"
-    );
-}
-
-#[test]
-fn dest_anchor_for_branch_tries_every_equal_cbase_candidate_not_just_the_alphabetically_first() {
-    // z-feature mirrors first at shared commit S. a-feature mirrors
-    // second, and — since z-feature already has a dest ref by
-    // then — a-feature's own anchor search finds z-feature as its own
-    // more specific anchor and builds directly onto it, rather than
-    // re-projecting S independently. So a-feature's own dest history
-    // carries no branch-scoped marker naming S at all; only
-    // z-feature's does. A naive fix that collapses equal-cbase
-    // candidates to one representative *before* checking each one's own
-    // dest history — picking "a-feature" for being alphabetically
-    // first — would try only the one candidate with nothing to find,
-    // and silently fall back to the coarser baseline even though
-    // z-feature's real, more specific anchor is right there. This is
-    // the exact shape reported in review of the first fix.
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch("shared", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "shared", &[("shared_feature.txt", "line1\n")]);
-    let shared_tip = source_repo
-        .find_branch("shared", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch(
-            "z-feature",
-            &source_repo.find_commit(shared_tip).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(&source_repo, "z-feature", &[("z_only.txt", "line1\n")]);
-
-    source_repo
-        .branch(
-            "a-feature",
-            &source_repo.find_commit(shared_tip).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(&source_repo, "a-feature", &[("a_only.txt", "line1\n")]);
-
-    source_repo
-        .branch("task", &source_repo.find_commit(shared_tip).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
-    let task_tip = source_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
-    )
-    .unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-    let reporter = Reporter::new(1, std::iter::empty());
-    let mut dest_ref_cache = RunCache::default();
-
-    // z-feature mirrors first — its own dest chain independently
-    // projects shared_tip, branch-scoped to "z-feature".
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "z-feature",
-        &reporter,
-        &mut dest_ref_cache,
-    )
-    .expect("z-feature must mirror to dest");
-    let dest_z_feature_shared_commit = dest_repo
-        .find_branch("z-feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .parent_id(0)
-        .unwrap();
-
-    // a-feature mirrors second, with z-feature already mirrored — its
-    // own anchor search must find z-feature and build directly onto it.
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "a-feature",
-        &reporter,
-        &mut dest_ref_cache,
-    )
-    .expect("a-feature must mirror to dest, anchored on z-feature");
-    let dest_a_feature_tip = dest_repo
-        .find_branch("a-feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-    assert_eq!(
-        dest_a_feature_tip.parent_id(0).unwrap(),
-        dest_z_feature_shared_commit,
-        "a-feature must build directly onto z-feature's own dest tip, not re-project \
-         shared_tip independently — confirming a-feature's own dest history has no \
-         branch-scoped marker naming shared_tip for the test below to matter"
-    );
-
-    let dest_url = dest_dir.path().display().to_string();
-    let key = marker::load_key().unwrap();
-    let mut anchor_cache = RunCache::default();
-    let anchor = dest_anchor_for_branch(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "task",
-        task_tip,
-        &key,
-        &mut anchor_cache,
-    )
-    .unwrap();
-    assert_eq!(
-        anchor,
-        DestAnchor::Resolved(shared_tip, dest_z_feature_shared_commit),
-        "task must anchor on z-feature's real, more specific projection of shared_tip, \
-         not silently fall back to the coarser baseline just because a-feature — the \
-         alphabetically first equal-cbase candidate — has no marker of its own to find"
-    );
-}
-
-#[test]
-fn dest_anchor_for_branch_hard_fails_when_equal_cbase_candidates_resolve_differently() {
-    // Two branches independently, separately given their own valid
-    // SourceToDest projection of the exact same source commit S — not
-    // through gitprism's own recursive anchoring (which would make one
-    // defer to the other, as in the test above), but as if each was
-    // mirrored in total isolation from the other, e.g. by two clones
-    // that never saw each other's dest ref. Both are equally specific,
-    // genuinely different dest-space anchors for the same S — gitprism
-    // must hard-fail this, not silently pick one.
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch("shared", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    let s = add_commit(&source_repo, "shared", &[("shared_feature.txt", "line1\n")]);
-
-    source_repo
-        .branch("feature-x", &source_repo.find_commit(s).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature-x", &[("x_only.txt", "line1\n")]);
-    source_repo
-        .branch("feature-y", &source_repo.find_commit(s).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature-y", &[("y_only.txt", "line1\n")]);
-
-    source_repo
-        .branch("task", &source_repo.find_commit(s).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
-    let task_tip = source_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
-    )
-    .unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-    let key = marker::load_key().unwrap();
-    let exclude_list = ExcludeList::from_contents("").unwrap();
-    let s_commit = repo.find_commit(s).unwrap();
-    let filtered_tree = filter_tree(
-        &repo,
-        &s_commit.tree().unwrap(),
-        Path::new(""),
-        &exclude_list,
-    )
-    .unwrap();
-
-    // Two independent, differently-branded dest projections of the
-    // exact same source commit `s` — the only way to construct this
-    // without one deferring to the other via gitprism's own recursive
-    // anchoring.
-    let dest_x_at_s = build_dest_commit(
-        &repo,
-        &config,
-        graft,
-        &s_commit,
-        filtered_tree,
-        "feature-x",
-        &key,
-    )
-    .unwrap();
-    git::push(
-        source_dir.path(),
-        &dest_dir.path().display().to_string(),
-        dest_x_at_s,
-        "feature-x",
-        PushMode::FastForwardOnly,
-    )
-    .unwrap();
-    let dest_y_at_s = build_dest_commit(
-        &repo,
-        &config,
-        graft,
-        &s_commit,
-        filtered_tree,
-        "feature-y",
-        &key,
-    )
-    .unwrap();
-    git::push(
-        source_dir.path(),
-        &dest_dir.path().display().to_string(),
-        dest_y_at_s,
-        "feature-y",
-        PushMode::FastForwardOnly,
-    )
-    .unwrap();
-
-    let dest_url = dest_dir.path().display().to_string();
-    let mut anchor_cache = RunCache::default();
-    let anchor = dest_anchor_for_branch(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "task",
-        task_tip,
-        &key,
-        &mut anchor_cache,
-    )
-    .unwrap();
-    match anchor {
-        DestAnchor::AmbiguousResolution(candidates) => {
-            let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
-            assert!(
-                names.contains(&"feature-x"),
-                "must name feature-x: {names:?}"
-            );
-            assert!(
-                names.contains(&"feature-y"),
-                "must name feature-y: {names:?}"
-            );
-            let message = ambiguous_resolution_message("task", &candidates);
-            assert!(message.contains("\"task\""));
-            assert!(message.contains(&dest_x_at_s.to_string()));
-            assert!(message.contains(&dest_y_at_s.to_string()));
-        }
-        other => panic!("expected AmbiguousResolution, got {other:?}"),
-    }
-}
-
-#[test]
 fn fetch_dest_tip_cached_hits_the_cache_without_fetching_again() {
-    // decisions/0043 step 5: trying every member of an equal-cbase
-    // group (see the tests above) must not cost a fresh `git fetch` per
-    // member per branch searched — the exact regression a review of the
-    // first fix for this caught: reintroducing O(branch count²) network
-    // calls via `fetch` instead of `ls-remote`. Proven directly, not
-    // just by absence of a slowdown: the second call is pointed at a
-    // deliberately broken remote and must still succeed, returning the
-    // identical oid — which is only possible if it never touched the
-    // remote at all.
+    // A fetched destination tip is cached for the whole run. Proven
+    // directly, not just by absence of a slowdown: the second call is
+    // pointed at a deliberately broken remote and must still succeed,
+    // returning the identical oid — which is only possible if it never
+    // touched the remote at all.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -2524,296 +1823,14 @@ fn fetch_dest_tip_cached_hits_the_cache_without_fetching_again() {
 }
 
 #[test]
-fn sync_pair_to_dest_wrong_order_task_does_not_self_correct_on_an_ordinary_resync() {
-    // task mirrored before feature has a dest ref falls back to the
-    // coarser baseline (main's graft) for that run. decisions/0043 is
-    // explicit that an ordinary LATER resync of task — unchanged, not
-    // rewritten — does not retry the anchor search: the direct
-    // behavioral proof of that now-corrected claim.
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
-    let feature_tip = source_repo
-        .find_branch("feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch(
-            "task",
-            &source_repo.find_commit(feature_tip).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
-
-    let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
-    )
-    .unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-    let reporter = Reporter::new(1, std::iter::empty());
-
-    // "This run": task discovered before feature has a dest ref, then
-    // feature mirrors — one shared cache, matching one run's
-    // per-branch loop (decisions/0043 step 2).
-    let mut run_cache = RunCache::default();
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "task",
-        &reporter,
-        &mut run_cache,
-    )
-    .expect("task must mirror, falling back to the baseline since feature has no dest ref yet");
-    let dest_task_tip_first = dest_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-    // Wrong order, baseline fallback: task's mirror flattens both
-    // feature's own commit and task's own commit directly onto main's
-    // graft (decisions/0043's documented ordering hazard) — two
-    // commits beyond `dest_tip`, not a chain built onto feature's own
-    // dest tip.
-    let mut walk = dest_repo.revwalk().unwrap();
-    walk.push(dest_task_tip_first.id()).unwrap();
-    walk.hide(dest_tip).unwrap();
-    let commits_since_graft: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
-    assert_eq!(
-        commits_since_graft.len(),
-        2,
-        "wrong order: task must fall back to main's graft, replaying feature's and \
-         task's own commits as its own flattened chain"
-    );
-
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "feature",
-        &reporter,
-        &mut run_cache,
-    )
-    .expect("feature must mirror to dest");
-
-    // The shared cache accurately reflects both branches processed
-    // this run — decisions/0043 step 2's read-through/update contract.
-    assert_eq!(run_cache.dest_ref_exists.get("task"), Some(&true));
-    assert_eq!(run_cache.dest_ref_exists.get("feature"), Some(&true));
-
-    // "A later resync": task is completely unchanged, no rewrite — a
-    // fresh cache, since decisions/0043 is explicit this is an
-    // ordinary later resync, not part of the run above.
-    let mut later_cache = RunCache::default();
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "task",
-        &reporter,
-        &mut later_cache,
-    )
-    .expect("an unchanged resync of task must still succeed as a no-op");
-
-    let dest_task_tip_second = dest_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-    assert_eq!(
-        dest_task_tip_second.id(),
-        dest_task_tip_first.id(),
-        "an ordinary resync of an unchanged task must not self-correct onto feature's dest tip"
-    );
-}
-
-#[test]
-fn sync_pair_to_dest_wrong_order_rewrite_of_task_picks_up_feature_as_the_anchor() {
-    // Same wrong-order topology as the no-self-correction test above,
-    // but task itself is then genuinely rewritten (decisions/0039's
-    // four conditions) — the documented operator workaround, proven to
-    // actually rebuild task's dest chain onto feature's dest tip.
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
-
-    let source_dir = tempdir().unwrap();
-    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
-    let graft = source_repo
-        .find_branch("main", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    // feature gets two commits; task's *original* fork point is only
-    // feature's first one, not its eventual tip — so task's wrong-order
-    // flattened mirror below never happens to replay feature's exact
-    // tip commit. Otherwise feature's own later first mirror would tie
-    // exactly onto a commit task's chain already built (a real commit,
-    // correct content, but branded for "task" in its trailer, not
-    // "feature" — decisions/0043 step 5's branch-scoped marker lookup
-    // could then never recognize it as feature's own again), pushing no
-    // new commit and leaving feature with no genuinely "feature"-branded
-    // dest commit for the rewrite below to find.
-    source_repo
-        .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
-        .unwrap();
-    add_commit(&source_repo, "feature", &[("feature_step1.txt", "line1\n")]);
-    let feature_step1 = source_repo
-        .find_branch("feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-    add_commit(&source_repo, "feature", &[("feature_step2.txt", "line1\n")]);
-    let feature_tip = source_repo
-        .find_branch("feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap()
-        .id();
-
-    source_repo
-        .branch(
-            "task",
-            &source_repo.find_commit(feature_step1).unwrap(),
-            false,
-        )
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
-
-    let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
-    )
-    .unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-    let reporter = Reporter::new(1, std::iter::empty());
-
-    // Wrong order, same as above: task mirrors first and falls back to
-    // the baseline, then feature mirrors.
-    let mut run_cache = RunCache::default();
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "task",
-        &reporter,
-        &mut run_cache,
-    )
-    .expect("task must mirror, falling back to the baseline since feature has no dest ref yet");
-    let dest_task_tip_before = dest_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-    // Wrong order, baseline fallback (same shape as the no-self-correct
-    // test above): two flattened commits beyond `dest_tip`.
-    let mut walk = dest_repo.revwalk().unwrap();
-    walk.push(dest_task_tip_before.id()).unwrap();
-    walk.hide(dest_tip).unwrap();
-    let commits_since_graft: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
-    assert_eq!(
-        commits_since_graft.len(),
-        2,
-        "wrong order: task must fall back to main's graft, replaying feature's and \
-         task's own commits as its own flattened chain"
-    );
-
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "feature",
-        &reporter,
-        &mut run_cache,
-    )
-    .expect("feature must mirror to dest");
-    let dest_feature_tip = dest_repo
-        .find_branch("feature", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-
-    // The operator workaround: rewrite task itself (amend-shaped) —
-    // reset to feature's tip and give it a brand-new commit, triggering
-    // decisions/0039's rewrite-rebuild arm on the next sync.
-    source_repo
-        .branch("task", &source_repo.find_commit(feature_tip).unwrap(), true)
-        .unwrap();
-    add_commit(&source_repo, "task", &[("task.txt", "rewritten\n")]);
-
-    let mut later_cache = RunCache::default();
-    sync_pair_to_dest(
-        &repo,
-        source_dir.path(),
-        &config,
-        "task",
-        &reporter,
-        &mut later_cache,
-    )
-    .expect("a rewritten mirror-only branch must rebuild, anchored on its sibling");
-
-    let dest_task_tip_after = dest_repo
-        .find_branch("task", git2::BranchType::Local)
-        .unwrap()
-        .get()
-        .peel_to_commit()
-        .unwrap();
-
-    assert_ne!(
-        dest_task_tip_after.id(),
-        dest_task_tip_before.id(),
-        "the pre-rewrite mirror history must be replaced, not built upon"
-    );
-    assert_eq!(
-        dest_task_tip_after.parent_id(0).unwrap(),
-        dest_feature_tip.id(),
-        "the rebuild must pick up feature as the more specific anchor, proving the \
-         documented operator workaround actually works after the wrong-order case"
-    );
-    let tree = dest_task_tip_after.tree().unwrap();
-    let blob = dest_repo
-        .find_blob(tree.get_name("task.txt").unwrap().id())
-        .unwrap();
-    assert_eq!(blob.content(), b"rewritten\n");
-}
-
-#[test]
 fn run_reproduces_the_round_tripped_feature_rebase_anchor_ambiguity() {
     // Production topology: develop is round-tripped, a round-tripped
     // feature receives develop's change on dest and brings it back to source,
     // a sibling task is mirrored, and a mirror-only task is then rebased onto
     // the feature. The task's resulting graph has the feature as its first
     // parent and the round-tripped develop commit as a second parent, so the
-    // old global merge-base search sees two incomparable candidates.
+    // the superseded global merge-base search sees two incomparable
+    // candidates.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip =
@@ -3011,7 +2028,7 @@ fn run_reproduces_the_round_tripped_feature_rebase_anchor_ambiguity() {
     add_commit(&source_repo, task, &[("task.txt", "after rebase\n")]);
 
     run(source_dir.path(), config.path())
-        .expect("a routine mirror-only rebase must not halt on global merge-base ambiguity");
+        .expect("a routine mirror-only rebase must use the exact branch-local mapping");
 
     let rebuilt_task_tip = dest_repo
         .find_branch(task, git2::BranchType::Local)

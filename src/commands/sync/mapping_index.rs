@@ -20,6 +20,13 @@ pub(crate) struct ResolvedMapping {
     pub(crate) provenance: Vec<MappingProvenance>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MappingLookup {
+    None,
+    Resolved(ResolvedMapping),
+    Contradictory(String),
+}
+
 #[derive(Debug)]
 pub(crate) struct MappingIndex {
     entries: HashMap<Oid, Vec<MappingProvenance>>,
@@ -61,13 +68,22 @@ impl MappingIndex {
         Ok(index)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         repo: &Repository,
         source: Oid,
     ) -> Result<Option<ResolvedMapping>> {
+        match self.resolve_for_anchor(repo, source)? {
+            MappingLookup::None => Ok(None),
+            MappingLookup::Resolved(mapping) => Ok(Some(mapping)),
+            MappingLookup::Contradictory(diagnostic) => anyhow::bail!(diagnostic),
+        }
+    }
+
+    fn resolve_for_anchor(&self, repo: &Repository, source: Oid) -> Result<MappingLookup> {
         let Some(records) = self.entries.get(&source) else {
-            return Ok(None);
+            return Ok(MappingLookup::None);
         };
 
         let mut by_dest: HashMap<Oid, Vec<MappingProvenance>> = HashMap::new();
@@ -124,14 +140,38 @@ impl MappingIndex {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            anyhow::bail!("source commit {source} has contradictory dest mappings: {details}");
+            return Ok(MappingLookup::Contradictory(format!(
+                "source commit {source} has contradictory dest mappings: {details}"
+            )));
         };
 
-        Ok(Some(ResolvedMapping {
+        Ok(MappingLookup::Resolved(ResolvedMapping {
             source,
             dest,
             provenance,
         }))
+    }
+
+    pub(crate) fn nearest_first_parent_mapping(
+        &self,
+        repo: &Repository,
+        tip: Oid,
+    ) -> Result<MappingLookup> {
+        let mut revwalk = first_parent_walk(repo, tip, "source")?;
+        for (scanned, oid) in (&mut revwalk).enumerate() {
+            if scanned >= crate::limits::MAX_MARKER_SCAN_COMMITS {
+                anyhow::bail!(
+                    "source anchor scan exceeds the {} commit limit",
+                    crate::limits::MAX_MARKER_SCAN_COMMITS
+                );
+            }
+            let oid = oid.context("walking source history for an exact mapping")?;
+            match self.resolve_for_anchor(repo, oid)? {
+                MappingLookup::None => {}
+                mapping => return Ok(mapping),
+            }
+        }
+        Ok(MappingLookup::None)
     }
 
     pub(crate) fn add_source_commit(
@@ -668,5 +708,98 @@ mod tests {
         assert_eq!(mapping.dest, root);
         assert_eq!(mapping.provenance.len(), 1);
         assert_eq!(index.entry_count, 1);
+    }
+
+    #[test]
+    fn nearest_mapping_walks_first_parent_and_ignores_mapped_side_parent() {
+        // The ordinary and filtered-only commits have no authenticated
+        // mapping; the merge's mapped side parent must not be considered.
+        let (_dir, repo, root) = empty_repo();
+        let mapped_tree = tree_with_file(&repo, Some(root), "mapped.txt", b"mapped");
+        let mapped = commit(
+            &repo,
+            "refs/heads/main",
+            &[root],
+            mapped_tree,
+            &marker_message(
+                &repo,
+                MarkerDirection::DestToSource,
+                "main",
+                root,
+                &[root],
+                mapped_tree,
+            ),
+        );
+        let ordinary_tree = tree_with_file(&repo, Some(mapped), "ordinary.txt", b"ordinary");
+        let ordinary = commit(
+            &repo,
+            "refs/heads/main",
+            &[mapped],
+            ordinary_tree,
+            "ordinary",
+        );
+        let filtered_tree = tree_with_file(&repo, Some(ordinary), "secret.txt", b"filtered");
+        let filtered = commit(
+            &repo,
+            "refs/heads/main",
+            &[ordinary],
+            filtered_tree,
+            "filtered-only change",
+        );
+        let side_tree = tree_with_file(&repo, Some(filtered), "side.txt", b"side");
+        let side = commit(
+            &repo,
+            "refs/heads/side",
+            &[filtered],
+            side_tree,
+            &marker_message(
+                &repo,
+                MarkerDirection::DestToSource,
+                "side",
+                Oid::from_bytes(&[7; 20]).unwrap(),
+                &[filtered],
+                side_tree,
+            ),
+        );
+        let merge = commit(
+            &repo,
+            "refs/heads/main",
+            &[filtered, side],
+            filtered_tree,
+            "merge side",
+        );
+
+        let index = MappingIndex::reconstruct(
+            &repo,
+            &[("main".to_owned(), merge), ("side".to_owned(), side)],
+            &[],
+            &marker::load_key().unwrap(),
+        )
+        .unwrap();
+        let side_mapping = index.resolve(&repo, side).unwrap().unwrap();
+        assert_eq!(side_mapping.source, side);
+        let nearest = match index.nearest_first_parent_mapping(&repo, merge).unwrap() {
+            MappingLookup::Resolved(mapping) => mapping,
+            other => panic!("expected a resolved mapping, got {other:?}"),
+        };
+        assert_eq!(nearest.source, mapped);
+        assert_eq!(nearest.dest, root);
+        assert!(
+            nearest
+                .provenance
+                .iter()
+                .all(|record| record.branch == "main")
+        );
+    }
+
+    #[test]
+    fn nearest_mapping_propagates_missing_tip_errors() {
+        let (_dir, repo, _root) = empty_repo();
+        let index = MappingIndex::new();
+        let missing = Oid::from_bytes(&[8; 20]).unwrap();
+        let error = index
+            .nearest_first_parent_mapping(&repo, missing)
+            .unwrap_err();
+        assert!(!error.to_string().contains("contradictory"));
     }
 }
