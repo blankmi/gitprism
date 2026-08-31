@@ -1,6 +1,7 @@
 //! The first-parent marker revwalks shared by [`super`]'s main loop and
-//! [`super::anchor`]'s decisions/0043 search — see decisions/0019 for why
-//! every scan here is restricted to first-parent history.
+//! [`super::anchor`]'s mapping-index reconstruction and lookup — see
+//! decisions/0019 for why every scan here is restricted to first-parent
+//! history.
 
 use anyhow::{Context, Result};
 use git2::{Oid, Repository};

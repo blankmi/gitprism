@@ -108,10 +108,10 @@ In short, gitprism is designed for:
 ## Status
 
 Early and under active design. The two sync directions and the conflict
-helper described below are implemented and covered by `cargo test` (186 tests
-passing as of this writing), but the tool hasn't run against a real
-production pair of repos yet. Read [`design/index.md`](design/index.md)
-before assuming behavior beyond what's written here.
+helper described below are implemented and covered by the locked test suite,
+but the tool has not yet reached a stable release. Read
+[`design/index.md`](design/index.md) before assuming behavior beyond what's
+written here.
 
 The repository CI workflow validates formatting, Clippy, locked tests and a
 locked release build with Rust 1.89, and runs the test suite on Linux, macOS
@@ -127,12 +127,21 @@ installer and package-manager integrations are optional.
   dest's tip and makes source's first commit a genuine child of it, so every
   future merge/cherry-pick between the two has a real, native git
   merge-base — no hand-rolled cross-repo ancestry tracking.
-* **Sync state lives in the commits themselves.** Every commit gitprism
-  creates carries a trailer recording the commit it came from on the other
-  side. There's no separate database or state file — a `sync` run scans
-  history for what's already been carried across and picks up from there.
-  That also means any run is safe to invoke redundantly: a run that finds
-  nothing new is a cheap no-op.
+* **Sync state lives durably in authenticated commit markers.** Every commit
+  gitprism creates carries a human-readable trailer and authenticated state
+  recording the commit it came from on the other side. There's no separate
+  database or state file — each `sync` run reconstructs a bounded, in-memory
+  index from the fetched histories and picks up from there. That also means
+  any run is safe to invoke redundantly: a run that finds nothing new is a
+  cheap no-op.
+* **New and rewritten mirror-only branches use exact anchors.** gitprism
+  follows the branch's first-parent history to the nearest authenticated
+  source-to-dest mapping, rather than inferring an anchor from sibling
+  branches. Mapped branches are processed by increasing first-parent distance
+  (with branch name as the deterministic tie-break), so a parent projected in
+  the current run is available to its child. Only incomparable exact
+  destination mappings recorded for the same source commit halt an affected
+  branch for operator review.
 * **source → dest mirrors every branch automatically.** No per-branch config
   needed on this side — a new branch on source starts syncing to dest the
   moment it exists.
@@ -216,13 +225,21 @@ those objects across platforms.
 Repository-controlled input also has static safety budgets: control files are
 limited to 1 MiB, small Git state files to 64 KiB, commit messages to 1 MiB,
 configured branches to 1,024, source-branch discovery to 4,096, pending
-commits to 10,000, and marker scans to 100,000 first-parent commits. Recursive
-tree work is limited to 1,000,000 entries and depth 256; conflict reporting is
-limited to 100,000 records and 8 MiB of raw path bytes. Resolution worktrees
-are signed into their operation state and must remain registered to the same
-Git common directory; tampered or legacy state fails closed. Exceeding a
-budget fails the operation; gitprism does not truncate data, skip conflicts,
-or choose a conflict resolution.
+commits to 10,000, and marker scans / mapping reconstruction to 100,000
+first-parent commits per scan and 100,000 mapping entries per reconstruction.
+Recursive tree work is limited to 1,000,000 entries and depth 256; conflict
+reporting is limited to 100,000 records and 8 MiB of raw path bytes.
+Resolution worktrees are signed into their operation state and must remain
+registered to the same Git common directory; tampered or legacy state fails
+closed. Exceeding most budgets fails the operation; gitprism does not
+truncate data, skip conflicts, or choose a conflict resolution. Mapping
+reconstruction is the exception: exceeding a marker-scan or mapping-entry
+limit, or finding more than 4,096 branches on dest, truncates that scan
+instead of failing the run, and only the branches an incomplete mapping index
+leaves ambiguous — a new branch's first mirror and a detected rewrite's
+rebuild — halt for operator review. Already-mirrored branches keep syncing.
+See
+[decisions/0046](design/decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md).
 
 ## Configuration: `.gitprism.toml`
 

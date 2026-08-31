@@ -571,6 +571,162 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
     }
 }
 
+/// Every branch name currently on `url` — a real `git ls-remote --heads`
+/// subprocess, parsed by [`parse_ls_remote_heads`]. decisions/0046, F-A:
+/// mapping-index reconstruction must see a mirror-only branch's own dest
+/// ref even after its local source branch is deleted (decisions/0018 Case
+/// 2's routine post-merge cleanup) — `source`'s own branch listing cannot
+/// name a branch source no longer has, so dest itself is asked directly. A
+/// genuine `ls-remote` failure is still an `Err`.
+pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<RemoteBranchListing> {
+    validate_remote(url)?;
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("ls-remote")
+        .arg("--heads")
+        .arg("--")
+        .arg(url)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // A SHA-1 ref advertisement is at least dozens of bytes per branch, so
+    // SMALL_OUTPUT would reject the valid 4,096-branch boundary before the
+    // explicit branch-count guard below gets a chance to run.  PARSE_OUTPUT
+    // is still a fixed cap (not an unbounded capture) and comfortably covers
+    // the Git refname limit multiplied by MAX_SOURCE_BRANCHES.
+    let output = run_git_output(command, PARSE_OUTPUT)
+        .context("running git ls-remote --heads against configured remote")?;
+    if !output.status.success() {
+        let diagnostic = git_diagnostic(&output.stderr, Some(url));
+        anyhow::bail!(
+            "git ls-remote --heads against configured remote failed ({}): {diagnostic}",
+            output.status
+        );
+    }
+    Ok(parse_ls_remote_heads(&output.stdout))
+}
+
+/// Parses `git ls-remote --heads` stdout for `refs/heads/<name>` lines.
+/// Bounded the same way `commands::sync::list_source_branches` bounds its
+/// own local listing.
+///
+/// decisions/0030, decisions/0047: the ref field is parsed as bytes, never
+/// through a lossy UTF-8 conversion. A name that isn't valid UTF-8 is
+/// skipped — never fabricated into a replacement-character name — and
+/// **makes the listing incomplete**, the same signal decisions/0046
+/// Addendum 2, Finding F already defined for hitting `MAX_SOURCE_BRANCHES`.
+/// Both causes are recorded independently (decisions/0047 addendum,
+/// amendment 1) rather than only whichever came first, since an undecodable
+/// ref never stops the scan and a later branch-limit horizon can still be
+/// hit in the same listing. A name that decodes but fails
+/// [`validate_branch_name`] keeps decisions/0024's precedent instead:
+/// skipped, listing still complete, since gitprism has fully read and
+/// judged it.
+fn parse_ls_remote_heads(stdout: &[u8]) -> RemoteBranchListing {
+    let mut names = Vec::new();
+    let mut completeness = ListingCompleteness::default();
+    for line in stdout.split(|&byte| byte == b'\n') {
+        let mut fields = line
+            .split(|byte: &u8| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let Some(refname) = fields.nth(1) else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix(b"refs/heads/") else {
+            continue;
+        };
+        let name = match std::str::from_utf8(name) {
+            Ok(name) => name,
+            Err(_) => {
+                completeness.note_undecodable_ref(escape_bytes(name));
+                continue;
+            }
+        };
+        if validate_branch_name(name).is_err() {
+            continue;
+        }
+        if names.len() >= crate::limits::MAX_SOURCE_BRANCHES {
+            completeness.note_branch_limit();
+            break;
+        }
+        names.push(name.to_string());
+    }
+    RemoteBranchListing {
+        names,
+        completeness,
+    }
+}
+
+/// [`remote_branch_names`]'s result: the branch names read, plus why the
+/// listing might not name every one of dest's current branches
+/// (decisions/0046 Addendum 2, Finding F; decisions/0047). `completeness` is
+/// the caller's signal for whether — and, per decisions/0047's addendum,
+/// how — to treat reconstruction as incomplete rather than to assume dest
+/// has no more branches than `names` lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteBranchListing {
+    pub(crate) names: Vec<String>,
+    pub(crate) completeness: ListingCompleteness,
+}
+
+/// Every recorded reason a [`RemoteBranchListing`] might not name every one
+/// of dest's current branches (decisions/0047 addendum: a *set* of causes,
+/// not one — recording only the first would let a later branch-limit
+/// horizon go unreported once an undecodable ref had already been seen).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ListingCompleteness {
+    /// Reading stopped at `MAX_SOURCE_BRANCHES` (decisions/0046 Addendum 2,
+    /// Finding F). An unlisted name may still have a dest ref beyond this
+    /// horizon.
+    branch_limit: bool,
+    /// The first undecodable advertised `refs/heads/*` ref's
+    /// [`escape_bytes`] rendering, if any were seen (decisions/0030,
+    /// decisions/0047). Does not stop the scan, so it never hides a later
+    /// cause.
+    undecodable_ref: Option<String>,
+}
+
+impl ListingCompleteness {
+    fn note_branch_limit(&mut self) {
+        self.branch_limit = true;
+    }
+
+    fn note_undecodable_ref(&mut self, escaped: String) {
+        self.undecodable_ref.get_or_insert(escaped);
+    }
+
+    /// True when no cause was recorded at all.
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.branch_limit && self.undecodable_ref.is_none()
+    }
+
+    /// decisions/0047 addendum: an undecodable ref never stops the scan and
+    /// can never itself be the distinct, valid-UTF-8 branch a caller is
+    /// asking about, so it alone does not block a "dest has no branch by
+    /// this name" claim. Only the branch-limit horizon does — an unlisted
+    /// name may still have a dest ref beyond it.
+    pub(crate) fn can_establish_absence(&self) -> bool {
+        !self.branch_limit
+    }
+
+    /// Names every recorded cause, not just one.
+    pub(crate) fn describe(&self) -> String {
+        let mut causes = Vec::new();
+        if self.branch_limit {
+            causes.push(format!(
+                "dest branch listing truncated at the {} branch limit",
+                crate::limits::MAX_SOURCE_BRANCHES
+            ));
+        }
+        if let Some(escaped) = &self.undecodable_ref {
+            causes.push(format!(
+                "dest branch listing incomplete: advertised ref name {escaped} is not valid UTF-8"
+            ));
+        }
+        causes.join("; ")
+    }
+}
+
 /// What happened to a [`push`] attempt: either it landed, or it was
 /// rejected because the remote ref had moved since gitprism last looked at
 /// it — a plain non-fast-forward rejection (decisions/0009) or a stale
@@ -2469,5 +2625,224 @@ mod tests {
     #[test]
     fn ensure_merge_tree_supported_accepts_the_git_on_this_machine() {
         ensure_merge_tree_supported().expect("the git on this dev/CI machine must be new enough");
+    }
+
+    #[test]
+    fn remote_branch_names_accepts_the_declared_branch_limit() {
+        let dir = tempdir().unwrap();
+        let source = Repository::init(dir.path().join("source")).unwrap();
+        let dest = Repository::init_bare(dir.path().join("dest")).unwrap();
+        let tree = dest
+            .find_tree(dest.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let oid = dest
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES {
+            dest.reference(&format!("refs/heads/b{index:04}"), oid, true, "test")
+                .unwrap();
+        }
+
+        let listing = remote_branch_names(
+            source
+                .workdir()
+                .expect("non-bare source repository has a worktree"),
+            dest.path().to_str().unwrap(),
+        )
+        .expect("the valid branch boundary must not hit the small output cap");
+        assert_eq!(listing.names.len(), crate::limits::MAX_SOURCE_BRANCHES);
+        assert!(listing.completeness.is_complete());
+    }
+
+    #[test]
+    fn remote_branch_names_truncates_the_listing_instead_of_failing_past_the_declared_limit() {
+        let dir = tempdir().unwrap();
+        let source = Repository::init(dir.path().join("source")).unwrap();
+        let dest = Repository::init_bare(dir.path().join("dest")).unwrap();
+        let tree = dest
+            .find_tree(dest.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let oid = dest
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES + 1 {
+            dest.reference(&format!("refs/heads/b{index:05}"), oid, true, "test")
+                .unwrap();
+        }
+
+        let listing = remote_branch_names(
+            source
+                .workdir()
+                .expect("non-bare source repository has a worktree"),
+            dest.path().to_str().unwrap(),
+        )
+        .expect("exceeding the branch limit must truncate the listing, not fail the call");
+        assert_eq!(listing.names.len(), crate::limits::MAX_SOURCE_BRANCHES);
+        assert!(!listing.completeness.is_complete());
+        assert!(
+            !listing.completeness.can_establish_absence(),
+            "an unlisted name may still have a dest ref beyond the branch-limit horizon"
+        );
+    }
+
+    #[test]
+    fn remote_branch_names_skips_an_undecodable_ref_and_marks_the_listing_incomplete() {
+        let dir = tempdir().unwrap();
+        let source = Repository::init(dir.path().join("source")).unwrap();
+        let dest = Repository::init_bare(dir.path().join("dest")).unwrap();
+        let tree = dest
+            .find_tree(dest.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let oid = dest
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        dest.reference("refs/heads/main", oid, true, "test")
+            .unwrap();
+
+        // decisions/0047: raw invalid UTF-8 bytes, not a literal U+FFFD
+        // (which is itself valid UTF-8 and would pass the old
+        // `from_utf8_lossy` code unchanged, proving nothing). `packed-refs`
+        // sidesteps git2's own valid-`&str` requirement and the
+        // filesystems that reject a non-UTF-8 loose-ref filename — same
+        // technique as `run_entrypoint.rs`'s
+        // `list_source_branches_warns_about_and_skips_a_non_utf8_branch_name`.
+        let mut packed_refs = Vec::new();
+        packed_refs.extend_from_slice(b"# pack-refs with: peeled fully-peeled sorted\n");
+        packed_refs.extend_from_slice(oid.to_string().as_bytes());
+        packed_refs.push(b' ');
+        packed_refs.extend_from_slice(b"refs/heads/bad-");
+        packed_refs.extend_from_slice(&[0xFF, 0xFE]);
+        packed_refs.push(b'\n');
+        std::fs::write(dest.path().join("packed-refs"), packed_refs).unwrap();
+
+        let listing = remote_branch_names(
+            source
+                .workdir()
+                .expect("non-bare source repository has a worktree"),
+            dest.path().to_str().unwrap(),
+        )
+        .expect("an undecodable advertised ref must not fail the whole listing");
+
+        assert_eq!(
+            listing.names,
+            vec!["main".to_string()],
+            "the undecodable ref must never be fabricated into a replacement-character name"
+        );
+        assert!(!listing.completeness.is_complete());
+        assert!(
+            listing.completeness.can_establish_absence(),
+            "decisions/0047 addendum: an undecodable ref alone must not block an absence claim"
+        );
+        let description = listing.completeness.describe();
+        assert!(
+            description.contains("bad-"),
+            "the escaped rendering should stay readable: {description}"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_heads_skips_a_decodable_but_invalid_branch_name_and_stays_complete() {
+        assert!(
+            validate_branch_name("bad..name").is_err(),
+            "this test needs a name git2::Branch::name_is_valid actually rejects"
+        );
+        assert!(std::str::from_utf8(b"bad..name").is_ok());
+
+        let oid = "0".repeat(40);
+        let stdout = format!("{oid}\trefs/heads/bad..name\n");
+
+        let listing = parse_ls_remote_heads(stdout.as_bytes());
+
+        assert!(listing.names.is_empty());
+        assert!(
+            listing.completeness.is_complete(),
+            "decisions/0047 point 5: a decodable name that merely fails validation keeps the listing complete"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_heads_skips_an_undecodable_ref_and_marks_the_listing_incomplete() {
+        let oid = "0".repeat(40);
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice(oid.as_bytes());
+        stdout.push(b'\t');
+        stdout.extend_from_slice(b"refs/heads/bad-");
+        stdout.extend_from_slice(&[0xFF, 0xFE]);
+        stdout.push(b'\n');
+
+        let listing = parse_ls_remote_heads(&stdout);
+
+        assert!(listing.names.is_empty());
+        assert!(
+            !listing.names.iter().any(|name| name.contains('\u{FFFD}')),
+            "an undecodable ref must never be fabricated into a replacement-character name"
+        );
+        assert!(!listing.completeness.is_complete());
+        assert!(listing.completeness.can_establish_absence());
+        let description = listing.completeness.describe();
+        assert!(description.contains("bad-"), "got {description}");
+    }
+
+    #[test]
+    fn parse_ls_remote_heads_records_both_causes_when_an_undecodable_ref_precedes_the_branch_limit()
+    {
+        // decisions/0047 addendum, amendment 1: recording only the first
+        // cause would let a listing that hit an undecodable ref and then
+        // the branch limit report just the undecodable ref, under which
+        // `can_establish_absence()` would wrongly say true despite the real
+        // unscanned horizon.
+        let oid = "0".repeat(40);
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice(oid.as_bytes());
+        stdout.push(b'\t');
+        stdout.extend_from_slice(b"refs/heads/bad-");
+        stdout.extend_from_slice(&[0xFF, 0xFE]);
+        stdout.push(b'\n');
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES + 1 {
+            stdout.extend_from_slice(format!("{oid}\trefs/heads/b{index:05}\n").as_bytes());
+        }
+
+        let listing = parse_ls_remote_heads(&stdout);
+
+        assert_eq!(listing.names.len(), crate::limits::MAX_SOURCE_BRANCHES);
+        assert!(
+            !listing.completeness.can_establish_absence(),
+            "the branch-limit cause must still be recorded even though the undecodable ref came first"
+        );
+        let description = listing.completeness.describe();
+        assert!(
+            description.contains("not valid UTF-8"),
+            "must still name the undecodable-ref cause: {description}"
+        );
+        assert!(
+            description.contains(&crate::limits::MAX_SOURCE_BRANCHES.to_string()),
+            "must also name the branch-limit cause: {description}"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_heads_does_not_let_a_bad_ref_truncate_the_surrounding_scan() {
+        let oid = "0".repeat(40);
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice(format!("{oid}\trefs/heads/before-valid\n").as_bytes());
+        stdout.extend_from_slice(format!("{oid}\trefs/heads/bad..name\n").as_bytes());
+        stdout.extend_from_slice(oid.as_bytes());
+        stdout.push(b'\t');
+        stdout.extend_from_slice(b"refs/heads/bad-");
+        stdout.extend_from_slice(&[0xFF, 0xFE]);
+        stdout.push(b'\n');
+        stdout.extend_from_slice(format!("{oid}\trefs/heads/after-valid\n").as_bytes());
+
+        let listing = parse_ls_remote_heads(&stdout);
+
+        assert_eq!(
+            listing.names,
+            vec!["before-valid".to_string(), "after-valid".to_string()]
+        );
+        assert!(!listing.completeness.is_complete());
+        assert!(listing.completeness.can_establish_absence());
     }
 }

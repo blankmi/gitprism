@@ -63,7 +63,7 @@
 //!
 //! Split (2026-08-28, see docs/2026-08-27_REPOSITORY_REVIEW.md §10/§11) into
 //! this orchestration module (`run`, the main per-branch loop, branch
-//! listing, and the build/push helpers) plus [`anchor`] (decisions/0043/0044's
+//! listing, and the build/push helpers) plus [`anchor`] (decisions/0044/0046's
 //! dest anchor search), [`marker_scan`] (the shared first-parent marker
 //! revwalks), [`local_advance`] (dest→source's local ref preflight and
 //! compare-and-swap), [`filter`] (tree filtering), and [`policy_check`]
@@ -73,6 +73,7 @@
 pub(crate) mod anchor;
 pub(crate) mod filter;
 mod local_advance;
+mod mapping_index;
 mod marker_scan;
 pub(crate) mod policy_check;
 
@@ -90,9 +91,8 @@ use crate::policy;
 use crate::progress::{Direction, Outcome, Reporter};
 
 use anchor::{
-    DestAnchor, RunCache, ambiguous_anchor_message, ambiguous_resolution_message,
-    dest_anchor_for_branch, dest_ref_exists_cached, dest_resume_point_for_branch,
-    mirror_only_rewrite_detected,
+    DestAnchor, RunCache, dest_anchor_for_branch, dest_ref_exists_cached,
+    dest_resume_point_for_branch, mapping_distance_for_branch, mirror_only_rewrite_detected,
 };
 use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
@@ -116,6 +116,78 @@ fn divergence_after_exhausted_retries_message(branch: &str, ff_target: &str) -> 
     format!(
         "gitprism sync: dest branch {branch:?} and source have diverged — {MAX_RACE_RETRIES} refetch-and-recompute attempts still couldn't fast-forward {ff_target} onto it; reconcile the two histories with ordinary git, then rerun gitprism sync"
     )
+}
+
+/// decisions/0046 addendum, Finding I: memoizes only a branch's `None`
+/// distance across scheduling rounds. A branch that could gain a mapping
+/// from another branch's successful push already has that push's
+/// prerequisite anchor in its own ancestry, and would therefore already
+/// have reported a distance — a `None` distance can never become `Some`
+/// mid-run, so it is safe to skip recomputing that branch's full-history
+/// walk for the rest of this run. A `Some` distance is never cached here:
+/// an earlier push in the same run can shorten it before a later round asks
+/// again.
+fn mapping_distance_with_none_memo(
+    branch: &str,
+    known_to_have_no_mapping: &mut std::collections::HashSet<String>,
+    mut distance_for: impl FnMut(&str) -> Result<Option<usize>>,
+) -> Result<Option<usize>> {
+    if known_to_have_no_mapping.contains(branch) {
+        return Ok(None);
+    }
+    let distance = distance_for(branch)?;
+    if distance.is_none() {
+        known_to_have_no_mapping.insert(branch.to_owned());
+    }
+    Ok(distance)
+}
+
+/// One round of decisions/0046's distance-based scheduling: computes each
+/// remaining branch's mapping distance exactly once this round (never once
+/// per pairwise comparison, as the previous ~2·B² revwalks per run did —
+/// see decisions/0046 addendum, Finding C) and selects the minimum by
+/// `(has-no-mapping, distance, name)`. This helper still recomputes every
+/// remaining branch every round; the caller memoizes `None` results across
+/// rounds itself (Finding I) with [`mapping_distance_with_none_memo`],
+/// since a `Some` distance can shorten mid-run and must not be cached. A
+/// branch whose distance computation itself fails
+/// (e.g. Finding A's own-scan-horizon refusal, or any other unexpected git
+/// error) is never selected and never aborts the round for every other
+/// branch — it's returned instead, for the caller to report as its own
+/// per-branch halt (decisions/0045's shape) before trying the next round
+/// with it removed. Recomputing every round (rather than caching across
+/// rounds) is deliberate: a push earlier in this same run can add a
+/// mapping a later branch's distance depends on (decisions/0046).
+///
+/// Returns `(halted, None)` when at least one branch's distance errored
+/// this round — nothing is selected from a round that saw an error, so the
+/// caller retries with the halted branches removed. Otherwise returns
+/// `(empty, Some(branch))`, or `(empty, None)` only when `remaining` itself
+/// is empty.
+fn select_next_branch_by_mapping_distance(
+    remaining: &[String],
+    mut distance_for: impl FnMut(&str) -> Result<Option<usize>>,
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut keys: Vec<(bool, usize, String)> = Vec::with_capacity(remaining.len());
+    let mut halted = Vec::new();
+    for branch in remaining {
+        match distance_for(branch) {
+            Ok(distance) => keys.push((
+                distance.is_none(),
+                distance.unwrap_or(usize::MAX),
+                branch.clone(),
+            )),
+            Err(error) => halted.push((
+                branch.clone(),
+                format!("{branch:?} halted — could not determine its mapping distance: {error:#}"),
+            )),
+        }
+    }
+    if !halted.is_empty() {
+        return (halted, None);
+    }
+    let selected = keys.into_iter().min().map(|(_, _, branch)| branch);
+    (halted, selected)
 }
 
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
@@ -201,6 +273,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // Grouping by phase rather than by branch still guarantees this ordering
     // per branch, since discovery above only runs once, before either phase
     // (decisions/0017, decisions/0020).
+    let mut run_cache = RunCache::default();
     for branch in &config.branches {
         sync_pair_from_dest_with_key(&repo, &source_root, &config, branch, &reporter, &state_key)
             .with_context(|| format!("syncing {branch:?} dest -> source"))?;
@@ -215,26 +288,73 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // mismatch halts (nothing is pushed for it) but doesn't stop the loop —
     // every other branch still gets its turn, matching decisions/0024's
     // precedent for not letting one branch's problem cost every other
-    // branch its sync. decisions/0043 extends the same halt-and-continue
-    // signal to a discovered branch whose dest anchor is genuinely
-    // ambiguous between two equally specific mirrored siblings. Either
-    // failure is accumulated instead and turned into a non-zero exit only
+    // branch its sync. decisions/0046 extends the same halt-and-continue
+    // signal to a discovered branch whose exact mappings are contradictory.
+    // Either failure is accumulated instead and turned into a non-zero exit only
     // once every branch has been processed, so CI can't mistake a halted
     // branch for a clean run.
     let mut any_branch_halted = false;
-    // decisions/0043 steps 2 and 5: one cache for this whole `run()`
-    // invocation — dest-ref existence and fetched dest tips alike, not a
-    // fresh `git ls-remote`/`git fetch` subprocess per sibling candidate per
-    // branch — shared across every branch below so a branch pushed earlier
-    // this run is immediately visible as a candidate for a later branch's
-    // anchor search within the same run.
-    let mut run_cache = RunCache::default();
-    for branch in &source_branches {
+    // decisions/0046: reconstruct exact authenticated mappings after
+    // dest→source has advanced local source histories. Destination heads are
+    // fetched once and retained in the same per-run cache used below.
+    let dest_url = config.dest_url()?;
+    let mapping_index = anchor::reconstruct_mapping_index(
+        &repo,
+        &source_root,
+        &dest_url,
+        &source_branches,
+        &state_key,
+        &mut run_cache,
+    )?;
+    run_cache.mapping_index = mapping_index;
+
+    // One cache for this whole `run()` invocation — destination ref
+    // existence, fetched destination tips, and the authenticated mapping
+    // index — is shared across every branch below. Select the next branch
+    // from the nearest exact mapping so a parent projection is available to
+    // its child later in this run (decisions/0046).
+    let mut remaining_branches = source_branches.clone();
+    let mut branches_with_no_mapping = std::collections::HashSet::new();
+    while !remaining_branches.is_empty() {
+        let (halted_by_distance_error, selected) =
+            select_next_branch_by_mapping_distance(&remaining_branches, |branch| {
+                mapping_distance_with_none_memo(branch, &mut branches_with_no_mapping, |branch| {
+                    mapping_distance_for_branch(&repo, branch, &run_cache)
+                })
+            });
+        if !halted_by_distance_error.is_empty() {
+            // decisions/0045's per-branch halt shape, applied to a distance
+            // computation failure too (e.g. Finding A's own-scan-horizon
+            // refusal): one branch's problem must not starve every other
+            // branch's turn this run.
+            for (branch, message) in &halted_by_distance_error {
+                let round_tripped = config.branches.iter().any(|b| b == branch);
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::SourceToDest,
+                    round_tripped,
+                    Some(message),
+                );
+            }
+            any_branch_halted = true;
+            remaining_branches.retain(|branch| {
+                !halted_by_distance_error
+                    .iter()
+                    .any(|(halted, _)| halted == branch)
+            });
+            continue;
+        }
+        let branch = selected.expect(
+            "select_next_branch_by_mapping_distance returns a branch whenever nothing halted \
+             and the candidate list is non-empty",
+        );
+        remaining_branches.retain(|candidate| candidate != &branch);
         let halted = sync_pair_to_dest_with_key(
             &repo,
             &source_root,
             &config,
-            branch,
+            &branch,
             &reporter,
             &state_key,
             &exclude_list,
@@ -256,7 +376,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     if any_branch_halted {
         anyhow::bail!(
-            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a discovered branch's dest anchor was ambiguous between equally specific mirrored siblings, or a discovered branch's existing dest ref wasn't safe to build on — see the branch lines above for the affected commit(s)/branch(es) and remedy"
+            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a discovered branch had contradictory exact dest mappings, or a discovered branch's existing dest ref wasn't safe to build on — see the branch lines above for the affected commit(s)/branch(es) and remedy"
         );
     }
 
@@ -287,17 +407,20 @@ pub(crate) struct SkippedSourceBranch {
 /// branch` enumeration; no fetch involved. A branch whose name isn't valid
 /// UTF-8 is reported back via the second element rather than failing the
 /// whole listing — decisions/0024's precedent for a branch gitprism
-/// discovered but can't act on.
+/// discovered but can't act on — but it still counts against
+/// `MAX_SOURCE_BRANCHES` (decisions/0032: the bound is on branches
+/// enumerated, not on how many gitprism could parse).
 pub(super) fn list_source_branches(
     repo: &Repository,
 ) -> Result<(Vec<String>, Vec<SkippedSourceBranch>)> {
     let mut source_branches = Vec::new();
     let mut skipped = Vec::new();
-    for entry in repo
+    for (enumerated, entry) in repo
         .branches(Some(git2::BranchType::Local))
         .context("listing source's local branches")?
+        .enumerate()
     {
-        if source_branches.len() >= limits::MAX_SOURCE_BRANCHES {
+        if enumerated >= limits::MAX_SOURCE_BRANCHES {
             anyhow::bail!(
                 "source branch enumeration exceeds the {} branch limit",
                 limits::MAX_SOURCE_BRANCHES
@@ -330,10 +453,10 @@ pub(super) fn list_source_branches(
 
 /// Returns `Ok(true)` if this branch halted with nothing pushed — because a
 /// replayed commit's control file disagreed with the pinned policy
-/// (decisions/0037), because a discovered branch's dest anchor was genuinely
-/// ambiguous between two or more equally specific mirrored sibling branches
-/// (decisions/0043), or because a discovered branch's existing dest ref
-/// isn't a point gitprism recognizes as safe to build on (decisions/0045) —
+/// (decisions/0037), because a discovered branch's exact mappings were
+/// contradictory (decisions/0046), or because a discovered branch's existing
+/// dest ref isn't a point gitprism recognizes as safe to build on
+/// (decisions/0045) —
 /// `Ok(false)` for every other outcome (done, skipped, or decisions/0024's
 /// warning). The equivalent refusal for a *round-tripped* (`config.branches`)
 /// branch stays a fatal `anyhow::bail!`, unaffected by decisions/0045: that
@@ -377,10 +500,9 @@ fn sync_pair_to_dest_with_key(
         // same-named counterpart on dest at all yet (a brand-new feature
         // branch, say) — checked explicitly rather than attempting a fetch
         // and treating "no such ref" as the same failure it would be for a
-        // branch that's supposed to already exist. Read-through the same
-        // per-run cache decisions/0043's anchor search shares (see
-        // `dest_ref_exists_cached`), so this check's own result is what the
-        // anchor search's candidate loop sees for `branch` too.
+        // branch that's supposed to already exist. Read through the same
+        // per-run cache decisions/0046's anchor lookup shares (see
+        // `dest_ref_exists_cached`).
         let dest_ref_exists = dest_ref_exists_cached(source_root, &dest_url, branch, run_cache)?;
         // decisions/0038, decisions/0039: force is requested only once this
         // very run has established both that `branch` is mirror-only and
@@ -404,6 +526,13 @@ fn sync_pair_to_dest_with_key(
                     "fetching dest (mirror-only branch, not round-tripped)",
                 );
             }
+            // Deliberately its own fetch, not read from a cache: decisions/0040
+            // requires a `ForceMirrorOnly` lease built from the dest tip as
+            // actually fetched by *this* attempt, and the race-retry loop
+            // below must refetch after a `RejectedRefMoved` rejection —
+            // reusing a run-wide cached tip here would build a lease against
+            // a tip that may already be stale (decisions/0046 Addendum 2,
+            // Finding K).
             git::fetch(source_root, &dest_url, branch).with_context(|| {
                 format!("fetching dest branch {branch:?} from configured remote")
             })?;
@@ -418,12 +547,6 @@ fn sync_pair_to_dest_with_key(
                 .peel_to_commit()
                 .context("resolving fetched dest branch to a commit")?
                 .id();
-            // decisions/0043 step 5: this fetch is already paid for and
-            // freshly accurate — free informational reuse for a later
-            // sibling's own anchor search this run, at no extra subprocess.
-            run_cache
-                .dest_tip
-                .insert(branch.to_string(), fetched_dest_tip);
 
             // There is no safe way to build a new commit straight from
             // source's filtered snapshot and fast-forward dest onto it
@@ -474,32 +597,16 @@ fn sync_pair_to_dest_with_key(
                     // does source's ancestry say the boundary is," which is
                     // exactly the condition that arm was already built for.
                     let (boundary, rebuild_dest_tip) = match dest_anchor_for_branch(
-                        repo,
-                        source_root,
-                        &dest_url,
-                        branch,
-                        source_tip,
-                        state_key,
-                        run_cache,
+                        repo, source_tip, branch, run_cache,
                     )? {
                         DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
-                        DestAnchor::Ambiguous(candidates) => {
+                        DestAnchor::Contradictory(diagnostic) => {
                             reporter.complete(
                                 Outcome::Error,
                                 branch,
                                 Direction::SourceToDest,
                                 round_tripped,
-                                Some(&ambiguous_anchor_message(branch, &candidates)),
-                            );
-                            return Ok(true);
-                        }
-                        DestAnchor::AmbiguousResolution(candidates) => {
-                            reporter.complete(
-                                Outcome::Error,
-                                branch,
-                                Direction::SourceToDest,
-                                round_tripped,
-                                Some(&ambiguous_resolution_message(branch, &candidates)),
+                                Some(&format!("{branch:?} halted — {diagnostic}")),
                             );
                             return Ok(true);
                         }
@@ -537,12 +644,12 @@ fn sync_pair_to_dest_with_key(
             // either — this branch's own ancestry already carries dest
             // content, inherited from whichever branch it was created from
             // (typically a branch `setup` grafted), so the nearest
-            // `Gitprism-Dest-Commit` trailer reachable from `source_tip`
-            // names both the dest-space tree to build the new chain onto and
-            // the source-space boundary `pending_commits` should resume
-            // from — the same graft-derived ancestry decisions/0006
-            // established, just read directly off source's own history
-            // instead of off a dest ref that doesn't exist. But unlike a
+            // authenticated mapping reachable from `source_tip` names both
+            // the dest-space tree to build the new chain onto and the
+            // source-space boundary `pending_commits` should resume from —
+            // the same graft-derived ancestry decisions/0006 established,
+            // just read directly from the per-run mapping index instead of
+            // from a dest ref that doesn't exist. But unlike a
             // `config.branches` entry, nothing guarantees this discovered
             // branch (decisions/0017) shares any ancestry with dest at all —
             // handled below (decisions/0024) the same way
@@ -553,44 +660,16 @@ fn sync_pair_to_dest_with_key(
             // decisions/0017 merely discovered, so one such branch warns and
             // the run moves on rather than stopping every other branch too.
             let (boundary, dest_tip) = match dest_anchor_for_branch(
-                repo,
-                source_root,
-                &dest_url,
-                branch,
-                source_tip,
-                state_key,
-                run_cache,
+                repo, source_tip, branch, run_cache,
             )? {
                 DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
-                // decisions/0043: two or more sibling branches are equally
-                // specific mirrored ancestors of `branch` and neither is an
-                // ancestor of the other — gitprism won't guess which to
-                // anchor onto. A per-branch halt (decisions/0024's own
-                // precedent for a structural surprise this function merely
-                // discovered, not one an operator directly asked gitprism to
-                // manage), not a whole-run abort.
-                DestAnchor::Ambiguous(candidates) => {
+                DestAnchor::Contradictory(diagnostic) => {
                     reporter.complete(
                         Outcome::Error,
                         branch,
                         Direction::SourceToDest,
                         round_tripped,
-                        Some(&ambiguous_anchor_message(branch, &candidates)),
-                    );
-                    return Ok(true);
-                }
-                // decisions/0043 (amended): two or more candidates share the
-                // same source-side merge-base, but their own never-merged
-                // dest histories disagree on where it landed — the same
-                // no-guessing halt as the incomparable-merge-base case
-                // above, just discovered one step later.
-                DestAnchor::AmbiguousResolution(candidates) => {
-                    reporter.complete(
-                        Outcome::Error,
-                        branch,
-                        Direction::SourceToDest,
-                        round_tripped,
-                        Some(&ambiguous_resolution_message(branch, &candidates)),
+                        Some(&format!("{branch:?} halted — {diagnostic}")),
                     );
                     return Ok(true);
                 }
@@ -640,7 +719,6 @@ fn sync_pair_to_dest_with_key(
         if let Some(mismatch) = find_control_file_policy_mismatch(
             repo,
             &pending_for_policy_check,
-            branch,
             state_key,
             ignore_raw,
         )? {
@@ -733,14 +811,75 @@ fn sync_pair_to_dest_with_key(
         };
 
         if let Some(new_dest_tip) = new_dest_tip {
+            // All fallible ancestry work needed to discard the replaced
+            // branch's stale mappings happens before the remote mutation.
+            // Applying the resulting plan after an accepted push is
+            // deliberately infallible, so cache maintenance can never turn
+            // a successful force-with-lease into a failed sync.
+            let invalidation_plan = if force_rebuild {
+                Some(run_cache.mapping_index.plan_replaced_chain_invalidation(
+                    repo,
+                    branch,
+                    new_dest_tip,
+                )?)
+            } else {
+                None
+            };
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
                 git::PushOutcome::Accepted => {
-                    // decisions/0043 steps 2 and 5: `branch` now definitely
-                    // has a dest ref, at exactly `new_dest_tip` — visible
-                    // in-memory to a later branch's anchor search this same
-                    // run, with no re-query and no re-fetch.
+                    // The destination ref is visible to later branch anchor
+                    // lookups this run, with no re-query.
                     run_cache.dest_ref_exists.insert(branch.to_string(), true);
-                    run_cache.dest_tip.insert(branch.to_string(), new_dest_tip);
+                    // decisions/0046, F-A: a `ForceMirrorOnly` push just
+                    // replaced `branch`'s own dest chain wholesale — any
+                    // mapping this run recorded from that replaced chain
+                    // whose dest commit didn't survive into `new_dest_tip`'s
+                    // own ancestry is now a mapping to an orphan. Left alone,
+                    // a branch scheduled later in this same run could anchor
+                    // on it and push straight back onto history this run
+                    // itself just discarded. A mapping for the same source
+                    // commit recorded via some other branch's own markers is
+                    // untouched — this only clears `branch`'s own stale
+                    // entries. Done before recording this push's own new
+                    // mappings below, though the order doesn't matter: they
+                    // are, by construction, already reachable from
+                    // `new_dest_tip`.
+                    if force_rebuild {
+                        run_cache.mapping_index.apply_replaced_chain_invalidation(
+                            invalidation_plan
+                                .as_deref()
+                                .expect("force rebuild always planned invalidation"),
+                        );
+                    }
+                    // F-C: `build_dest_commit` already returned the exact
+                    // (source, dest) pair for each of these — recorded
+                    // straight into the index, with no re-read or
+                    // re-HMAC-verify of a commit this very call just
+                    // authored.
+                    for &(source_oid, generated_dest_oid) in &build.generated_mappings {
+                        run_cache.mapping_index.record_built_mapping(
+                            branch,
+                            source_oid,
+                            generated_dest_oid,
+                        );
+                    }
+                    // When `build.new_tip` is `Some`, `new_dest_tip` is
+                    // exactly the last mapping just recorded above — adding
+                    // it again would only be rediscovered and discarded by
+                    // `record`'s own dedup. The remaining cases (a brand-new
+                    // branch or a rebuild reusing `dest_tip` unchanged, or
+                    // `branch_scoped_dest_tip`'s own possibly-aliased marker
+                    // commit) didn't come from this call's build loop at
+                    // all, so they still go through the verifying,
+                    // alias-canonicalizing path.
+                    if build.new_tip.is_none() {
+                        run_cache.mapping_index.record_pushed_dest_commit(
+                            repo,
+                            branch,
+                            new_dest_tip,
+                            state_key,
+                        );
+                    }
                 }
                 git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
                     // dest's tip moved between fetch and push — refetch and
@@ -867,6 +1006,11 @@ struct Conflict {
 /// (decisions/0007's "Consequences": later commits may depend on it).
 struct PendingDestBuild {
     new_tip: Option<Oid>,
+    /// `(source oid, dest oid)` for every commit actually built this call —
+    /// `build_dest_commit`'s own trusted output, recorded into the mapping
+    /// index directly on push acceptance rather than re-read and
+    /// re-verified from the repo (decisions/0046, F-C).
+    generated_mappings: Vec<(Oid, Oid)>,
     conflict: Option<Conflict>,
 }
 
@@ -890,41 +1034,28 @@ struct PendingDestBuild {
 /// stop being possible. Stops at the first commit that doesn't merge cleanly
 /// (decisions/0007). `dest_tip` seeds the chain's first parent.
 /// Loop prevention (decisions/0003): whether `commit` already exists on
-/// dest, so replaying it for `branch` would loop — a `Setup` graft (any
-/// branch cut from it, `marker::verify`'s own hardcoded exception) or a
-/// `DestToSource` marker scoped to `branch` itself.
+/// dest, so replaying it would loop — a `Setup` graft (exempt from the
+/// branch check by construction) or any `DestToSource` marker, verified
+/// against its own recorded branch rather than the branch currently being
+/// synced.
 ///
-/// Widened by decisions/0043's addendum (F-04): a `DestToSource` marker is
-/// written once, scoped to whichever branch's dest→source sync imported it,
-/// but once that commit is an ancestor of a *different* branch's tip (e.g. a
-/// branch forked after the import), the dest-native commit it names is
-/// already on dest regardless of which branch originally imported it. Self-
-/// verified against the marker's own recorded branch
-/// (`marker::parse(...).branch`), never against `branch` — this reuses
-/// `marker::verify` exactly as written, so its MAC check is not weakened;
-/// only which branch name gets passed to it changes.
-pub(super) fn loop_prevented(commit: &git2::Commit, branch: &str, key: &marker::StateKey) -> bool {
-    if marker::verify(
+/// Widened by decisions/0043's addendum (F-04), retained by decisions/0046:
+/// a `DestToSource` marker is written once, scoped to whichever branch's
+/// dest→source sync imported it, but once that commit is an ancestor of a
+/// *different* branch's tip (e.g. a branch forked after the import), the
+/// dest-native commit it names is already on dest regardless of which
+/// branch originally imported it — hence the self-verification via
+/// `marker::verify_self` (decisions/0046 addendum, Finding L), which never
+/// takes a branch to check against in the first place.
+pub(super) fn loop_prevented(commit: &git2::Commit, key: &marker::StateKey) -> bool {
+    // `Setup` is exempt from the branch check by construction, and a
+    // `DestToSource` marker inherited onto some other branch's history
+    // verifies against its own recorded branch, not the branch being
+    // scanned (decisions/0046 addendum, Finding L) — exactly what
+    // `verify_self` already does, so no `branch` argument is needed here.
+    marker::verify_self(
         commit,
-        branch,
         &[MarkerDirection::Setup, MarkerDirection::DestToSource],
-        None,
-        key,
-    )
-    .is_some()
-    {
-        return true;
-    }
-    let Some(message) = commit.message().ok() else {
-        return false;
-    };
-    let Some(parsed) = marker::parse(message) else {
-        return false;
-    };
-    marker::verify(
-        commit,
-        &parsed.branch,
-        &[MarkerDirection::DestToSource],
         None,
         key,
     )
@@ -947,6 +1078,7 @@ fn build_pending_dest_tip(
 
     let mut parent = dest_tip;
     let mut built_any = false;
+    let mut generated_mappings = Vec::new();
     for source_oid in pending {
         let source_commit = repo
             .find_commit(source_oid)
@@ -955,7 +1087,7 @@ fn build_pending_dest_tip(
         // Loop prevention (decisions/0003, widened by decisions/0043's
         // addendum) — see `loop_prevented`. First thing in the loop now that
         // there's no cursor left to advance before it.
-        if loop_prevented(&source_commit, branch, key) {
+        if loop_prevented(&source_commit, key) {
             continue;
         }
 
@@ -982,6 +1114,7 @@ fn build_pending_dest_tip(
             git::MergeTreeOutcome::Conflict { paths } => {
                 return Ok(PendingDestBuild {
                     new_tip: built_any.then_some(parent),
+                    generated_mappings,
                     conflict: Some(Conflict {
                         commit: source_oid,
                         paths,
@@ -999,6 +1132,7 @@ fn build_pending_dest_tip(
 
                 parent =
                     build_dest_commit(repo, config, parent, &source_commit, merged, branch, key)?;
+                generated_mappings.push((source_oid, parent));
                 built_any = true;
             }
         }
@@ -1006,6 +1140,7 @@ fn build_pending_dest_tip(
 
     Ok(PendingDestBuild {
         new_tip: built_any.then_some(parent),
+        generated_mappings,
         conflict: None,
     })
 }
@@ -1232,8 +1367,9 @@ pub(crate) fn build_dest_commit(
 /// decisions/0044: the tip to create/rebuild a dest ref at when nothing was
 /// built — `dest_tip` itself if [`anchor::dest_tip_is_accounted_for`]
 /// recognizes it for *this* branch, otherwise a content-empty marker commit
-/// on top of it (a sibling's anchor carries the sibling's marker, not this
-/// branch's).
+/// on top of it. An inherited anchor carries another branch's marker, so the
+/// branch gets its own content-empty marker when branch accounting requires
+/// it.
 fn branch_scoped_dest_tip(
     repo: &Repository,
     config: &Config,

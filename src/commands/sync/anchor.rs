@@ -1,4 +1,4 @@
-//! decisions/0043/0044's dest anchor search: which dest-space commit a
+//! decisions/0044/0046's dest anchor search: which dest-space commit a
 //! discovered or rewritten mirror-only branch should build its chain onto,
 //! and whether dest's current tip is a state gitprism recognizes as safe to
 //! build on at all.
@@ -12,7 +12,8 @@ use git2::{Oid, Repository};
 use crate::git;
 use crate::marker::{self, Direction as MarkerDirection};
 
-use super::marker_scan::{newest_dest_marker, newest_source_marker, scan_for_dest_marker};
+use super::mapping_index::{MappingIndex, MappingLookup};
+use super::marker_scan::{newest_dest_marker, newest_source_marker};
 
 /// `setup`'s own real graft between source and dest (decisions/0006) — the
 /// one commit both sides actually share ancestry from. dest→source's
@@ -166,9 +167,9 @@ pub(crate) fn dest_resume_point_for_branch(
         return Ok(Some(boundary));
     }
 
-    // The trailer might name a commit this clone doesn't even have — a
-    // sibling clone's own source commit is never transmitted to dest, only
-    // the filtered commit it produced is, so an unrelated or behind clone has
+    // The trailer might name a commit this clone doesn't even have — another
+    // clone's own source commit is never transmitted to dest, only the
+    // filtered commit it produced is, so an unrelated or behind clone has
     // no way to have fetched it. That's just as unsafe to build on as a
     // confirmed non-ancestor, so it's checked (and rejected) before asking
     // libgit2 to compare ancestry, whose own error surface for a missing
@@ -264,58 +265,39 @@ pub(super) fn mirror_only_rewrite_detected(
     Ok(!descends)
 }
 
-/// decisions/0043: `branch`'s dest-space anchor — [`scan_for_dest_marker`]'s
-/// own baseline scan, refined by a search for a more specific anchor among
-/// sibling branches discovered this run. A branch forked from another
-/// already-mirrored branch (round-tripped or mirror-only) anchors its dest
-/// chain on that branch's own mirror at their real merge-base, instead of
-/// always falling back to the nearest round-tripped marker the baseline
-/// scan finds by walking straight past every unmarked commit in between.
+/// A branch's destination-space anchor resolved from its nearest exact
+/// authenticated mapping on the branch's first-parent history.
 ///
 /// Shared by both of [`super::sync_pair_to_dest_with_key`]'s call sites — a
 /// brand-new branch's own first mirror, and decisions/0039's rewrite-rebuild
 /// arm — so both benefit with no second implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DestAnchor {
-    /// The baseline scan itself found nothing — decisions/0024's existing
+    /// No exact authenticated mapping was found — decisions/0024's existing
     /// warn-and-continue path, untouched.
     None,
     /// The `(boundary, dest_tip)` pair to build the pending chain onto —
-    /// either the baseline, untouched, or a sibling branch's more specific
-    /// one.
+    /// the nearest exact mapping's source and destination commits.
     Resolved(Oid, Oid),
-    /// Two or more sibling candidates are equally specific mirrored
-    /// ancestors and neither is an ancestor of the other — gitprism won't
-    /// guess which to anchor onto. Carries every such candidate's branch
-    /// name and merge-base oid, for the caller to name in a hard-fail
-    /// message.
-    Ambiguous(Vec<(String, Oid)>),
-    /// Two or more sibling candidates share the exact same merge-base
-    /// (source-side fork point), but their own dest histories — never
-    /// merged with each other — each carry a *different* qualifying
-    /// `Gitprism-Source-Commit` marker for it, so step 5 genuinely can't
-    /// tell which dest-space projection of that shared fork point is the
-    /// right one to anchor onto. Carries every disagreeing candidate's
-    /// branch name and its own resolved dest-space anchor oid.
-    AmbiguousResolution(Vec<(String, Oid)>),
+    /// Exact authenticated mappings for the nearest source commit point at
+    /// incomparable canonical dest histories. The caller reports this as a
+    /// per-branch halt with the source OID and provenance details intact.
+    Contradictory(String),
 }
 
-/// decisions/0043 steps 2 and 5: every real subprocess this search would
-/// otherwise repeat per candidate per branch, resolved through one cache per
-/// `run()` invocation instead — dest-ref existence (`git ls-remote`) and a
-/// fetched candidate's dest tip (`git fetch`) alike. This search runs once
-/// per newly-discovered-or-rewritten branch, and step 5 (trying every member
-/// of an equal-merge-base group, not just one — see Decision step 5) can
-/// revisit the same sibling from more than one branch's own search, so
-/// caching only one of the two subprocesses would just trade one quadratic
-/// cost for the other. A cache hit skips the subprocess entirely; a miss
-/// queries or fetches once and remembers the result for every later lookup
-/// this run, including a later branch's own candidate search landing on the
-/// same sibling.
+/// Per-run cache for destination refs and fetched tips, plus the authenticated
+/// source-to-destination mapping index reconstructed from both repositories.
+///
+/// `mapping_index` is populated exactly once, by [`run`](super::run) right
+/// after dest→source has run and before source→dest scheduling starts
+/// (decisions/0046) — never lazily, and never left unset for a call site to
+/// discover. A default-constructed cache carries an empty index, which is
+/// only ever the right starting point for that one init site or for a test
+/// that builds its own via [`reconstruct_mapping_index`].
 #[derive(Default)]
 pub(super) struct RunCache {
     pub(super) dest_ref_exists: HashMap<String, bool>,
-    pub(super) dest_tip: HashMap<String, Oid>,
+    pub(super) mapping_index: MappingIndex,
 }
 
 pub(super) fn dest_ref_exists_cached(
@@ -333,393 +315,194 @@ pub(super) fn dest_ref_exists_cached(
     Ok(exists)
 }
 
-/// A sibling candidate's fetched dest tip, resolved through the same
-/// per-run cache as `dest_ref_exists_cached` — see [`RunCache`]. Trying
-/// every member of an equal-merge-base group (Decision step 5) means the
-/// same sibling can be looked up from more than one branch's own search
-/// this run; a cache hit reuses the oid with no subprocess at all.
-pub(super) fn fetch_dest_tip_cached(
+/// Fetches `branch`'s dest head for [`reconstruct_mapping_index`], resolving
+/// the decisions/0046 Addendum 2, Finding G list/fetch race: `branch` was
+/// advertised by reconstruction's own initial listing, but another writer
+/// may have deleted it before this call runs. On a fetch failure, the dest
+/// listing is refreshed at most once per run (via `refreshed_listing`,
+/// shared across every branch this run reconstructs) and the two outcomes
+/// are handled differently on purpose. A branch absent from the refreshed
+/// listing is fully recovered — *if* that listing can actually support "dest
+/// has no branch by this name" (decisions/0047 addendum:
+/// `can_establish_absence()`, true unless the branch-limit horizon was hit —
+/// an unrelated undecodable ref elsewhere never blocks this, since it
+/// doesn't stop the scan and can't be `branch` itself). Any other fetch
+/// failure — auth, network, transport, a corrupt remote, the branch still
+/// being advertised, or the listing unable to establish absence — propagates
+/// instead: silently skipping it would leave the mapping index incomplete
+/// while every other branch's lookup still believed it complete, the exact
+/// "a visible mapping hides an unscanned contradiction" hole Addendum 1
+/// closed. A per-branch halt is the right shape for a per-branch fact;
+/// reconstruction's completeness is a whole-run fact.
+pub(super) fn fetch_dest_head_for_reconstruction(
     repo: &Repository,
     source_root: &Path,
     dest_url: &str,
     branch: &str,
-    cache: &mut RunCache,
-) -> Result<Oid> {
-    if let Some(&tip) = cache.dest_tip.get(branch) {
-        return Ok(tip);
+    run_cache: &mut RunCache,
+    refreshed_listing: &mut Option<git::RemoteBranchListing>,
+) -> Result<Option<Oid>> {
+    let fetch_err = match git::fetch(source_root, dest_url, branch) {
+        Ok(()) => {
+            let tip = repo
+                .find_reference("FETCH_HEAD")
+                .context("reading FETCH_HEAD after fetching a destination branch")?
+                .peel_to_commit()
+                .context("resolving a fetched destination branch to a commit")?
+                .id();
+            return Ok(Some(tip));
+        }
+        Err(err) => err,
+    };
+    if refreshed_listing.is_none() {
+        *refreshed_listing = Some(
+            git::remote_branch_names(source_root, dest_url)
+                .context("refreshing the dest branch listing after a fetch failure")?,
+        );
     }
-    git::fetch(source_root, dest_url, branch)
-        .with_context(|| format!("fetching sibling candidate {branch:?} from configured remote"))?;
-    let tip = repo
-        .find_reference("FETCH_HEAD")
-        .context("reading FETCH_HEAD after fetching a sibling candidate")?
-        .peel_to_commit()
-        .context("resolving a fetched sibling candidate to a commit")?
-        .id();
-    cache.dest_tip.insert(branch.to_string(), tip);
-    Ok(tip)
+    let listing = refreshed_listing.as_ref().expect("just populated above");
+    if listing.completeness.can_establish_absence()
+        && !listing.names.iter().any(|name| name == branch)
+    {
+        run_cache.dest_ref_exists.insert(branch.to_string(), false);
+        return Ok(None);
+    }
+    Err(fetch_err.context(format!(
+        "fetching destination branch {branch:?} from configured remote"
+    )))
 }
 
-pub(super) fn dest_anchor_for_branch(
+pub(super) fn reconstruct_mapping_index(
     repo: &Repository,
     source_root: &Path,
     dest_url: &str,
-    branch: &str,
-    source_tip: Oid,
+    source_branches: &[String],
     key: &marker::StateKey,
     run_cache: &mut RunCache,
+) -> Result<MappingIndex> {
+    let source_heads = source_branches
+        .iter()
+        .map(|branch| {
+            let tip = repo
+                .find_branch(branch, git2::BranchType::Local)
+                .with_context(|| format!("resolving source branch {branch:?}"))?
+                .get()
+                .peel_to_commit()
+                .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
+                .id();
+            Ok((branch.clone(), tip))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // decisions/0046, F-A: a mirror-only branch's dest ref must still
+    // contribute its own SourceToDest mappings once its local source branch
+    // is deleted (decisions/0018 Case 2's routine post-merge cleanup) —
+    // `source_branches` can no longer name it, so dest's actual branches are
+    // asked for directly rather than inferred from what source still has.
+    let mut dest_branch_names = source_branches.to_vec();
+    let dest_listing = git::remote_branch_names(source_root, dest_url)?;
+    // Existence for every listed name — and, when the listing can establish
+    // absence, non-existence for every source branch it didn't list — is now
+    // known from this one subprocess, recorded into the same cache
+    // `dest_ref_exists_cached` reads below so it never re-queries per
+    // branch (decisions/0043's own quadratic-cost lesson; decisions/0046
+    // Addendum 2, Finding J for the non-existence half). Only the
+    // branch-limit horizon blocks that negative claim (decisions/0047
+    // addendum: `can_establish_absence()`) — an unlisted name might still
+    // have a dest ref beyond it. An undecodable ref elsewhere doesn't: it
+    // never stops the scan and can't be a distinct, valid-UTF-8 source
+    // branch itself, so absence still seeds for every other case, and
+    // `dest_ref_exists_cached` is left to query only what a real horizon
+    // left unresolved.
+    for name in &dest_listing.names {
+        run_cache.dest_ref_exists.insert(name.clone(), true);
+        if !dest_branch_names.contains(name) {
+            dest_branch_names.push(name.clone());
+        }
+    }
+    if dest_listing.completeness.can_establish_absence() {
+        for branch in source_branches {
+            if !dest_listing.names.contains(branch) {
+                run_cache.dest_ref_exists.insert(branch.clone(), false);
+            }
+        }
+    }
+
+    let mut dest_heads = Vec::new();
+    let mut refreshed_listing = None;
+    for branch in &dest_branch_names {
+        if !dest_ref_exists_cached(source_root, dest_url, branch, run_cache)? {
+            continue;
+        }
+        if let Some(tip) = fetch_dest_head_for_reconstruction(
+            repo,
+            source_root,
+            dest_url,
+            branch,
+            run_cache,
+            &mut refreshed_listing,
+        )? {
+            dest_heads.push((branch.clone(), tip));
+        }
+    }
+    let mut index = MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)?;
+    if !dest_listing.completeness.is_complete() {
+        // decisions/0046 Addendum 2, Finding F; decisions/0047 and its
+        // addendum: an unlisted or undecodable dest branch may carry an
+        // incomparable mapping for a source commit already observed, so any
+        // recorded cause must taint exact lookups the same way a truncated
+        // history scan already does — `describe()` names every cause found,
+        // not just one.
+        index.note_incomplete_reconstruction(dest_listing.completeness.describe());
+    }
+    Ok(index)
+}
+
+/// `branch` is excluded from canonicalization (decisions/0046, F-C):
+/// `branch`'s own rewrite is what's being anchored here, so a mapping whose
+/// only provenance is `branch` itself is that branch's own now-discarded
+/// chain, never a valid anchor for its own rebuild — matching main's old
+/// `if candidate == branch { continue; }` sibling-search exclusion, applied
+/// at both of this function's own call sites (a brand-new branch's first
+/// mirror, and a detected mirror-only rewrite's rebuild).
+pub(super) fn dest_anchor_for_branch(
+    repo: &Repository,
+    source_tip: Oid,
+    branch: &str,
+    run_cache: &RunCache,
 ) -> Result<DestAnchor> {
-    let Some((boundary_base, dest_tip_base)) = scan_for_dest_marker(repo, source_tip, branch, key)?
+    Ok(
+        match run_cache.mapping_index.nearest_first_parent_mapping(
+            repo,
+            source_tip,
+            Some(branch),
+        )? {
+            MappingLookup::Resolved(mapping) => DestAnchor::Resolved(mapping.source, mapping.dest),
+            MappingLookup::None => DestAnchor::None,
+            MappingLookup::Contradictory(diagnostic) => DestAnchor::Contradictory(diagnostic),
+        },
+    )
+}
+
+pub(super) fn mapping_distance_for_branch(
+    repo: &Repository,
+    branch: &str,
+    run_cache: &RunCache,
+) -> Result<Option<usize>> {
+    let source_tip = repo
+        .find_branch(branch, git2::BranchType::Local)
+        .with_context(|| format!("resolving source branch {branch:?}"))?
+        .get()
+        .peel_to_commit()
+        .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
+        .id();
+    let Some((distance, lookup)) = run_cache
+        .mapping_index
+        .nearest_first_parent_mapping_with_distance(repo, source_tip, None)?
     else {
-        return Ok(DestAnchor::None);
+        return Ok(None);
     };
-
-    // decisions/0017's existing discovery, not a new listing mechanism —
-    // every other local branch on source is a candidate, round-tripped or
-    // mirror-only alike (no special-casing: the search only ever resolves
-    // to a candidate's real historical merge-base, never its current tip,
-    // which is exactly what makes anchoring on a round-tripped candidate
-    // here as safe as a mirror-only one).
-    let mut survivors: Vec<(String, Oid)> = Vec::new();
-    let (candidates, _skipped) = super::list_source_branches(repo)?;
-    for candidate in candidates {
-        if candidate == branch {
-            continue;
-        }
-        if !dest_ref_exists_cached(source_root, dest_url, &candidate, run_cache)? {
-            continue;
-        }
-        let candidate_tip = repo
-            .find_branch(&candidate, git2::BranchType::Local)
-            .with_context(|| format!("resolving sibling candidate {candidate:?}"))?
-            .get()
-            .peel_to_commit()
-            .with_context(|| format!("resolving sibling candidate {candidate:?} to a commit"))?
-            .id();
-        // No shared history at all with this candidate — same guard
-        // `already_merged_into_a_landing_branch` already uses.
-        let cbase = match repo.merge_base(source_tip, candidate_tip) {
-            Ok(oid) => oid,
-            Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
-            Err(error) => {
-                return Err(anyhow::Error::from(error).context(format!(
-                    "finding a merge base between this branch and sibling candidate {candidate:?}"
-                )));
-            }
-        };
-        // A candidate less specific than what the baseline already found is
-        // never an improvement — bounds the search to real refinements only.
-        let at_least_as_specific = cbase == boundary_base
-            || repo
-                .graph_descendant_of(cbase, boundary_base)
-                .with_context(|| {
-                    format!("checking whether {cbase} descends from {boundary_base}")
-                })?;
-        if !at_least_as_specific {
-            continue;
-        }
-        survivors.push((candidate, cbase));
-    }
-
-    // A survivor whose merge-base merely ties `boundary_base` exactly offers
-    // no refinement over the baseline at all — only a survivor strictly
-    // beyond it is a real candidate to disambiguate among. Without this,
-    // two or more candidates that both happen to share nothing beyond the
-    // baseline (e.g. two unrelated siblings forked from the same graft
-    // point as `branch` itself) would spuriously read as "ambiguous,"
-    // despite neither actually proposing anything more specific than what
-    // the baseline already found.
-    if !survivors.iter().any(|(_, cbase)| *cbase != boundary_base) {
-        return Ok(DestAnchor::Resolved(boundary_base, dest_tip_base));
-    }
-
-    // Two or more survivors sharing the exact same `cbase` are not
-    // ambiguous *by merge-base* — equal is the opposite of incomparable —
-    // but their own dest histories are never merged with each other, so
-    // step 5 below can still disagree once each one is actually tried.
-    // Group by `cbase` for the domination comparison, keeping every branch
-    // name in the group rather than collapsing to one representative: a
-    // representative picked before step 5 runs could be the one candidate
-    // whose own dest history happens to lack a qualifying marker, silently
-    // discarding a sibling that would have found one.
-    let mut groups: Vec<(Oid, Vec<String>)> = Vec::new();
-    for (name, cbase) in survivors {
-        match groups.iter_mut().find(|(c, _)| *c == cbase) {
-            Some((_, names)) => names.push(name),
-            None => groups.push((cbase, vec![name])),
-        }
-    }
-    for (_, names) in &mut groups {
-        names.sort();
-    }
-
-    // The unique most-specific group: its `cbase` undominated by any other
-    // group's, via `graph_descendant_of` — the same primitive
-    // decisions/0039's own condition 4 already uses. A tie strictly at
-    // `boundary_base` is always dominated by any real refinement above (per
-    // the check just above, at least one exists here), so it never reaches
-    // `maximal`. Two or more genuinely incomparable *refinements* are what
-    // leaves more than one maximal group, handled below.
-    let mut maximal: Vec<(Oid, Vec<String>)> = Vec::new();
-    for (index, (cbase, names)) in groups.iter().enumerate() {
-        let mut dominated = false;
-        for (other_index, (other_cbase, _)) in groups.iter().enumerate() {
-            if index == other_index {
-                continue;
-            }
-            if repo
-                .graph_descendant_of(*other_cbase, *cbase)
-                .with_context(|| {
-                    format!("comparing sibling candidate merge-bases {other_cbase} and {cbase}")
-                })?
-            {
-                dominated = true;
-                break;
-            }
-        }
-        if !dominated {
-            maximal.push((*cbase, names.clone()));
-        }
-    }
-
-    let (cbase, names) = match maximal.len() {
-        // Every group dominated by another is impossible for a nonempty
-        // list under git's acyclic ancestry order, but treated as "the
-        // search found nothing better" rather than panicking.
-        0 => return Ok(DestAnchor::Resolved(boundary_base, dest_tip_base)),
-        1 => maximal.into_iter().next().expect("checked len == 1"),
-        _ => {
-            // Every candidate in every incomparable group, not just one
-            // representative per group — the operator needs to see all of
-            // them to resolve the ambiguity.
-            return Ok(DestAnchor::Ambiguous(
-                maximal
-                    .into_iter()
-                    .flat_map(|(cbase, names)| names.into_iter().map(move |name| (name, cbase)))
-                    .collect(),
-            ));
-        }
-    };
-
-    // Every branch sharing the winning `cbase` must actually be tried, not
-    // just the first one alphabetically: an equal merge-base only proves
-    // the *source-side* fork point is shared, not that every candidate's
-    // *dest-side* history recorded it the same way. `fetch_dest_tip_cached`
-    // keeps this at one real `git fetch` per sibling per run, even though
-    // the same sibling can be revisited by more than one branch's own
-    // search this run (decisions/0043's own cost claim would otherwise be
-    // regressed right back by this very fix, just via `fetch` instead of
-    // `ls-remote`).
-    let mut resolutions: Vec<(String, Oid, Oid)> = Vec::new();
-    for name in names {
-        // decisions/0043's addendum (F-04): a `DestToSource` marker at or
-        // before `cbase` on `name`'s own source-side history already records
-        // exactly what dest has for `name`. No fetch needed, and it can be
-        // strictly more specific than the dest-side scan below, which
-        // depends on dest's own history separately carrying a matching
-        // trailer — never true for a dest-native commit dest→source only
-        // reflected into source's history, not dest's.
-        let source_side = newest_dest_to_source_marker_at_or_before(repo, cbase, &name, key)?;
-
-        let candidate_dest_tip =
-            fetch_dest_tip_cached(repo, source_root, dest_url, &name, run_cache)?;
-        let dest_side =
-            newest_source_marker_at_or_before(repo, candidate_dest_tip, &name, cbase, key)?
-                .map(|(found_dest_oid, found_source_oid)| (found_source_oid, found_dest_oid));
-
-        let resolved = match (source_side, dest_side) {
-            (Some((source_oid, dest_oid)), Some((_, dest_side_source_oid)))
-                if source_oid == cbase
-                    || repo
-                        .graph_descendant_of(source_oid, dest_side_source_oid)
-                        .with_context(|| {
-                            format!(
-                                "checking whether {source_oid} descends from {dest_side_source_oid}"
-                            )
-                        })? =>
-            {
-                Some((source_oid, dest_oid))
-            }
-            (Some(source_side), None) => Some(source_side),
-            (_, dest_side) => dest_side,
-        };
-
-        if let Some((found_source_oid, found_dest_oid)) = resolved {
-            resolutions.push((name, found_source_oid, found_dest_oid));
-        }
-    }
-
-    match resolutions.as_slice() {
-        // None of the equally-specific candidates' own dest histories carry
-        // a qualifying marker for the shared merge-base (e.g. every one is
-        // a round-tripped candidate that has never itself been synced
-        // beyond `setup`'s own graft) — degrades to the existing baseline
-        // rather than to a worse or unsafe result (decisions/0043's own
-        // "Why": a bug in the new search must never produce something less
-        // safe than today).
-        [] => Ok(DestAnchor::Resolved(boundary_base, dest_tip_base)),
-        [(_, found_source_oid, found_dest_oid), rest @ ..]
-            if rest
-                .iter()
-                .all(|(_, s, d)| s == found_source_oid && d == found_dest_oid) =>
-        {
-            // Every candidate that resolved at all agrees on the same
-            // dest-space anchor — not ambiguous, even if only some of the
-            // group's candidates qualified at all.
-            Ok(DestAnchor::Resolved(*found_source_oid, *found_dest_oid))
-        }
-        _ => Ok(DestAnchor::AmbiguousResolution(
-            resolutions
-                .into_iter()
-                .map(|(name, _, found_dest_oid)| (name, found_dest_oid))
-                .collect(),
-        )),
-    }
-}
-
-/// decisions/0043 step 5: [`newest_source_marker`]'s own first-parent walk
-/// over a *sibling candidate's* dest history, narrowed to only accept a
-/// `Gitprism-Source-Commit` trailer naming `cbase` itself or an ancestor of
-/// it — not just the newest trailer found at all, since a sibling
-/// candidate's dest history can carry later syncs that postdate the real
-/// fork point being anchored on. Returns the found commit's own oid
-/// (dest-space) alongside the source oid its trailer names.
-fn newest_source_marker_at_or_before(
-    repo: &Repository,
-    dest_tip: Oid,
-    branch: &str,
-    cbase: Oid,
-    key: &marker::StateKey,
-) -> Result<Option<(Oid, Oid)>> {
-    let mut revwalk = repo
-        .revwalk()
-        .context("starting a sibling candidate's resume-point scan")?;
-    revwalk
-        .push(dest_tip)
-        .context("seeding a sibling candidate's resume-point scan")?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .context("ordering a sibling candidate's resume-point scan newest-first")?;
-    revwalk.simplify_first_parent().context(
-        "restricting a sibling candidate's resume-point scan to first-parent history (decisions/0019)",
-    )?;
-
-    for (scanned, oid) in revwalk.enumerate() {
-        if scanned >= crate::limits::MAX_MARKER_SCAN_COMMITS {
-            anyhow::bail!(
-                "sibling candidate resume-point scan exceeds the {} commit limit",
-                crate::limits::MAX_MARKER_SCAN_COMMITS
-            );
-        }
-        let oid = oid.context("walking a sibling candidate's history for a resume point")?;
-        let commit = repo
-            .find_commit(oid)
-            .context("resolving a commit in a sibling candidate's history")?;
-        let Some(source_oid) =
-            marker::verify(&commit, branch, &[MarkerDirection::SourceToDest], None, key)
-        else {
-            continue;
-        };
-        let qualifies = source_oid == cbase
-            || (repo.find_commit(source_oid).is_ok()
-                && repo
-                    .graph_descendant_of(cbase, source_oid)
-                    .with_context(|| {
-                        format!("checking whether {cbase} descends from {source_oid}")
-                    })?);
-        if qualifies {
-            return Ok(Some((oid, source_oid)));
-        }
-    }
-
-    Ok(None)
-}
-
-/// decisions/0043's addendum (F-04): the newest `DestToSource` marker at or
-/// before `cbase`, on `branch`'s own source-side history — deliberately
-/// narrower than [`scan_for_dest_marker`] (`Setup` excluded): every branch
-/// trivially inherits the one shared `Setup` graft regardless of its own
-/// name (`marker::verify`'s own hardcoded exception), so accepting it here
-/// would rediscover the same coarse point `boundary_base` already reflects
-/// for every candidate, not a real per-candidate refinement — exactly the
-/// false "candidate found something" that made two equal-`cbase` siblings
-/// with no `DestToSource` marker of their own read as disagreeing instead of
-/// both correctly contributing nothing.
-fn newest_dest_to_source_marker_at_or_before(
-    repo: &Repository,
-    cbase: Oid,
-    branch: &str,
-    key: &marker::StateKey,
-) -> Result<Option<(Oid, Oid)>> {
-    let mut revwalk = repo
-        .revwalk()
-        .context("starting a sibling candidate's own dest-to-source scan")?;
-    revwalk
-        .push(cbase)
-        .context("seeding a sibling candidate's own dest-to-source scan")?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .context("ordering a sibling candidate's own dest-to-source scan newest-first")?;
-    revwalk.simplify_first_parent().context(
-        "restricting a sibling candidate's own dest-to-source scan to first-parent history (decisions/0019)",
-    )?;
-
-    for (scanned, oid) in revwalk.enumerate() {
-        if scanned >= crate::limits::MAX_MARKER_SCAN_COMMITS {
-            anyhow::bail!(
-                "sibling candidate dest-to-source scan exceeds the {} commit limit",
-                crate::limits::MAX_MARKER_SCAN_COMMITS
-            );
-        }
-        let oid =
-            oid.context("walking a sibling candidate's own history for a dest-to-source marker")?;
-        let commit = repo
-            .find_commit(oid)
-            .context("resolving a commit in a sibling candidate's own history")?;
-        if let Some(dest_oid) =
-            marker::verify(&commit, branch, &[MarkerDirection::DestToSource], None, key)
-        {
-            return Ok(Some((oid, dest_oid)));
-        }
-    }
-
-    Ok(None)
-}
-
-/// decisions/0043's per-branch hard-fail message for
-/// [`DestAnchor::Ambiguous`] — names every equally specific candidate and
-/// its merge-base oid, matching decisions/0007's and decisions/0023's own
-/// hard-fail precedent of naming exactly what's ambiguous rather than
-/// guessing, but surfaced as a per-branch halt (decisions/0024's
-/// precedent), not a whole-run abort.
-pub(super) fn ambiguous_anchor_message(branch: &str, candidates: &[(String, Oid)]) -> String {
-    let list = candidates
-        .iter()
-        .map(|(name, cbase)| format!("{name:?} (merge-base {cbase})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{branch:?} halted — its dest anchor is ambiguous: {list} are equally specific \
-         mirrored ancestors, none an ancestor of any other; gitprism won't guess which one \
-         to anchor onto — merge or rebase to establish a real order between them, then \
-         re-run gitprism sync"
-    )
-}
-
-/// decisions/0043's per-branch hard-fail message for
-/// [`DestAnchor::AmbiguousResolution`] — names every candidate that shares
-/// the winning merge-base alongside the dest-space anchor its own history
-/// resolved to, so the operator can see exactly how they disagree.
-pub(super) fn ambiguous_resolution_message(branch: &str, candidates: &[(String, Oid)]) -> String {
-    let list = candidates
-        .iter()
-        .map(|(name, dest_oid)| format!("{name:?} (resolves to dest commit {dest_oid})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{branch:?} halted — its dest anchor is ambiguous: {list} share the same source-side \
-         fork point, but their own dest histories disagree on where it landed; gitprism won't \
-         guess which one to anchor onto — merge or rebase to establish a real order between \
-         them, then re-run gitprism sync"
-    )
+    Ok(match lookup {
+        MappingLookup::None => None,
+        MappingLookup::Resolved(_) | MappingLookup::Contradictory(_) => Some(distance),
+    })
 }

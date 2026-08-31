@@ -388,6 +388,74 @@ fn run_fails_clearly_against_a_completely_empty_dest_repo() {
 }
 
 #[test]
+// A genuine `--depth=1` clone of a mirror-only branch, run through `run()`
+// itself rather than the `sync_pair_to_dest` wrapper — proves in the actual
+// production entry point what design/log.md's 2026-08-31 investigation
+// established directly: a fresh `Repository::discover` walks a shallow
+// clone cleanly, so this reaches decisions/0045's per-branch halt, never a
+// `git2::Error` from mapping reconstruction.
+fn run_halts_a_mirror_only_branch_through_a_genuine_depth_1_clone_without_a_git2_error() {
+    let (dest_dir, dest_repo, _source_dir, repo, graft, _config) =
+        mirror_only_feature_branch_synced_once();
+
+    // Amend `feature-x` in place, same as the shallow wrapper-level test:
+    // dest's marker for it now names a commit this clone will never fetch.
+    repo.branch("feature-x", &repo.find_commit(graft).unwrap(), true)
+        .unwrap();
+    add_commit_with_message(
+        &repo,
+        "feature-x",
+        &[("feature.txt", "amended\n")],
+        "add feature (amended)",
+    );
+
+    let (fresh_dir, fresh_repo) = fresh_clone_of_branch(&repo, "feature-x", true);
+    assert!(
+        fresh_repo.is_shallow(),
+        "a --depth=1 fetch must produce a shallow clone"
+    );
+
+    // No round-tripped branches: a real CI checkout of a mirror-only branch
+    // fetches only that branch, so `main` never exists in this clone —
+    // `config.branches` must be empty or `run()`'s dest→source phase would
+    // fail outright on a branch this clone never has, before source→dest
+    // ever gets a turn.
+    let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
+
+    let error = run(fresh_dir.path(), config.path()).expect_err(
+        "a shallow clone's missing boundary object must halt this branch, not silently mirror it",
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("one or more branches halted"),
+        "expected decisions/0045's aggregate halted-branch error, got: {message}"
+    );
+    assert!(
+        error
+            .chain()
+            .all(|cause| cause.downcast_ref::<git2::Error>().is_none()),
+        "a correctly refused branch must never surface a git2::Error in its chain: {error:#}"
+    );
+
+    let untouched = dest_repo
+        .find_branch("feature-x", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    let tree = untouched.tree().unwrap();
+    let blob = dest_repo
+        .find_blob(tree.get_name("feature.txt").unwrap().id())
+        .unwrap();
+    assert_eq!(
+        blob.content(),
+        b"original\n",
+        "dest must be left exactly as the first sync produced it"
+    );
+    drop(dest_dir);
+}
+
+#[test]
 fn list_source_branches_lists_every_local_branch_sorted() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();

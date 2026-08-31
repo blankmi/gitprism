@@ -310,6 +310,38 @@ pub(crate) fn verify(
     counterpart: Option<Oid>,
     key: &StateKey,
 ) -> Option<Oid> {
+    verify_parsed(commit, Some(branch), expected, counterpart, key).map(|marker| marker.counterpart)
+}
+
+/// Same authentication as [`verify`], for a caller whose scanning context
+/// has no independent branch expectation of its own — a marker inherited
+/// as an ordinary ancestor commit on some other branch's history is
+/// verified against its own recorded branch (decisions/0046), which the
+/// two-argument branch check below always accepts by construction. Returns
+/// the full [`ParsedMarker`] on success so a caller that already needs the
+/// parsed fields (e.g. `branch`) doesn't parse the message a second time
+/// (decisions/0046 addendum): parsing and the size gate both run exactly
+/// once per commit here, not once in a caller's own pre-parse and again
+/// inside verification.
+pub(crate) fn verify_self(
+    commit: &Commit<'_>,
+    expected: &[Direction],
+    counterpart: Option<Oid>,
+    key: &StateKey,
+) -> Option<ParsedMarker> {
+    verify_parsed(commit, None, expected, counterpart, key)
+}
+
+/// Shared implementation for [`verify`] and [`verify_self`]. `branch` is
+/// `None` for the self-verifying case, skipping the branch-name check
+/// entirely rather than comparing a value against itself.
+fn verify_parsed(
+    commit: &Commit<'_>,
+    branch: Option<&str>,
+    expected: &[Direction],
+    counterpart: Option<Oid>,
+    key: &StateKey,
+) -> Option<ParsedMarker> {
     if commit.message_bytes().len() > limits::MAX_COMMIT_MESSAGE_BYTES {
         return None;
     }
@@ -317,7 +349,7 @@ pub(crate) fn verify(
     let marker = parse(message)?;
     // A setup graft is deliberately inherited by every source branch cut
     // from it (decisions/0017). Later directional markers are branch-local.
-    if (marker.direction != Direction::Setup && marker.branch != branch)
+    if branch.is_some_and(|branch| marker.direction != Direction::Setup && marker.branch != branch)
         || !expected.contains(&marker.direction)
         || counterpart.is_some_and(|expected| expected != marker.counterpart)
     {
@@ -340,7 +372,7 @@ pub(crate) fn verify(
         &marker.body,
     ));
     verifier.verify_slice(&marker.mac).ok()?;
-    Some(marker.counterpart)
+    Some(marker)
 }
 
 #[cfg(test)]
@@ -489,5 +521,50 @@ mod tests {
     fn oversized_marker_messages_are_rejected_before_parsing() {
         let message = "x".repeat(limits::MAX_COMMIT_MESSAGE_BYTES + 1);
         assert!(parse(&message).is_none());
+    }
+
+    #[test]
+    fn verify_self_rejects_an_oversized_message_before_parsing_it() {
+        // decisions/0046 addendum: `verify_self` is the single parse+verify
+        // pass a scan now uses instead of a caller's own pre-parse plus
+        // `verify`'s internal re-parse — the size gate must still run
+        // before any line-scanning, on this one remaining pass.
+        let dir = tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let tree = repo
+            .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let key = load_key().unwrap();
+        let valid_message = build_message(
+            "body",
+            Direction::DestToSource,
+            "main",
+            Oid::ZERO_SHA1,
+            "Gitprism-Dest-Commit",
+            &[],
+            tree.id(),
+            &signature,
+            &signature,
+            &key,
+        );
+        // Pad the message past the size limit while keeping the trailing
+        // authenticated block intact and byte-identical, so an oversized
+        // rejection here can only come from the size gate, never from the
+        // MAC failing to verify over the now-longer message.
+        let padding = "x".repeat(limits::MAX_COMMIT_MESSAGE_BYTES);
+        let oversized_message = format!("{padding}\n\n{valid_message}");
+        let oversized = repo
+            .commit(None, &signature, &signature, &oversized_message, &tree, &[])
+            .unwrap();
+        assert!(
+            verify_self(
+                &repo.find_commit(oversized).unwrap(),
+                &[Direction::DestToSource],
+                None,
+                &key,
+            )
+            .is_none()
+        );
     }
 }

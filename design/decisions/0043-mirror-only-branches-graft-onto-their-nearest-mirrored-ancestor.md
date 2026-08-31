@@ -9,6 +9,21 @@ verified:
   - { by: "human:michael.blank@evia.de", at: 2026-08-27T00:00:00Z }
 ---
 
+> **Superseded by [decisions/0046](0046-dest-anchors-come-from-exact-authenticated-mappings.md).**
+> This decision's sibling-candidate search — enumerating every branch with
+> an existing dest ref, computing `merge_base` against each, comparing the
+> results by `graph_descendant_of` specificity, and hard-failing on
+> incomparable ties (steps 2–5 below) — is replaced by a branch-local walk
+> to the nearest exactly mapped commit in an in-memory index of
+> authenticated source→dest markers. Only incomparable canonical mappings
+> for the same exact source commit still hard-fail, now per-branch.
+>
+> **What this decision still decides, unedited by 0046:** the problem
+> itself. A task branch forked from a mirror-only feature branch must still
+> build on that branch's filtered dest history, or PR diffs repeat
+> already-merged commits — decisions/0046's own Context restates, not
+> repeats, this file's Context below.
+
 # Context
 
 Real deployment shape: a round-tripped `main`, a mirror-only `feature` branched
@@ -88,6 +103,11 @@ a more specific anchor among sibling branches:
    to) `boundary_base` — a candidate less specific than what the baseline
    already found is never an improvement, and this bounds the search to
    real refinements only.
+   **[Superseded by decisions/0046: this sibling enumeration and its
+   per-candidate `merge_base` computation are replaced by a branch-local
+   first-parent walk to the nearest exact mapping in an authenticated
+   source→dest index. Other branches are no longer inputs to anchor
+   resolution.]**
 4. A survivor whose `cbase` merely *ties* `boundary_base` exactly offers no
    refinement at all — only survivors strictly beyond `boundary_base` are
    real candidates to disambiguate among. If none exist, use the baseline
@@ -115,6 +135,11 @@ a more specific anchor among sibling branches:
    Without excluding baseline-ties first, two unrelated siblings that each
    merely share `boundary_base` itself (offering nothing beyond what the
    baseline already found) would read as a spurious ambiguity.
+   **[Superseded by decisions/0046: `graph_descendant_of` specificity
+   comparison across sibling candidates, and this hard-fail on incomparable
+   most-specific groups, no longer exist. Only two or more incomparable
+   canonical dest OIDs for the same exact source commit halt, resolved
+   per-branch from the mapping index.]**
 5. For every branch name in the winning group (not just one), fetch its dest
    tip through the same per-run cache as step 2's dest-ref-existence check
    (a fetch on a cache miss, remembered for every later lookup this run —
@@ -151,6 +176,11 @@ a more specific anchor among sibling branches:
    chain's starting parent, in place of `boundary_base`/`dest_tip_base`,
    with `pending_commits` and `build_pending_dest_tip` unchanged downstream
    of that substitution.
+   **[Superseded by decisions/0046: per-candidate dest-side marker
+   resolution and this disagreement hard-fail are replaced by
+   decisions/0046's mapping-index canonicalization — comparable mappings
+   choose their common ancestor automatically; only incomparable ones
+   halt.]**
 
 **Not solved here — accepted, same as decisions/0038/0039's own accepted
 hazards:** if `C` (e.g. `feature`) hasn't been mirrored to dest yet in *this*
@@ -176,6 +206,13 @@ history) is a positively detected rewrite, and that rebuild picks up the
 now-available, more specific sibling anchor through this same search. No
 branch-processing-order guarantee is added, and none is implied by
 "self-corrects."
+**[Superseded in part by decisions/0046: the same-run ordering hazard —
+`task` discovered before `feature` has a dest ref — is fixed by scheduling
+branches in increasing order of distance from known mapping state, so a
+parent processed earlier in a run supplies the mapping its child anchors
+on. Unchanged: an already-anchored branch still does not retry anchor
+resolution on an ordinary resync, only on a new branch's first mirror or a
+positively detected rewrite.]**
 
 # Why
 
@@ -359,6 +396,12 @@ requires), that marker:
    more specific (its own source oid equal to `cbase`, or a descendant of
    the other's) wins; if only one found anything, it wins by default; if
    neither did, the candidate contributes nothing, unchanged from today.
+   **[Superseded by decisions/0046: step 5 and
+   `newest_dest_to_source_marker_at_or_before` no longer exist. A verified
+   `DestToSource` marker on source now contributes its `S -> D` mapping
+   directly to decisions/0046's index, resolved by the same nearest-exact-
+   mapping walk every other branch uses — not by a special per-candidate
+   anchor search.]**
 
 ## Why
 
@@ -437,3 +480,39 @@ requires), that marker:
     anchor precision). Confirmed failing with only the step-5 fix reverted
     (three replayed commits instead of two), and passing with both fixes
     in place.
+
+## Superseded (2026-08-31): see decisions/0046
+
+**[decisions/0046](0046-dest-anchors-come-from-exact-authenticated-mappings.md)**
+replaces this decision's global sibling-candidate search — the enumeration
+of every branch with an existing dest ref, the pairwise `merge_base`
+computation, the `graph_descendant_of` specificity comparison, and the
+ambiguous-tie hard-fails at both step 4 and step 5 — with a branch-local
+walk to the nearest exactly mapped commit in an authenticated source→dest
+index. The whole mechanism is superseded, not narrowed; the marked clauses
+above and this decision's `Ambiguous`/equal-merge-base test list no longer
+describe current behavior.
+
+**Not superseded:** this decision's problem statement. A task branch
+forked from a mirror-only feature branch must still build on that branch's
+filtered dest history, or PR diffs repeat already-merged commits. That
+problem is decisions/0046's own Context, restated there rather than
+repeated here.
+
+**Moved elsewhere, not deleted.** Two amendments recorded against this
+decision survive under different cover:
+
+* The 2026-08-27 amendment on `Repository::is_shallow()` not confirming a
+  rewrite (`design/decisions/index.md`'s entry for this file) was never
+  part of this file's own body — it amended `mirror_only_rewrite_detected`,
+  which belongs to decisions/0039's rewrite detection, and its full history
+  (including the 2026-08-27 correction that stopped trusting
+  `is_shallow()` at all) lives there, not here.
+* This file's own 2026-08-27 `DestToSource`-marker addendum splits. Its
+  loop-prevention half (point 1: a self-verified `DestToSource` marker
+  counts for loop prevention on any branch it is an ancestor of) stays in
+  force unedited — decisions/0046 says so explicitly. Its anchor-resolution
+  half (point 2: usable by step 5 as an anchor) is superseded along with
+  step 5 itself: the same marker now contributes an ordinary `S -> D` entry
+  to decisions/0046's mapping index, resolved by every branch's shared
+  nearest-exact-mapping walk instead of a special per-candidate case.

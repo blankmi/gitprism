@@ -2303,3 +2303,311 @@ existed, not a live reference.
 ## 2026-08-28 — review F-15 (resolution worktree under `temp_dir()`) left as is
 
 **Decision**: Not changing the worktree location. Conflicts are never resolved on the CI runner (a conflict fails the pipeline, decisions/0007); resolution happens on a workstation and is expected to take hours, not the days a tmp-aging cleaner needs to become a factor. A swept worktree fails closed ("worktree not registered") and the state ref survives, so the worst case is redoing a short manual merge. Revisit only if resolution turnaround changes.
+
+## 2026-08-28 — exact authenticated mappings replace global anchor inference
+
+**Decision**: Added
+[decisions/0046](decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md),
+superseding decisions/0043's global sibling `merge_base`/ancestry comparison
+for destination-anchor selection. A production workflow — round-trip a
+`develop` change, merge it into a round-tripped feature, then rebase a
+mirror-only task onto that feature — halted because unrelated mirrored refs
+produced incomparable merge-base groups even though the developer's operation
+was routine. Gitprism will instead reconstruct a bounded in-memory exact
+source→dest mapping index from the authenticated `SourceToDest`, `Setup`, and
+`DestToSource` markers already stored in Git, walk each branch first-parent to
+its nearest mapped ancestor, and process source branches by increasing distance
+from known mapping state so a parent projected earlier in the same CI run is
+immediately available to its children. No database, Git notes, dedicated mapping
+refs, persistent runner cache, or developer command is added. Content-empty
+branch-marker aliases and comparable exact mappings normalize automatically;
+only incomparable canonical dest mappings for the same nearest source OID remain
+a genuine operator boundary. The decision includes the TDD implementation and
+verification plan; code is not changed yet.
+
+## 2026-08-28 — implement exact authenticated mapping anchors (0046)
+
+**Update**: Decision 0046 landed on branch
+`codex/exact-mapping-anchors`. The implementation adds a bounded per-run
+authenticated mapping index, nearest first-parent anchors for new and rewritten
+mirror-only branches, immediate index updates for successful projections
+(including intermediate generated commits), and deterministic distance-based
+parent-before-child scheduling. Existing fast-forward, force-with-lease,
+round-trip, rewrite, conflict, and policy safety behavior is preserved. The
+production-topology regression and parent-before-child scheduling regression
+both pass.
+
+Local final gates passed: `cargo fmt --all -- --check`; `cargo test
+--workspace --all-features --locked` (288/288); `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings`; and `cargo build
+--release --locked`. GitHub pipeline status is not recorded here.
+
+## 2026-08-31 — review of the 0046 implementation branch; bounded-completeness tradeoff remains
+
+**Update**: A code review of `codex/exact-mapping-anchors` confirmed seven
+correctness/availability findings and three cleanups against the 0046
+implementation. The concrete correctness and cleanup fixes are implemented on
+the branch, each behavior change failing-test-first; the scan-horizon finding
+exposes an architectural tradeoff that still needs an owner decision, recorded
+below. Correctness: a mirror-only force rebuild now invalidates
+the replaced dest chain's index entries (no same-run resurrection of an
+orphaned projection); index scans self-verify markers against the marker's own
+recorded branch and scan dest refs that actually exist, so a deleted branch's
+mappings still contribute (closing a silent content-loss path 0046's text
+already promised); mapped dest OIDs are existence-checked before use (a
+missing canonical object causes a per-branch halt rather than walking past a
+potentially content-bearing DestToSource marker, never a run abort or crash);
+and a branch's own-only stale projection no longer competes against a genuine
+alternative during its rewrite rebuild. Availability/scale: reconstruction
+dedups shared first-parent history via a run-wide visited set, treats
+`MAX_MARKER_SCAN_COMMITS` as a per-scan truncation horizon and conservatively
+refuses mapping lookups against any incomplete index (which may repeat while
+history remains beyond the horizon), records
+post-push mappings infallibly (a run can no longer fail after dest was
+mutated), and schedules by computing each remaining branch's distance once per
+round. Marker scans size-gate before parsing and parse once (`verify_self`).
+The mislabeled loop-prevention test was renamed to state what it proves and a
+genuine cross-branch loop-prevention regression test was added. Behavior
+adjustments to scan bounds are recorded as a dated addendum in decision 0046.
+
+The follow-up review also made truncation conservative for exact lookups (a
+visible mapping cannot hide a contradictory mapping beyond an incomplete
+horizon), replaced force-rebuild invalidation's per-mapping ancestry queries
+with one bounded ancestry walk planned before push and applied infallibly
+after acceptance, and raised `ls-remote --heads` to the fixed parse-output
+limit so the declared 4,096-branch boundary is reachable. Added regressions
+covering missing-object invalidation, the content-loss rewrite path, and the
+remote branch boundary.
+
+Local final gates passed: `cargo fmt --check`; `cargo test` (320/320);
+`cargo clippy --all-targets -- -D warnings`; `cargo build --release --locked`.
+
+## 2026-08-31 — second review of the exact-mapping implementation incorporated
+
+Ten findings from a second review of the decisions/0046 implementation branch,
+all confirmed by the project owner against the branch, were resolved and
+recorded as a dated Addendum 2 in
+`design/decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md`
+(Findings E–P). Four were availability regressions against 0046's own
+Addendum 1 direction: the implementation had introduced three fresh whole-run
+abort sites and left one post-push bookkeeping call fallible, in a module whose
+decision text had already settled that bounds are horizons and that a run
+never fails after dest has been mutated.
+
+The shape rule the addendum states, and which decided all four: a per-branch
+fact — a branch's own history, its own dest ref, its own rewrite — is a
+per-branch halt; reconstruction's *completeness*, which every branch's lookup
+depends on, is a whole-run fact and stays one.
+
+* **E** — force-rebuild invalidation no longer walks the whole replacement DAG
+  with a `MAX_MARKER_SCAN_COMMITS` bail (which aborted the run before the push
+  on any dest reaching 100,000 reachable commits). It queries reachability per
+  distinct destination via `graph_descendant_of`, memoized, existence-gated
+  with `find_commit` first so a missing object is stale by definition. No limit
+  reachable from a force-rebuild path can abort a run.
+* **F** — the dest branch listing became a horizon. `git::remote_branch_names`
+  returns `RemoteBranchListing { names, truncated }` instead of bailing at
+  `MAX_SOURCE_BRANCHES`, and a truncated listing taints exact lookups through
+  the new `MappingIndex::note_incomplete_reconstruction`, the same conservative
+  refusal a truncated history scan already produces. A dest with more than
+  4,096 branches now syncs already-mirrored branches normally.
+* **G** — the list/fetch race, resolved by failure class rather than by
+  convenience. On any reconstruction fetch failure the dest listing is
+  refreshed once per run; a branch absent from a *complete* refreshed listing
+  was deleted in the window and is recorded non-existent and dropped, since the
+  recovered state is complete. Every other failure (auth, network, transport,
+  or a still-advertised ref) propagates with its original context: skipping it
+  would leave the global index silently incomplete while every other branch's
+  lookup still believed it complete.
+* **H** — `record_pushed_dest_commit` and `record_built_mapping` return `()`;
+  no `?` remains after an accepted push, making Addendum 1's "always succeeds"
+  claim true rather than aspirational.
+* **I** — a branch whose distance is `None` is asked once per run, not once per
+  round, on the confirmed invariant that a branch able to gain a mapping from
+  another branch's push already has that push's prerequisite anchor in its own
+  ancestry. `Some` distances are still recomputed every round.
+* **J/K** — non-existence is cached from the same listing (suppressed when
+  truncated, where absence proves nothing); the dead `RunCache::dest_tip` cache
+  and `fetch_dest_tip_cached` are deleted, with the retained per-branch fetch
+  documented as decisions/0040 lease freshness rather than left looking like an
+  oversight.
+* **L** — `loop_prevented` collapses to one `marker::verify_self` call; its
+  `branch` parameter was dead once the equivalence was verified against
+  `verify_parsed`, and dropped from `find_control_file_policy_mismatch` too.
+* **M/O** — the test wrapper never retains another branch's index; one test
+  name now states what it proves.
+* **N** — decisions/0043 carries this repository's supersession signposting
+  (blockquote, inline clause notes, trailing section, index prefix), matching
+  decisions/0036 and 0038. Its problem statement is explicitly not superseded —
+  it is 0046's Context.
+* **P** — Addendum 1's "not a lifetime entry ceiling" is narrowed in place.
+  The constant bounds reconstruction work per run, but because every generated
+  dest commit adds one permanent authenticated mapping, a repository past the
+  horizon truncates on every subsequent run and its new branches and detected
+  rewrites halt until an operator acts. Accepted tradeoff, now stated as an
+  operational consequence rather than only as the constant's scope.
+
+Local final gates passed: `cargo fmt --check`; `cargo test --locked`
+(327/327); `cargo clippy --locked --all-targets -- -D warnings`;
+`cargo build --release --locked`.
+
+**Investigated and dropped — no decision recorded.** Finding M's test-wrapper
+work suggested that `scan_source_history`/`scan_dest_history` propagating a
+revwalk error (`oid.context(...)?`) made an ordinary `--depth=1` CI clone abort
+the whole run. Before recording that as a decision, the project owner required
+it be proven through `run()`. It was tested directly and **disproven**
+(git2 0.21.0, bundled libgit2 1.9.6):
+
+* A genuine `--depth=1` clone opened the way a real process opens it — a fresh
+  `Repository::discover` at startup — walks cleanly. A `Revwalk` built exactly
+  like `first_parent_walk` yields the shallow tip and ends without error;
+  libgit2 respects `.git/shallow` correctly. `reconstruct_mapping_index`
+  returns `Ok`, and `run()` against a shallow clone shows no `git2::Error` in
+  its chain at all — only decisions/0045's ordinary per-branch mirror-only
+  refusal.
+* The `NotFound`/`Odb` error that prompted the claim is a **stale-handle
+  artifact of the test fixture**: `fresh_clone_of_branch` reuses a
+  `Repository` handle opened *before* the external `git fetch --depth=1`
+  subprocess wrote `.git/shallow`, so libgit2's cached state predates the
+  graft. Not reachable by a real gitprism process.
+* A genuinely unreadable ancestor object (`chmod 000`) *does* abort the whole
+  run at that same call site, handle-independently — but with `class=Os`,
+  `code=Locked`, not `NotFound`. So the proposed "treat `ErrorCode::NotFound`
+  while scanning as a horizon" would not have covered the one real hazard, and
+  the case it would have covered does not occur in production.
+
+Propagating a corrupt or unreadable object store is left as-is: it is exactly
+the operator-intervention case AGENTS.md prefers, and degrading it to a
+truncation horizon would convert genuine repository corruption into a silent
+partial index.
+
+Consequence for Finding M: the test wrapper's `unwrap_or_default()` was
+accommodating a fixture artifact, not a real limitation. Done:
+`tests::fresh_clone_of_branch` now reopens the repository after the external fetch
+subprocess, before any use of the handle; all three of its callers
+(`src/commands/sync/tests/anchor.rs`) behave identically under the reopened
+handle. `tests::sync_pair_to_dest` propagates reconstruction errors with `?`,
+restoring Finding M's original intent. A new regression,
+`run_halts_a_mirror_only_branch_through_a_genuine_depth_1_clone_without_a_git2_error`
+(`src/commands/sync/tests/run_entrypoint.rs`), calls `run()` itself — not the
+wrapper — against a genuine `--depth=1` clone of a mirror-only branch whose
+boundary object is missing, and asserts `run()` reaches decisions/0045's
+per-branch halt (the aggregate "one or more branches halted" error) with no
+`git2::Error` anywhere in the returned error's chain, and that dest is left
+exactly as the previous sync produced it.
+
+## 2026-08-31 — third review's malformed-ref findings fixed (M-01, M-02 / 0047)
+
+The 2026-08-31 repository review (`docs/2026-08-31_REPOSITORY_REVIEW.md`), once
+checked against the tree and the decisions, left two real findings, both about
+what happens when a ref name isn't valid UTF-8. Neither challenged an existing
+decision; both were the code failing to hold one.
+
+* **M-01 — the source branch budget didn't count what it couldn't parse.**
+  `list_source_branches` checked `source_branches.len()` against
+  `MAX_SOURCE_BRANCHES`, but a non-UTF-8 branch name goes to `skipped`, not to
+  `source_branches`, so it consumed no budget: a repository with more than
+  4,096 non-UTF-8 refs drove enumeration, allocation and warning output past
+  decisions/0032's declared bound. The loop now counts every enumerated branch
+  (`.enumerate()`), parseable or not. Boundary semantics are unchanged —
+  exactly `MAX_SOURCE_BRANCHES` accepted, the next one bails with the same
+  message — and `skipped` is bounded as a consequence. Two regressions in
+  `src/commands/sync/tests/limit_tests.rs`: one exceeding the bound with
+  *only* non-UTF-8 packed refs, one holding the boundary exactly with a mix,
+  asserting `branches.len() + skipped.len() == MAX_SOURCE_BRANCHES`.
+
+* **M-02 — the dest listing invented names it then failed to fetch.**
+  `git::remote_branch_names` read `git ls-remote --heads` stdout through
+  `String::from_utf8_lossy`, so an undecodable advertised ref became a U+FFFD
+  name that `git2::Branch::name_is_valid` accepts. It was recorded as an
+  existing dest ref, fetched, failed (no such ref exists), and — because the
+  refresh path repeated the same lossy conversion and still saw it listed —
+  propagated as a whole-run abort. One malformed ref on dest denied every
+  branch its sync, and decisions/0030's own "reject, never transform" rule was
+  being broken at the one boundary where dest's ref names enter gitprism.
+
+  Recorded as
+  `design/decisions/0047-an-undecodable-dest-ref-makes-the-listing-incomplete.md`
+  before implementation, since skip-vs-fail is a policy choice, not a bug fix.
+  The listing is now parsed as bytes; an undecodable name is dropped and marks
+  the listing **incomplete** — decisions/0046 Addendum 2, Finding F's existing
+  signal — so reconstruction taints its exact lookups and the run degrades to
+  per-branch refusals instead of aborting. The two rejected alternatives are
+  argued in the decision: skipping silently would reopen Addendum 1's
+  "a visible mapping hides an unscanned contradiction" hole, and failing the
+  listing outright would keep the very asymmetry Finding F rejected — dest's
+  ref names are not something a source-side operator can necessarily fix.
+
+  `RemoteBranchListing.truncated: bool` became
+  `incomplete: Option<ListingIncomplete>` so the per-branch refusal names the
+  real cause rather than always claiming a branch-limit horizon. A name that
+  *decodes* but fails `validate_branch_name` keeps decisions/0024's silent
+  skip, listing still complete: gitprism has fully read and judged it.
+
+The parsing loop was then extracted into a pure `parse_ls_remote_heads(&[u8])`
+— a behaviour-preserving test seam, with the three subprocess-level tests left
+untouched as proof it is wired up. It exists because 0047's decodable-but-
+invalid case cannot be provoked end to end: Git will not advertise a ref whose
+name `validate_branch_name` rejects, so that clause was otherwise untestable.
+
+Release gates on the finished tree: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+and `cargo test --workspace --all-features --locked` all clean at 335 passing,
+up from 328.
+
+The review's other findings needed no code. H-01 (Git hooks/config as a
+code-execution boundary) is decisions/0029 working as designed and already
+documented in the README; a hardened subprocess mode would reopen that decision
+and is not an incidental remediation. L-01 (no Windows equivalent of
+`limits.rs`'s Unix dev/ino and hard-link checks) and the release-provenance item
+stay open as P2/P3. The review also confirmed the 2026-08-28 sync split is
+finished work: `sync/mod.rs` is the intended orchestration residue, and the
+three marker revwalks stay unmerged for the reason recorded then.
+
+## 2026-08-31 — M-03: an undecodable dest ref no longer blocks deleted-ref recovery
+
+A follow-up review of the M-02 fix found that it had traded one availability
+failure for a smaller one. `fetch_dest_head_for_reconstruction` recovers from a
+failed fetch by re-listing dest and treating a now-unlisted branch as deleted
+(decisions/0046 Addendum 2, Finding G), but decisions/0047 gated that recovery
+on the listing being complete *for any reason*. One unrelated undecodable ref
+therefore disabled it, so a valid branch genuinely deleted between the listing
+and its fetch aborted the whole run.
+
+The two causes are not equivalent for the claim "dest has no branch by this
+name". The branch-limit horizon stops the scan, so absence is unprovable. An
+undecodable ref does not stop the scan, and its bytes can never equal a
+valid-UTF-8 branch name, so absence of a distinct valid branch stays fully
+established. Recorded as an addendum to decisions/0047, which also corrects
+that decision's own point 3 ("both causes suppress the negative existence claim
+identically" was the wrong instruction).
+
+Implementing it exposed a second defect in the M-02 code: the parser recorded
+only the *first* incompleteness cause, so an undecodable ref followed by the
+branch limit reported only the undecodable ref — under which the new predicate
+would have approved an absence claim despite a real unscanned horizon. A
+single-cause enum cannot express the distinction safely, so
+`Option<ListingIncomplete>` became `ListingCompleteness { branch_limit,
+undecodable_ref }`, carrying both, with `can_establish_absence()` (false only
+under the horizon) and a `describe()` that names every cause. The global
+mapping-index taint still applies under either cause: an undecodable dest
+branch may carry markers for a source commit already observed, which is what
+that taint exists for. Only the per-branch absence claim is separable.
+
+`reconstruct_mapping_index`'s negative-existence seeding makes the same absence
+claim, so it uses the same predicate — restoring, for this input class, what
+that site did before decisions/0047, without the fabricated name.
+
+Two tests were needed, not one, and the first attempt at the second one was
+wrong. The seeding site records a never-advertised branch as non-existent
+*before* the per-branch loop, so a reconstruction-level test of the deletion
+race never reaches the fetch path at all: reverting the recovery gate left that
+test passing. The real coverage calls `fetch_dest_head_for_reconstruction`
+directly against a dest carrying both a deleted `target` and an unrelated
+undecodable ref, and was verified to fail against the reverted gate. The
+reconstruction-level test stays, describing what it actually proves (absence
+still seeded, no abort, index still tainted). The parser's two-cause case has
+its own regression.
+
+Gates on the finished tree: fmt, clippy `-D warnings`, `cargo test` at 338
+passing (up from 335), and `cargo build --release --locked`, all clean.

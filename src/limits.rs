@@ -20,6 +20,7 @@ pub(crate) const MAX_TREE_DEPTH: usize = 256;
 pub(crate) const MAX_COLLISION_PATHS: usize = 1_000_000;
 pub(crate) const MAX_PENDING_COMMITS: usize = 10_000;
 pub(crate) const MAX_MARKER_SCAN_COMMITS: usize = 100_000;
+pub(crate) const MAX_MAPPING_ENTRIES: usize = 100_000;
 pub(crate) const MAX_CONFLICT_RECORDS: usize = 100_000;
 pub(crate) const MAX_CONFLICT_PATH_BYTES: usize = 8 * 1024 * 1024;
 
