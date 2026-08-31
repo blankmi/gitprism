@@ -2324,3 +2324,20 @@ branch-marker aliases and comparable exact mappings normalize automatically;
 only incomparable canonical dest mappings for the same nearest source OID remain
 a genuine operator boundary. The decision includes the TDD implementation and
 verification plan; code is not changed yet.
+
+## 2026-08-28 — implement exact authenticated mapping anchors (0046)
+
+**Update**: Decision 0046 landed on branch
+`codex/exact-mapping-anchors`. The implementation adds a bounded per-run
+authenticated mapping index, nearest first-parent anchors for new and rewritten
+mirror-only branches, immediate index updates for successful projections
+(including intermediate generated commits), and deterministic distance-based
+parent-before-child scheduling. Existing fast-forward, force-with-lease,
+round-trip, rewrite, conflict, and policy safety behavior is preserved. The
+production-topology regression and parent-before-child scheduling regression
+both pass.
+
+Local final gates passed: `cargo fmt --all -- --check`; `cargo test
+--workspace --all-features --locked` (288/288); `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings`; and `cargo build
+--release --locked`. GitHub pipeline status is not recorded here.
