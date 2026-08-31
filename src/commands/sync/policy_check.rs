@@ -51,7 +51,6 @@ pub(super) enum PolicyMismatchReason {
 pub(crate) fn find_control_file_policy_mismatch(
     repo: &Repository,
     pending: &[Oid],
-    branch: &str,
     key: &marker::StateKey,
     ignore_raw: &str,
 ) -> Result<Option<PolicyMismatch>> {
@@ -62,11 +61,11 @@ pub(crate) fn find_control_file_policy_mismatch(
 
         // Same loop-prevention `build_pending_dest_tip` itself applies (see
         // `super::loop_prevented`): a commit that's already on dest — for
-        // `branch` or for whichever branch its own `DestToSource` marker
+        // this branch or for whichever branch its own `DestToSource` marker
         // names — is never replayed onto dest by this branch's sync, so it's
         // not this check's business either. This cross-branch marker rule is
         // retained by decisions/0046.
-        if super::loop_prevented(&commit, branch, key) {
+        if super::loop_prevented(&commit, key) {
             continue;
         }
 

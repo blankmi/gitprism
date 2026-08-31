@@ -118,11 +118,39 @@ fn divergence_after_exhausted_retries_message(branch: &str, ff_target: &str) -> 
     )
 }
 
+/// decisions/0046 addendum, Finding I: memoizes only a branch's `None`
+/// distance across scheduling rounds. A branch that could gain a mapping
+/// from another branch's successful push already has that push's
+/// prerequisite anchor in its own ancestry, and would therefore already
+/// have reported a distance — a `None` distance can never become `Some`
+/// mid-run, so it is safe to skip recomputing that branch's full-history
+/// walk for the rest of this run. A `Some` distance is never cached here:
+/// an earlier push in the same run can shorten it before a later round asks
+/// again.
+fn mapping_distance_with_none_memo(
+    branch: &str,
+    known_to_have_no_mapping: &mut std::collections::HashSet<String>,
+    mut distance_for: impl FnMut(&str) -> Result<Option<usize>>,
+) -> Result<Option<usize>> {
+    if known_to_have_no_mapping.contains(branch) {
+        return Ok(None);
+    }
+    let distance = distance_for(branch)?;
+    if distance.is_none() {
+        known_to_have_no_mapping.insert(branch.to_owned());
+    }
+    Ok(distance)
+}
+
 /// One round of decisions/0046's distance-based scheduling: computes each
-/// remaining branch's mapping distance exactly once (never once per
-/// pairwise comparison, as the previous ~2·B² revwalks per run did — see
-/// decisions/0046 addendum) and selects the minimum by `(has-no-mapping,
-/// distance, name)`. A branch whose distance computation itself fails
+/// remaining branch's mapping distance exactly once this round (never once
+/// per pairwise comparison, as the previous ~2·B² revwalks per run did —
+/// see decisions/0046 addendum, Finding C) and selects the minimum by
+/// `(has-no-mapping, distance, name)`. This helper still recomputes every
+/// remaining branch every round; the caller memoizes `None` results across
+/// rounds itself (Finding I) with [`mapping_distance_with_none_memo`],
+/// since a `Some` distance can shorten mid-run and must not be cached. A
+/// branch whose distance computation itself fails
 /// (e.g. Finding A's own-scan-horizon refusal, or any other unexpected git
 /// error) is never selected and never aborts the round for every other
 /// branch — it's returned instead, for the caller to report as its own
@@ -286,10 +314,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // from the nearest exact mapping so a parent projection is available to
     // its child later in this run (decisions/0046).
     let mut remaining_branches = source_branches.clone();
+    let mut branches_with_no_mapping = std::collections::HashSet::new();
     while !remaining_branches.is_empty() {
         let (halted_by_distance_error, selected) =
             select_next_branch_by_mapping_distance(&remaining_branches, |branch| {
-                mapping_distance_for_branch(&repo, branch, &run_cache)
+                mapping_distance_with_none_memo(branch, &mut branches_with_no_mapping, |branch| {
+                    mapping_distance_for_branch(&repo, branch, &run_cache)
+                })
             });
         if !halted_by_distance_error.is_empty() {
             // decisions/0045's per-branch halt shape, applied to a distance
@@ -492,6 +523,13 @@ fn sync_pair_to_dest_with_key(
                     "fetching dest (mirror-only branch, not round-tripped)",
                 );
             }
+            // Deliberately its own fetch, not read from a cache: decisions/0040
+            // requires a `ForceMirrorOnly` lease built from the dest tip as
+            // actually fetched by *this* attempt, and the race-retry loop
+            // below must refetch after a `RejectedRefMoved` rejection —
+            // reusing a run-wide cached tip here would build a lease against
+            // a tip that may already be stale (decisions/0046 Addendum 2,
+            // Finding K).
             git::fetch(source_root, &dest_url, branch).with_context(|| {
                 format!("fetching dest branch {branch:?} from configured remote")
             })?;
@@ -506,11 +544,6 @@ fn sync_pair_to_dest_with_key(
                 .peel_to_commit()
                 .context("resolving fetched dest branch to a commit")?
                 .id();
-            // This fetch is already paid for and freshly accurate — retain
-            // the tip for the run's mapping reconstruction and later lookups.
-            run_cache
-                .dest_tip
-                .insert(branch.to_string(), fetched_dest_tip);
 
             // There is no safe way to build a new commit straight from
             // source's filtered snapshot and fast-forward dest onto it
@@ -683,7 +716,6 @@ fn sync_pair_to_dest_with_key(
         if let Some(mismatch) = find_control_file_policy_mismatch(
             repo,
             &pending_for_policy_check,
-            branch,
             state_key,
             ignore_raw,
         )? {
@@ -792,11 +824,9 @@ fn sync_pair_to_dest_with_key(
             };
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
                 git::PushOutcome::Accepted => {
-                    // The destination ref and exact authenticated mapping
-                    // are both visible to later branch anchor lookups this
-                    // run, with no re-query or re-fetch.
+                    // The destination ref is visible to later branch anchor
+                    // lookups this run, with no re-query.
                     run_cache.dest_ref_exists.insert(branch.to_string(), true);
-                    run_cache.dest_tip.insert(branch.to_string(), new_dest_tip);
                     // decisions/0046, F-A: a `ForceMirrorOnly` push just
                     // replaced `branch`'s own dest chain wholesale — any
                     // mapping this run recorded from that replaced chain
@@ -828,7 +858,7 @@ fn sync_pair_to_dest_with_key(
                             branch,
                             source_oid,
                             generated_dest_oid,
-                        )?;
+                        );
                     }
                     // When `build.new_tip` is `Some`, `new_dest_tip` is
                     // exactly the last mapping just recorded above — adding
@@ -845,7 +875,7 @@ fn sync_pair_to_dest_with_key(
                             branch,
                             new_dest_tip,
                             state_key,
-                        )?;
+                        );
                     }
                 }
                 git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
@@ -1001,42 +1031,28 @@ struct PendingDestBuild {
 /// stop being possible. Stops at the first commit that doesn't merge cleanly
 /// (decisions/0007). `dest_tip` seeds the chain's first parent.
 /// Loop prevention (decisions/0003): whether `commit` already exists on
-/// dest, so replaying it for `branch` would loop — a `Setup` graft (any
-/// branch cut from it, `marker::verify`'s own hardcoded exception) or a
-/// `DestToSource` marker scoped to `branch` itself.
+/// dest, so replaying it would loop — a `Setup` graft (exempt from the
+/// branch check by construction) or any `DestToSource` marker, verified
+/// against its own recorded branch rather than the branch currently being
+/// synced.
 ///
 /// Widened by decisions/0043's addendum (F-04), retained by decisions/0046:
-/// a `DestToSource` marker is
-/// written once, scoped to whichever branch's dest→source sync imported it,
-/// but once that commit is an ancestor of a *different* branch's tip (e.g. a
-/// branch forked after the import), the dest-native commit it names is
-/// already on dest regardless of which branch originally imported it. Self-
-/// verified against the marker's own recorded branch
-/// (`marker::parse(...).branch`), never against `branch` — this reuses
-/// `marker::verify` exactly as written, so its MAC check is not weakened;
-/// only which branch name gets passed to it changes.
-pub(super) fn loop_prevented(commit: &git2::Commit, branch: &str, key: &marker::StateKey) -> bool {
-    if marker::verify(
+/// a `DestToSource` marker is written once, scoped to whichever branch's
+/// dest→source sync imported it, but once that commit is an ancestor of a
+/// *different* branch's tip (e.g. a branch forked after the import), the
+/// dest-native commit it names is already on dest regardless of which
+/// branch originally imported it — hence the self-verification via
+/// `marker::verify_self` (decisions/0046 addendum, Finding L), which never
+/// takes a branch to check against in the first place.
+pub(super) fn loop_prevented(commit: &git2::Commit, key: &marker::StateKey) -> bool {
+    // `Setup` is exempt from the branch check by construction, and a
+    // `DestToSource` marker inherited onto some other branch's history
+    // verifies against its own recorded branch, not the branch being
+    // scanned (decisions/0046 addendum, Finding L) — exactly what
+    // `verify_self` already does, so no `branch` argument is needed here.
+    marker::verify_self(
         commit,
-        branch,
         &[MarkerDirection::Setup, MarkerDirection::DestToSource],
-        None,
-        key,
-    )
-    .is_some()
-    {
-        return true;
-    }
-    let Some(message) = commit.message().ok() else {
-        return false;
-    };
-    let Some(parsed) = marker::parse(message) else {
-        return false;
-    };
-    marker::verify(
-        commit,
-        &parsed.branch,
-        &[MarkerDirection::DestToSource],
         None,
         key,
     )
@@ -1068,7 +1084,7 @@ fn build_pending_dest_tip(
         // Loop prevention (decisions/0003, widened by decisions/0043's
         // addendum) — see `loop_prevented`. First thing in the loop now that
         // there's no cursor left to advance before it.
-        if loop_prevented(&source_commit, branch, key) {
+        if loop_prevented(&source_commit, key) {
             continue;
         }
 

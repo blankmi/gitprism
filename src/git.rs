@@ -581,8 +581,12 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
 /// own local listing, and a name that doesn't pass
 /// [`validate_branch_name`] is skipped rather than failing the whole
 /// listing — decisions/0024's precedent for a discovered oddity gitprism
-/// can't act on.
-pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<Vec<String>> {
+/// can't act on. decisions/0046 Addendum 2, Finding F: hitting
+/// `MAX_SOURCE_BRANCHES` truncates the listing rather than failing it — dest's
+/// branch count is not something a source-side operator can necessarily
+/// reduce, so the caller degrades to a per-branch refusal instead of a
+/// whole-run abort. A genuine `ls-remote` failure is still an `Err`.
+pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<RemoteBranchListing> {
     validate_remote(url)?;
     let mut command = git_command();
     command
@@ -609,6 +613,7 @@ pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<Vec<Stri
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut names = Vec::new();
+    let mut truncated = false;
     for line in stdout.lines() {
         let Some(refname) = line.split_ascii_whitespace().nth(1) else {
             continue;
@@ -620,14 +625,23 @@ pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<Vec<Stri
             continue;
         }
         if names.len() >= crate::limits::MAX_SOURCE_BRANCHES {
-            anyhow::bail!(
-                "dest branch listing exceeds the {} branch limit",
-                crate::limits::MAX_SOURCE_BRANCHES
-            );
+            truncated = true;
+            break;
         }
         names.push(name.to_string());
     }
-    Ok(names)
+    Ok(RemoteBranchListing { names, truncated })
+}
+
+/// [`remote_branch_names`]'s result: the branch names read up to
+/// `MAX_SOURCE_BRANCHES`, plus whether the listing was cut short there
+/// (decisions/0046 Addendum 2, Finding F). `truncated` is the caller's
+/// signal to treat reconstruction as incomplete rather than to assume dest
+/// has no more branches than `names` lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteBranchListing {
+    pub(crate) names: Vec<String>,
+    pub(crate) truncated: bool,
 }
 
 /// What happened to a [`push`] attempt: either it landed, or it was
@@ -2547,13 +2561,42 @@ mod tests {
                 .unwrap();
         }
 
-        let names = remote_branch_names(
+        let listing = remote_branch_names(
             source
                 .workdir()
                 .expect("non-bare source repository has a worktree"),
             dest.path().to_str().unwrap(),
         )
         .expect("the valid branch boundary must not hit the small output cap");
-        assert_eq!(names.len(), crate::limits::MAX_SOURCE_BRANCHES);
+        assert_eq!(listing.names.len(), crate::limits::MAX_SOURCE_BRANCHES);
+        assert!(!listing.truncated);
+    }
+
+    #[test]
+    fn remote_branch_names_truncates_the_listing_instead_of_failing_past_the_declared_limit() {
+        let dir = tempdir().unwrap();
+        let source = Repository::init(dir.path().join("source")).unwrap();
+        let dest = Repository::init_bare(dir.path().join("dest")).unwrap();
+        let tree = dest
+            .find_tree(dest.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let oid = dest
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES + 1 {
+            dest.reference(&format!("refs/heads/b{index:05}"), oid, true, "test")
+                .unwrap();
+        }
+
+        let listing = remote_branch_names(
+            source
+                .workdir()
+                .expect("non-bare source repository has a worktree"),
+            dest.path().to_str().unwrap(),
+        )
+        .expect("exceeding the branch limit must truncate the listing, not fail the call");
+        assert_eq!(listing.names.len(), crate::limits::MAX_SOURCE_BRANCHES);
+        assert!(listing.truncated);
     }
 }

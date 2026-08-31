@@ -360,8 +360,9 @@ accepted-push call site in `run()`) — go through a separate, always-succeeds
 pending-history limits before dest was ever mutated, so recording it in the
 index must never fail an otherwise-successful run. `MAX_MAPPING_ENTRIES` now
 means "how much of reconstruction's own scan work to do," the same kind of
-bound `MAX_MARKER_SCAN_COMMITS` already was, not a lifetime ceiling on
-authenticated history. The entries retained before this horizon are not
+bound `MAX_MARKER_SCAN_COMMITS` already was, rather than a cap on how much
+authenticated history may exist (which nothing enforces, and which is why
+exceeding it recurs every run — Addendum 2, Finding P). The entries retained before this horizon are not
 necessarily the newest or oldest globally: scan order is determined by the
 source/dest head order and shared-history traversal.
 
@@ -392,8 +393,13 @@ horizon can repeatedly halt mapped branches until an operator changes the
 history or a future decision changes the static implementation limit. Avoiding
 that repeated halt requires a durable scan cursor/summary or an unbounded
 verification pass, both outside this decision. The horizon still prevents a
-whole-run error and does not create a lifetime entry ceiling; branches with a
-complete index are unaffected.
+whole-run error, and branches with a complete index are unaffected — but
+because every dest commit gitprism generates adds one authenticated mapping to
+history permanently, a repository that grows past the horizon truncates on
+every subsequent run, and from then on every new branch's first mirror and
+every detected rewrite's rebuild halts until an operator acts (see Addendum 2,
+Finding P). "Not a lifetime ceiling" describes what the constant bounds —
+reconstruction work per run — not the resulting operational availability.
 
 An exact mapping whose canonical destination object is absent from the local
 object database is also a per-branch refusal, even when an older mapping is
@@ -464,3 +470,251 @@ beyond the horizon is the explicit availability tradeoff documented above.
   it; and `select_next_branch_by_mapping_distance` computes each branch's
   distance exactly once per round, breaks ties by name, and turns a single
   branch's distance error into just that branch's halt.
+
+# Addendum 2 (2026-08-31): every new bound is a horizon or a per-branch halt, never a whole-run abort
+
+## Context
+
+A second review of this decision's implementation branch confirmed ten
+findings, all in code this decision added. Four are availability regressions
+against this decision's own Addendum 1 direction: the implementation
+introduced three fresh whole-run abort sites and left one post-push
+bookkeeping call fallible, while Addendum 1's stated rules are "a limit with
+no operator remedy is a design bug, not safety" and "never fail a run after
+dest has been mutated." Four are cost or dead-code findings where a doc
+comment claims an optimization the code does not implement. Two are
+bookkeeping: decisions/0043 carries none of this repository's supersession
+signposting, and one test's name still describes the bug it now proves fixed.
+
+This addendum records the resolutions. It changes behavior, so it is written
+before the code, per AGENTS.md.
+
+## Decision
+
+**Finding E — force-rebuild invalidation no longer walks the whole
+replacement DAG, and has no bound to hit.** Addendum 1 replaced
+`plan_replaced_chain_invalidation`'s per-mapping ancestry queries with a
+single reachability walk of `new_dest_tip`. That walk is the only scan in
+`mapping_index.rs` without `simplify_first_parent`, yet it spends
+`MAX_MARKER_SCAN_COMMITS` — a budget every other call site calibrates against
+first-parent history — and `anyhow::bail!`s on exceeding it. Because
+`sync_pair_to_dest_with_key`'s error propagates through `run()`'s `?`, a dest
+whose tip reaches more than 100,000 commits makes every mirror-only rewrite
+kill the whole run and cost every not-yet-processed branch its turn, with no
+operator remedy short of shortening dest's history.
+
+That walk is reverted to per-destination reachability queries, which is what
+Git already provides a safe primitive for (`git_graph_descendant_of`), with
+the two properties Addendum 1 wanted from the walk kept explicitly:
+
+* Only records provenanced to `branch` are considered, and their
+  `canonical_dest` OIDs are deduplicated into one memo per plan, so each
+  distinct destination is queried at most once regardless of how many source
+  commits map to it.
+* A destination absent from the local object database is stale by
+  definition — established with `Repository::find_commit` before any
+  reachability query, exactly as `resolve_for_anchor` already does — rather
+  than by relying on a reachability query not being asked about a missing
+  OID.
+
+`new_dest_tip` itself counts as reachable (a mapping to the replacement tip
+is not stale). The function keeps its `Result` for genuine object-database
+failures, but no longer contains a limit an operator cannot act on. It is
+still planned before the push and applied infallibly after acceptance.
+
+**Finding F — the destination branch listing is a horizon, not an abort.**
+`git::remote_branch_names` applies `MAX_SOURCE_BRANCHES` to dest's branches
+and bails, and `reconstruct_mapping_index` is called unconditionally with
+`?`, so a destination repository that independently accumulates more than
+4,096 branches fails every sync before any branch is processed. gitprism has
+never constrained dest this way, and dest's branch count is not something a
+source-side operator can necessarily reduce.
+
+`remote_branch_names` instead returns the names it read up to the limit
+together with an explicit "this listing was truncated" signal, and
+reconstruction records that truncation into the same `truncated_scans` an
+over-horizon history scan records (via a new
+`MappingIndex::note_incomplete_reconstruction`). The reasoning is identical
+to Addendum 1's: an unlisted dest branch may carry an incomparable mapping
+for a source commit already observed, so exact lookups against that index
+must refuse per-branch rather than resolve, and must not silently resolve the
+visible mapping. What changes is that this is now the same conservative
+per-branch refusal every other incompleteness produces, not a run that never
+starts.
+
+**Finding G — the list/fetch race is recovered for a deleted ref and
+propagated for anything else.** `reconstruct_mapping_index` seeds
+`dest_ref_exists` to `true` for every name `ls-remote` advertised, then
+fetches each one individually. A ref deleted in that window makes the fetch
+fail, and the failure aborts the whole run — previously a dest ref problem
+was scoped to its own branch.
+
+The two failure classes are resolved differently, and deliberately so:
+
+* *The ref no longer exists.* Recoverable, because the recovered state is
+  complete: the branch genuinely has no dest ref, so it contributes no
+  mappings. On any fetch failure during reconstruction, the dest listing is
+  refreshed once per run; if the branch is absent from the refreshed
+  listing, it is recorded as `dest_ref_exists = false`, dropped from the
+  reconstruction set, and the run continues.
+* *Any other fetch failure* (authentication, network, transport, a corrupt
+  remote). **Not** recoverable and explicitly not demoted to a per-branch
+  halt: skipping the branch would leave the global mapping index incomplete
+  while every other branch's lookup still believed it complete — the exact
+  "a visible mapping hides an unscanned contradiction" hole Addendum 1
+  closed. If the branch is still advertised by the refreshed listing, the
+  original fetch error propagates as a run failure, before dest is mutated.
+
+A per-branch halt is the right shape for a per-branch fact. Reconstruction's
+completeness is a whole-run fact, and it stays one.
+
+**Finding H — the post-push bookkeeping path is genuinely infallible.**
+Addendum 1 states that recording a mapping this run's own push authored
+"always succeeds," and restructured `run()`'s accepted-push arm specifically
+to guarantee it. `record_pushed_dest_commit` remained fallible through
+`dest_commit_mapping`'s `repo.find_commit(oid)?`, called with `?` after the
+push landed. Both `record_pushed_dest_commit` and `record_built_mapping` now
+return `()`. A commit this call just authored that cannot be re-read records
+no mapping rather than failing the run: the consequence of a missing entry is
+a later branch finding no anchor and halting per-branch, never anchoring
+wrongly. `record_built_mapping`'s `#[allow(clippy::unnecessary_wraps)]`
+rationale — "leaves room for a future genuinely-fallible check" — is
+withdrawn: the claim in the decision text is the stronger commitment, and a
+future fallible check would be a decision, not a signature convenience.
+
+**Finding I — a branch with no mapping is asked once per run, not once per
+round.** Addendum 1's Finding C removed the pairwise recomputation but not
+the per-round one, so scheduling remains Θ(B²) first-parent walks across a
+run, and the walk for a branch with *no* mapping is the expensive case: it
+traverses that branch's entire first-parent history up to
+`MAX_MARKER_SCAN_COMMITS` before returning `None`.
+
+Those results are cached for the rest of the run. The invariant that makes
+this sound: a branch that could gain a mapping from another branch's
+successful push already has that push's prerequisite anchor in its own
+ancestry, and would therefore already have reported a distance. A `None`
+distance can never become `Some` mid-run. Branches that *do* have a mapping
+are still recomputed every round — required, since a push earlier in the run
+can shorten their distance — and their walks stop at the first mapping found.
+
+**Finding J — non-existence is cached too.** `reconstruct_mapping_index`
+seeds `dest_ref_exists` only with `true`, so every source branch with no
+same-named dest ref still spends its own `ls-remote` subprocess later, and
+the comment claiming per-branch remote queries were eliminated is false. The
+complement is now seeded `false` from the same listing, which is also what
+Finding G's refresh path updates.
+
+**Finding K — the dead per-run destination tip cache is removed.**
+`RunCache::dest_tip`'s only reader is `fetch_dest_tip_cached`, whose only
+caller is `reconstruct_mapping_index`; both writes in `mod.rs` happen after
+reconstruction has finished and are never read. The cache and its helper are
+deleted and reconstruction fetches directly, since the branch names it
+iterates are already deduplicated. `sync_pair_to_dest_with_key`'s own
+per-branch fetch is deliberately *kept*: decisions/0040 requires a
+`ForceMirrorOnly` lease to be built from the dest tip as actually fetched by
+that attempt, and the race-retry loop must refetch after a
+`RejectedRefMoved` rejection. The duplicate fetch is the price of lease
+freshness, stated here rather than left looking like an oversight.
+
+**Finding L — `loop_prevented` parses once.** It calls
+`marker::verify(commit, branch, &[Setup, DestToSource], ...)`, then on
+failure re-reads the message, re-parses it, and calls `verify` again with the
+marker's own branch. Since `verify`'s branch check exempts `Setup` outright,
+that union is exactly `marker::verify_self(commit, &[Setup, DestToSource],
+None, key).is_some()` — the single call this addendum's own `verify_self`
+was introduced for. Behavior is unchanged and covered by the existing
+cross-branch loop-prevention regression test.
+
+**Finding M — the test wrapper propagates reconstruction errors.**
+`tests::sync_pair_to_dest` rebuilds `run_cache.mapping_index` with `?`, so a
+reconstruction regression is catchable through the wrapper exactly as
+through `run()` itself — no test can pass against a stale index left by an
+earlier call on some other branch. The accommodation this replaced (reset
+the index to empty on error) existed because `tests::fresh_clone_of_branch`
+reused a `Repository` handle opened before its own external `git fetch
+--depth=1` subprocess wrote `.git/shallow`, so a first-parent walk against
+that stale handle raised a spurious `git2::Error { code: NotFound, class:
+Odb }` — a fixture artifact, not a real limitation of reconstruction
+(confirmed by direct investigation, design/log.md 2026-08-31). The fixture
+now reopens the repository after the external fetch, before any use of the
+handle, matching what a real gitprism process already does at every
+`Repository::discover` startup; all three of its callers behave identically
+under the reopened handle. A genuine object-database failure — an unreadable
+object, `class=Os, code=Locked` — still propagates through reconstruction by
+design: neither `mapping_index.rs` nor `anchor.rs` swallows or bounds it.
+
+**Finding N — decisions/0043 gets this repository's supersession
+signposting.** 0043 keeps `status: stable` with no inline supersession notes,
+and its `decisions/index.md` entry does not say it is superseded, against the
+convention decisions/0036 and decisions/0038 already establish. Since
+AGENTS.md makes `design/` the source of truth, a reader landing on 0043 today
+is handed a deleted algorithm as current. Its status, a header note, inline
+notes on the clauses this decision replaced, and its index entry are updated.
+0043's *problem statement* is not superseded — it is this decision's Context.
+
+**Finding O — one test name is corrected.**
+`run_reproduces_the_round_tripped_feature_rebase_anchor_ambiguity` now
+asserts the fixed anchoring behavior, not the ambiguity it was written to
+reproduce. Renamed to
+`run_anchors_a_round_tripped_feature_rebase_on_its_exact_mapping_instead_of_halting`.
+
+**Finding P — Addendum 1's "not a lifetime entry ceiling" is narrowed.**
+That sentence is accurate about what the constant *means* (how much
+reconstruction work one run does) but reads as contradicting the
+availability paragraph directly above it. Every dest commit gitprism
+generates is one more authenticated mapping in source and dest history
+forever, so a repository that grows past the horizon truncates on *every*
+subsequent run, and from then on every new branch's first mirror and every
+detected rewrite's rebuild halts until an operator acts. The tradeoff is
+accepted, not reopened here; the wording is corrected to state the
+operational consequence rather than only the constant's scope.
+
+## Why
+
+Three of these four availability findings share one cause: a bound was added
+for a real safety reason and then wired to `anyhow::bail!` because that was
+the shortest path, in a module whose own decision text had already settled
+that bounds are horizons. The distinction that decides the shape is not how
+serious the condition is but *whose* fact it is. A branch's own history, its
+own dest ref, its own rewrite — per-branch halt. Reconstruction's
+completeness, which every branch's lookup depends on — whole-run, and the
+index's existing truncation refusal already expresses it correctly. Finding
+G is the case where those two rules meet, and the answer follows the fact,
+not the convenience: a deleted ref is per-branch and recoverable, an
+unreachable remote is not.
+
+Finding E is also a case of Git already having the primitive. Addendum 1
+moved away from `graph_descendant_of` to avoid asking it about a missing
+object; existence-gating first solves that directly, and keeps the bound out
+of the design.
+
+## Consequences
+
+* `plan_replaced_chain_invalidation` no longer references
+  `MAX_MARKER_SCAN_COMMITS`; the only limit reachable from a force-rebuild
+  path is the aggregate mapping-entry horizon, which cannot abort a run.
+* `git::remote_branch_names` returns the listing plus whether it was
+  truncated (its callers must handle both); `MappingIndex` gains
+  `note_incomplete_reconstruction`, which makes an externally observed
+  incompleteness taint lookups the same way a truncated internal scan does.
+* `MappingIndex::record_built_mapping` and
+  `MappingIndex::record_pushed_dest_commit` return `()`; `run()`'s
+  accepted-push arm has no `?` after the push succeeded.
+* `RunCache` loses `dest_tip`; `anchor::fetch_dest_tip_cached` is removed.
+  `RunCache::dest_ref_exists` is now seeded for every source branch and every
+  advertised dest branch, and is corrected in place when a listed ref turns
+  out to be deleted.
+* A destination with more than `MAX_SOURCE_BRANCHES` branches now syncs
+  already-mirrored branches normally and halts only new branches and detected
+  rewrites, instead of failing every run outright.
+* **Tests added:** a force-rebuild whose replacement history exceeds the old
+  invalidation limit still pushes and still invalidates its orphaned
+  mappings; a truncated dest branch listing taints exact lookups instead of
+  failing reconstruction; a dest branch deleted between listing and fetch is
+  recovered by refreshing the listing, while a fetch failure whose ref is
+  still advertised propagates; a source branch with no dest ref costs no
+  per-branch remote query; a branch with no mapping has its distance computed
+  once per run rather than once per round; `loop_prevented` behavior is
+  unchanged after collapsing to `verify_self`; and the test wrapper
+  propagates a reconstruction failure rather than reusing a previous
+  branch's index.

@@ -122,7 +122,7 @@ fn fresh_clone_of_branch(
     shallow: bool,
 ) -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    Repository::init(dir.path()).unwrap();
     let url = source_repo.path().display().to_string();
     let refspec = format!("refs/heads/{branch}");
     if shallow {
@@ -130,6 +130,13 @@ fn fresh_clone_of_branch(
     } else {
         git::fetch(dir.path(), &url, branch).unwrap();
     }
+    // Reopened here, not reused from `init` above: the fetch just ran as an
+    // external subprocess, which can write `.git/shallow` behind an
+    // already-open handle, and a real gitprism process always does a fresh
+    // `Repository::discover` at startup — so this fixture must too, or tests
+    // observe stale libgit2 graft state production never sees (decisions/0046
+    // Addendum 2, Finding M).
+    let repo = Repository::open(dir.path()).unwrap();
     {
         let fetched_tip = repo
             .find_reference("FETCH_HEAD")
@@ -437,25 +444,16 @@ fn sync_pair_to_dest(
     // the current state on every call. A test that needs the "built once,
     // carried across several branches in one run" invariant under test calls
     // `run` directly instead (see `tests::anchor`'s scheduling tests).
-    //
-    // A reconstruction failure (e.g. a deliberately shallow/incomplete test
-    // clone whose own source history can't be walked past its fetch
-    // boundary) is swallowed here rather than propagated: this branch's own
-    // sync may never actually consult the index at all — the same as before
-    // this wrapper started seeding it explicitly — and a real `run` still
-    // propagates its own single reconstruction's errors untouched.
     let dest_url = config.dest_url()?;
     let (source_branches, _skipped) = list_source_branches(repo)?;
-    if let Ok(mapping_index) = reconstruct_mapping_index(
+    run_cache.mapping_index = reconstruct_mapping_index(
         repo,
         source_root,
         &dest_url,
         &source_branches,
         &key,
         run_cache,
-    ) {
-        run_cache.mapping_index = mapping_index;
-    }
+    )?;
     sync_pair_to_dest_with_key(
         repo,
         source_root,

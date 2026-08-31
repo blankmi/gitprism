@@ -297,7 +297,6 @@ pub(super) enum DestAnchor {
 #[derive(Default)]
 pub(super) struct RunCache {
     pub(super) dest_ref_exists: HashMap<String, bool>,
-    pub(super) dest_tip: HashMap<String, Oid>,
     pub(super) mapping_index: MappingIndex,
 }
 
@@ -316,29 +315,56 @@ pub(super) fn dest_ref_exists_cached(
     Ok(exists)
 }
 
-/// A fetched destination tip, resolved through the same per-run cache as
-/// [`dest_ref_exists_cached`].
-pub(super) fn fetch_dest_tip_cached(
+/// Fetches `branch`'s dest head for [`reconstruct_mapping_index`], resolving
+/// the decisions/0046 Addendum 2, Finding G list/fetch race: `branch` was
+/// advertised by reconstruction's own initial listing, but another writer
+/// may have deleted it before this call runs. On a fetch failure, the dest
+/// listing is refreshed at most once per run (via `refreshed_listing`,
+/// shared across every branch this run reconstructs) and the two outcomes
+/// are handled differently on purpose. A branch absent from the refreshed
+/// listing is fully recovered: the branch genuinely has no dest ref any
+/// more, so it contributes no mappings, and reconstruction stays complete.
+/// Any other fetch failure — auth, network, transport, a corrupt remote, or
+/// the branch still being advertised — propagates instead: silently
+/// skipping it would leave the mapping index incomplete while every other
+/// branch's lookup still believed it complete, the exact "a visible mapping
+/// hides an unscanned contradiction" hole Addendum 1 closed. A per-branch
+/// halt is the right shape for a per-branch fact; reconstruction's
+/// completeness is a whole-run fact.
+pub(super) fn fetch_dest_head_for_reconstruction(
     repo: &Repository,
     source_root: &Path,
     dest_url: &str,
     branch: &str,
-    cache: &mut RunCache,
-) -> Result<Oid> {
-    if let Some(&tip) = cache.dest_tip.get(branch) {
-        return Ok(tip);
+    run_cache: &mut RunCache,
+    refreshed_listing: &mut Option<git::RemoteBranchListing>,
+) -> Result<Option<Oid>> {
+    let fetch_err = match git::fetch(source_root, dest_url, branch) {
+        Ok(()) => {
+            let tip = repo
+                .find_reference("FETCH_HEAD")
+                .context("reading FETCH_HEAD after fetching a destination branch")?
+                .peel_to_commit()
+                .context("resolving a fetched destination branch to a commit")?
+                .id();
+            return Ok(Some(tip));
+        }
+        Err(err) => err,
+    };
+    if refreshed_listing.is_none() {
+        *refreshed_listing = Some(
+            git::remote_branch_names(source_root, dest_url)
+                .context("refreshing the dest branch listing after a fetch failure")?,
+        );
     }
-    git::fetch(source_root, dest_url, branch).with_context(|| {
-        format!("fetching destination branch {branch:?} from configured remote")
-    })?;
-    let tip = repo
-        .find_reference("FETCH_HEAD")
-        .context("reading FETCH_HEAD after fetching a destination branch")?
-        .peel_to_commit()
-        .context("resolving a fetched destination branch to a commit")?
-        .id();
-    cache.dest_tip.insert(branch.to_string(), tip);
-    Ok(tip)
+    let listing = refreshed_listing.as_ref().expect("just populated above");
+    if !listing.truncated && !listing.names.iter().any(|name| name == branch) {
+        run_cache.dest_ref_exists.insert(branch.to_string(), false);
+        return Ok(None);
+    }
+    Err(fetch_err.context(format!(
+        "fetching destination branch {branch:?} from configured remote"
+    )))
 }
 
 pub(super) fn reconstruct_mapping_index(
@@ -368,25 +394,60 @@ pub(super) fn reconstruct_mapping_index(
     // `source_branches` can no longer name it, so dest's actual branches are
     // asked for directly rather than inferred from what source still has.
     let mut dest_branch_names = source_branches.to_vec();
-    // Existence for every listed name is already known from this one
-    // subprocess — recorded into the same cache `dest_ref_exists_cached`
-    // reads below so it never re-queries per branch (decisions/0043's own
-    // quadratic-cost lesson).
-    for name in git::remote_branch_names(source_root, dest_url)? {
+    let dest_listing = git::remote_branch_names(source_root, dest_url)?;
+    // Existence for every listed name — and, when the listing is complete,
+    // non-existence for every source branch it didn't list — is now known
+    // from this one subprocess, recorded into the same cache
+    // `dest_ref_exists_cached` reads below so it never re-queries per
+    // branch (decisions/0043's own quadratic-cost lesson; decisions/0046
+    // Addendum 2, Finding J for the non-existence half). A truncated
+    // listing can't support that negative claim — an unlisted name might
+    // still have a dest ref beyond the horizon — so only the positives are
+    // seeded in that case, and `dest_ref_exists_cached` is left to query
+    // the rest itself.
+    for name in &dest_listing.names {
         run_cache.dest_ref_exists.insert(name.clone(), true);
-        if !dest_branch_names.contains(&name) {
-            dest_branch_names.push(name);
+        if !dest_branch_names.contains(name) {
+            dest_branch_names.push(name.clone());
+        }
+    }
+    if !dest_listing.truncated {
+        for branch in source_branches {
+            if !dest_listing.names.contains(branch) {
+                run_cache.dest_ref_exists.insert(branch.clone(), false);
+            }
         }
     }
 
     let mut dest_heads = Vec::new();
+    let mut refreshed_listing = None;
     for branch in &dest_branch_names {
-        if dest_ref_exists_cached(source_root, dest_url, branch, run_cache)? {
-            let tip = fetch_dest_tip_cached(repo, source_root, dest_url, branch, run_cache)?;
+        if !dest_ref_exists_cached(source_root, dest_url, branch, run_cache)? {
+            continue;
+        }
+        if let Some(tip) = fetch_dest_head_for_reconstruction(
+            repo,
+            source_root,
+            dest_url,
+            branch,
+            run_cache,
+            &mut refreshed_listing,
+        )? {
             dest_heads.push((branch.clone(), tip));
         }
     }
-    MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)
+    let mut index = MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)?;
+    if dest_listing.truncated {
+        // decisions/0046 Addendum 2, Finding F: an unlisted dest branch may
+        // carry an incomparable mapping for a source commit already
+        // observed, so this incompleteness must taint exact lookups the
+        // same way a truncated history scan already does.
+        index.note_incomplete_reconstruction(format!(
+            "dest branch listing truncated at the {} branch limit",
+            crate::limits::MAX_SOURCE_BRANCHES
+        ));
+    }
+    Ok(index)
 }
 
 /// `branch` is excluded from canonicalization (decisions/0046, F-C):

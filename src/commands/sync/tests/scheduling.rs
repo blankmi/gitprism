@@ -101,3 +101,49 @@ fn an_empty_remaining_list_selects_nothing_and_halts_nothing() {
     assert!(halted.is_empty());
     assert!(selected.is_none());
 }
+
+#[test]
+fn a_branchs_none_distance_is_computed_once_across_rounds_while_a_some_distance_is_recomputed_every_round()
+ {
+    // decisions/0046 addendum, Finding I: a branch that never gains a
+    // mapping this run has its expensive full-history walk paid exactly
+    // once, not once per scheduling round, while a branch with a mapping is
+    // still asked every round since an earlier push in the same run can
+    // shorten its distance.
+    let mut no_mapping_memo: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let calls: std::collections::HashMap<&str, Cell<usize>> =
+        [("no-mapping", Cell::new(0)), ("mapped", Cell::new(0))]
+            .into_iter()
+            .collect();
+
+    for _round in 0..3 {
+        for branch in ["no-mapping", "mapped"] {
+            let distance =
+                mapping_distance_with_none_memo(branch, &mut no_mapping_memo, |queried| {
+                    calls[queried].set(calls[queried].get() + 1);
+                    Ok(match queried {
+                        "no-mapping" => None,
+                        "mapped" => Some(1),
+                        _ => unreachable!(),
+                    })
+                })
+                .unwrap();
+            match branch {
+                "no-mapping" => assert_eq!(distance, None),
+                "mapped" => assert_eq!(distance, Some(1)),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    assert_eq!(
+        calls["no-mapping"].get(),
+        1,
+        "a None distance must be memoized for the rest of the run"
+    );
+    assert_eq!(
+        calls["mapped"].get(),
+        3,
+        "a Some distance must be recomputed every round"
+    );
+}

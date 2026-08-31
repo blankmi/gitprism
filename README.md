@@ -225,13 +225,21 @@ those objects across platforms.
 Repository-controlled input also has static safety budgets: control files are
 limited to 1 MiB, small Git state files to 64 KiB, commit messages to 1 MiB,
 configured branches to 1,024, source-branch discovery to 4,096, pending
-commits to 10,000, and marker scans to 100,000 first-parent commits. Recursive
-tree work is limited to 1,000,000 entries and depth 256; conflict reporting is
-limited to 100,000 records and 8 MiB of raw path bytes. Resolution worktrees
-are signed into their operation state and must remain registered to the same
-Git common directory; tampered or legacy state fails closed. Exceeding a
-budget fails the operation; gitprism does not truncate data, skip conflicts,
-or choose a conflict resolution.
+commits to 10,000, and marker scans / mapping reconstruction to 100,000
+first-parent commits per scan and 100,000 mapping entries per reconstruction.
+Recursive tree work is limited to 1,000,000 entries and depth 256; conflict
+reporting is limited to 100,000 records and 8 MiB of raw path bytes.
+Resolution worktrees are signed into their operation state and must remain
+registered to the same Git common directory; tampered or legacy state fails
+closed. Exceeding most budgets fails the operation; gitprism does not
+truncate data, skip conflicts, or choose a conflict resolution. Mapping
+reconstruction is the exception: exceeding a marker-scan or mapping-entry
+limit, or finding more than 4,096 branches on dest, truncates that scan
+instead of failing the run, and only the branches an incomplete mapping index
+leaves ambiguous — a new branch's first mirror and a detected rewrite's
+rebuild — halt for operator review. Already-mirrored branches keep syncing.
+See
+[decisions/0046](design/decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md).
 
 ## Configuration: `.gitprism.toml`
 

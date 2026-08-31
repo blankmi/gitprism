@@ -1864,15 +1864,16 @@ fn sync_pair_to_dest_rewrite_rebuild_anchors_on_a_sibling_mirror_only_branch_too
 }
 
 #[test]
-fn fetch_dest_tip_cached_hits_the_cache_without_fetching_again() {
-    // A fetched destination tip is cached for the whole run. Proven
-    // directly, not just by absence of a slowdown: the second call is
-    // pointed at a deliberately broken remote and must still succeed,
-    // returning the identical oid — which is only possible if it never
-    // touched the remote at all.
+fn reconstruct_mapping_index_caches_a_source_branchs_missing_dest_ref_as_nonexistent() {
+    // decisions/0046 Addendum 2, Finding J: `feature` has no same-named
+    // dest ref, and the dest listing that reconstruction already ran is a
+    // complete (non-truncated) account of every dest branch — so
+    // reconstruction must record `feature`'s absence from that one listing
+    // directly, rather than leaving `dest_ref_exists_cached` to spend its
+    // own `ls-remote` subprocess on it later.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
 
     let source_dir = tempdir().unwrap();
     let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
@@ -1883,63 +1884,140 @@ fn fetch_dest_tip_cached_hits_the_cache_without_fetching_again() {
         .peel_to_commit()
         .unwrap()
         .id();
-
     source_repo
         .branch("feature", &source_repo.find_commit(graft).unwrap(), false)
         .unwrap();
     add_commit(&source_repo, "feature", &[("feature.txt", "line1\n")]);
 
-    let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
-    )
-    .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
-    let reporter = Reporter::new(1, std::iter::empty());
+    let dest_url = dest_dir.path().display().to_string();
+    let key = marker::load_key().unwrap();
     let mut run_cache = RunCache::default();
 
-    sync_pair_to_dest(
+    reconstruct_mapping_index(
         &repo,
         source_dir.path(),
-        &config,
-        "feature",
-        &reporter,
+        &dest_url,
+        &["main".to_string(), "feature".to_string()],
+        &key,
         &mut run_cache,
     )
-    .expect("feature must mirror to dest");
-
-    // sync_pair_to_dest's own push-accept path already cached this tip
-    // as a side effect — remove it so the first call below is a genuine
-    // miss, not a hit disguised as one.
-    run_cache.dest_tip.remove("feature");
-
-    let real_dest_url = dest_dir.path().display().to_string();
-    let first = fetch_dest_tip_cached(
-        &repo,
-        source_dir.path(),
-        &real_dest_url,
-        "feature",
-        &mut run_cache,
-    )
-    .expect("the first call must really fetch");
-
-    // A URL that cannot possibly be fetched from — if the second call
-    // hits the cache as required, this is never touched.
-    let broken_dest_url = dest_dir.path().join("does-not-exist").display().to_string();
-    let second = fetch_dest_tip_cached(
-        &repo,
-        source_dir.path(),
-        &broken_dest_url,
-        "feature",
-        &mut run_cache,
-    )
-    .expect(
-        "a cache hit must succeed even against an unreachable remote — proof it never \
-         fetched again",
-    );
+    .expect("reconstruction must succeed even though feature has no dest ref");
 
     assert_eq!(
-        first, second,
-        "the cached oid must be returned unchanged on the second call"
+        run_cache.dest_ref_exists.get("feature"),
+        Some(&false),
+        "a source branch absent from the (non-truncated) dest listing must be cached as \
+         having no dest ref, not left for a later per-branch ls-remote to discover"
+    );
+}
+
+#[test]
+fn fetch_dest_head_for_reconstruction_recovers_a_dest_branch_deleted_between_the_listing_and_its_fetch()
+ {
+    // decisions/0046 Addendum 2, Finding G: stands in for the listing
+    // having advertised `target` and another writer deleting it before
+    // this branch's own fetch runs. `run_cache` starts out believing
+    // exactly what a real listing would have reported (`true`); the ref is
+    // really gone by the time this call fetches it.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
+    // HEAD must point elsewhere before `target` can be deleted.
+    dest_repo.set_head("refs/heads/unused").unwrap();
+    dest_repo
+        .find_branch("target", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    let source_dir = tempdir().unwrap();
+    Repository::init(source_dir.path()).unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let dest_url = dest_dir.path().display().to_string();
+    let mut run_cache = RunCache::default();
+    run_cache.dest_ref_exists.insert("target".to_string(), true);
+    let mut refreshed_listing = None;
+
+    let head = fetch_dest_head_for_reconstruction(
+        &repo,
+        source_dir.path(),
+        &dest_url,
+        "target",
+        &mut run_cache,
+        &mut refreshed_listing,
+    )
+    .expect("a genuinely deleted dest ref must be recovered, not fail the run");
+
+    assert_eq!(
+        head, None,
+        "a deleted dest ref contributes no dest head to reconstruction"
+    );
+    assert_eq!(
+        run_cache.dest_ref_exists.get("target"),
+        Some(&false),
+        "the branch must be recorded as no longer having a dest ref"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fetch_dest_head_for_reconstruction_propagates_a_fetch_failure_for_a_ref_still_advertised() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // decisions/0046 Addendum 2, Finding G: `target` is still advertised
+    // by a refreshed listing (its ref is untouched), but its own object is
+    // made unreadable — `ls-remote` never touches objects so the listing
+    // still sees it, but the real `git fetch` fails, standing in for
+    // authentication/network/transport/corrupt-remote failures that must
+    // not be silently downgraded to "branch doesn't exist".
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
+    drop(dest_repo);
+
+    let hex = tip.to_string();
+    let object_path = dest_dir
+        .path()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        object_path.exists(),
+        "the tip commit must be a real loose object"
+    );
+    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let source_dir = tempdir().unwrap();
+    Repository::init(source_dir.path()).unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let dest_url = dest_dir.path().display().to_string();
+    let mut run_cache = RunCache::default();
+    run_cache.dest_ref_exists.insert("target".to_string(), true);
+    let mut refreshed_listing = None;
+
+    let error = fetch_dest_head_for_reconstruction(
+        &repo,
+        source_dir.path(),
+        &dest_url,
+        "target",
+        &mut run_cache,
+        &mut refreshed_listing,
+    )
+    .expect_err("a fetch failure for a still-advertised ref must propagate, not be recovered");
+
+    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("fetching destination branch"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(
+        run_cache.dest_ref_exists.get("target"),
+        Some(&true),
+        "a still-advertised ref's cached existence must not be downgraded on an unrelated \
+         fetch failure"
     );
 }
 
@@ -2118,7 +2196,7 @@ fn run_does_not_resurrect_an_orphaned_dest_commit_after_a_same_run_amend() {
 }
 
 #[test]
-fn run_reproduces_the_round_tripped_feature_rebase_anchor_ambiguity() {
+fn run_anchors_a_round_tripped_feature_rebase_on_its_exact_mapping_instead_of_halting() {
     // Production topology: develop is round-tripped, a round-tripped
     // feature receives develop's change on dest and brings it back to source,
     // a sibling task is mirrored, and a mirror-only task is then rebased onto
@@ -2653,12 +2731,10 @@ fn mapping_distance_for_branch_does_not_abort_scheduling_when_a_mapping_is_missi
     // against an object that was never fetched.
     run_cache
         .mapping_index
-        .record_built_mapping("main", main_tip, dest_tip)
-        .unwrap();
+        .record_built_mapping("main", main_tip, dest_tip);
     run_cache
         .mapping_index
-        .record_built_mapping("other", main_tip, missing)
-        .unwrap();
+        .record_built_mapping("other", main_tip, missing);
 
     let distance = mapping_distance_for_branch(&source_repo, "main", &run_cache);
     assert!(

@@ -2381,3 +2381,117 @@ remote branch boundary.
 
 Local final gates passed: `cargo fmt --check`; `cargo test` (320/320);
 `cargo clippy --all-targets -- -D warnings`; `cargo build --release --locked`.
+
+## 2026-08-31 — second review of the exact-mapping implementation incorporated
+
+Ten findings from a second review of the decisions/0046 implementation branch,
+all confirmed by the project owner against the branch, were resolved and
+recorded as a dated Addendum 2 in
+`design/decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md`
+(Findings E–P). Four were availability regressions against 0046's own
+Addendum 1 direction: the implementation had introduced three fresh whole-run
+abort sites and left one post-push bookkeeping call fallible, in a module whose
+decision text had already settled that bounds are horizons and that a run
+never fails after dest has been mutated.
+
+The shape rule the addendum states, and which decided all four: a per-branch
+fact — a branch's own history, its own dest ref, its own rewrite — is a
+per-branch halt; reconstruction's *completeness*, which every branch's lookup
+depends on, is a whole-run fact and stays one.
+
+* **E** — force-rebuild invalidation no longer walks the whole replacement DAG
+  with a `MAX_MARKER_SCAN_COMMITS` bail (which aborted the run before the push
+  on any dest reaching 100,000 reachable commits). It queries reachability per
+  distinct destination via `graph_descendant_of`, memoized, existence-gated
+  with `find_commit` first so a missing object is stale by definition. No limit
+  reachable from a force-rebuild path can abort a run.
+* **F** — the dest branch listing became a horizon. `git::remote_branch_names`
+  returns `RemoteBranchListing { names, truncated }` instead of bailing at
+  `MAX_SOURCE_BRANCHES`, and a truncated listing taints exact lookups through
+  the new `MappingIndex::note_incomplete_reconstruction`, the same conservative
+  refusal a truncated history scan already produces. A dest with more than
+  4,096 branches now syncs already-mirrored branches normally.
+* **G** — the list/fetch race, resolved by failure class rather than by
+  convenience. On any reconstruction fetch failure the dest listing is
+  refreshed once per run; a branch absent from a *complete* refreshed listing
+  was deleted in the window and is recorded non-existent and dropped, since the
+  recovered state is complete. Every other failure (auth, network, transport,
+  or a still-advertised ref) propagates with its original context: skipping it
+  would leave the global index silently incomplete while every other branch's
+  lookup still believed it complete.
+* **H** — `record_pushed_dest_commit` and `record_built_mapping` return `()`;
+  no `?` remains after an accepted push, making Addendum 1's "always succeeds"
+  claim true rather than aspirational.
+* **I** — a branch whose distance is `None` is asked once per run, not once per
+  round, on the confirmed invariant that a branch able to gain a mapping from
+  another branch's push already has that push's prerequisite anchor in its own
+  ancestry. `Some` distances are still recomputed every round.
+* **J/K** — non-existence is cached from the same listing (suppressed when
+  truncated, where absence proves nothing); the dead `RunCache::dest_tip` cache
+  and `fetch_dest_tip_cached` are deleted, with the retained per-branch fetch
+  documented as decisions/0040 lease freshness rather than left looking like an
+  oversight.
+* **L** — `loop_prevented` collapses to one `marker::verify_self` call; its
+  `branch` parameter was dead once the equivalence was verified against
+  `verify_parsed`, and dropped from `find_control_file_policy_mismatch` too.
+* **M/O** — the test wrapper never retains another branch's index; one test
+  name now states what it proves.
+* **N** — decisions/0043 carries this repository's supersession signposting
+  (blockquote, inline clause notes, trailing section, index prefix), matching
+  decisions/0036 and 0038. Its problem statement is explicitly not superseded —
+  it is 0046's Context.
+* **P** — Addendum 1's "not a lifetime entry ceiling" is narrowed in place.
+  The constant bounds reconstruction work per run, but because every generated
+  dest commit adds one permanent authenticated mapping, a repository past the
+  horizon truncates on every subsequent run and its new branches and detected
+  rewrites halt until an operator acts. Accepted tradeoff, now stated as an
+  operational consequence rather than only as the constant's scope.
+
+Local final gates passed: `cargo fmt --check`; `cargo test --locked`
+(327/327); `cargo clippy --locked --all-targets -- -D warnings`;
+`cargo build --release --locked`.
+
+**Investigated and dropped — no decision recorded.** Finding M's test-wrapper
+work suggested that `scan_source_history`/`scan_dest_history` propagating a
+revwalk error (`oid.context(...)?`) made an ordinary `--depth=1` CI clone abort
+the whole run. Before recording that as a decision, the project owner required
+it be proven through `run()`. It was tested directly and **disproven**
+(git2 0.21.0, bundled libgit2 1.9.6):
+
+* A genuine `--depth=1` clone opened the way a real process opens it — a fresh
+  `Repository::discover` at startup — walks cleanly. A `Revwalk` built exactly
+  like `first_parent_walk` yields the shallow tip and ends without error;
+  libgit2 respects `.git/shallow` correctly. `reconstruct_mapping_index`
+  returns `Ok`, and `run()` against a shallow clone shows no `git2::Error` in
+  its chain at all — only decisions/0045's ordinary per-branch mirror-only
+  refusal.
+* The `NotFound`/`Odb` error that prompted the claim is a **stale-handle
+  artifact of the test fixture**: `fresh_clone_of_branch` reuses a
+  `Repository` handle opened *before* the external `git fetch --depth=1`
+  subprocess wrote `.git/shallow`, so libgit2's cached state predates the
+  graft. Not reachable by a real gitprism process.
+* A genuinely unreadable ancestor object (`chmod 000`) *does* abort the whole
+  run at that same call site, handle-independently — but with `class=Os`,
+  `code=Locked`, not `NotFound`. So the proposed "treat `ErrorCode::NotFound`
+  while scanning as a horizon" would not have covered the one real hazard, and
+  the case it would have covered does not occur in production.
+
+Propagating a corrupt or unreadable object store is left as-is: it is exactly
+the operator-intervention case AGENTS.md prefers, and degrading it to a
+truncation horizon would convert genuine repository corruption into a silent
+partial index.
+
+Consequence for Finding M: the test wrapper's `unwrap_or_default()` was
+accommodating a fixture artifact, not a real limitation. Done:
+`tests::fresh_clone_of_branch` now reopens the repository after the external fetch
+subprocess, before any use of the handle; all three of its callers
+(`src/commands/sync/tests/anchor.rs`) behave identically under the reopened
+handle. `tests::sync_pair_to_dest` propagates reconstruction errors with `?`,
+restoring Finding M's original intent. A new regression,
+`run_halts_a_mirror_only_branch_through_a_genuine_depth_1_clone_without_a_git2_error`
+(`src/commands/sync/tests/run_entrypoint.rs`), calls `run()` itself — not the
+wrapper — against a genuine `--depth=1` clone of a mirror-only branch whose
+boundary object is missing, and asserts `run()` reaches decisions/0045's
+per-branch halt (the aggregate "one or more branches halted" error) with no
+`git2::Error` anywhere in the returned error's chain, and that dest is left
+exactly as the previous sync produced it.

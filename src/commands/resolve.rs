@@ -314,7 +314,7 @@ fn start_source_to_dest(
     // or dest is touched, rather than pushing a clean prefix filtered only
     // by the pinned policy.
     if let Some(mismatch) =
-        find_control_file_policy_mismatch(repo, &pending, branch, state_key, ignore_raw)?
+        find_control_file_policy_mismatch(repo, &pending, state_key, ignore_raw)?
     {
         anyhow::bail!(
             "gitprism resolve: {}",
@@ -642,13 +642,9 @@ fn finish_source_to_dest(
     // `start_source_to_dest`'s own pre-pass — a `--continue` invocation
     // never runs that pre-pass itself, so finishing must not depend on it
     // having run in some earlier process.
-    if let Some(mismatch) = find_control_file_policy_mismatch(
-        repo,
-        &[operation.source_commit],
-        branch,
-        state_key,
-        ignore_raw,
-    )? {
+    if let Some(mismatch) =
+        find_control_file_policy_mismatch(repo, &[operation.source_commit], state_key, ignore_raw)?
+    {
         anyhow::bail!(
             "gitprism resolve: {}",
             policy_mismatch_message(branch, &mismatch)

@@ -172,6 +172,17 @@ impl MappingIndex {
         self.scanned_commits
     }
 
+    /// Taints every exact lookup for an incompleteness observed *outside*
+    /// this reconstruction's own history scans — decisions/0046 Addendum 2,
+    /// Finding F, currently a dest branch listing capped by
+    /// `MAX_SOURCE_BRANCHES` — the same way an over-horizon
+    /// `scan_source_history`/`scan_dest_history` scan already taints them
+    /// via `truncated_scans`: an unlisted dest branch may carry an
+    /// incomparable mapping for a source commit this run did observe.
+    pub(crate) fn note_incomplete_reconstruction(&mut self, description: String) {
+        self.truncated_scans.push(description);
+    }
+
     fn resolve_for_anchor(
         &self,
         repo: &Repository,
@@ -460,23 +471,27 @@ impl MappingIndex {
     /// `build.generated_mappings` (a brand-new branch's reused dest tip, or
     /// `branch_scoped_dest_tip`'s own possibly-aliased marker commit).
     /// Already bounded by the pending-history limits before dest was ever
-    /// mutated, so recording it here must never fail an otherwise-
-    /// successful run over index bookkeeping (decisions/0046 addendum) —
-    /// exempt from the aggregate mapping-entry bound, unlike
-    /// [`Self::add_dest_commit`]'s reconstruction-time counterpart.
+    /// mutated, so recording it here never fails an otherwise-successful run
+    /// over index bookkeeping (decisions/0046 Addendum 2, Finding H): a
+    /// commit this call just authored that cannot be re-read out of the
+    /// repository records no mapping, rather than failing the run — the
+    /// consequence is a later branch finding no anchor and halting
+    /// per-branch, never anchoring wrongly. Exempt from the aggregate
+    /// mapping-entry bound, unlike [`Self::add_dest_commit`]'s
+    /// reconstruction-time counterpart.
     pub(crate) fn record_pushed_dest_commit(
         &mut self,
         repo: &Repository,
         branch: &str,
         oid: Oid,
         key: &StateKey,
-    ) -> Result<()> {
-        if let Some((source, parsed_branch, canonical_dest)) =
-            dest_commit_mapping(repo, branch, oid, key)?
-        {
-            self.record_unbounded(source, oid, parsed_branch, oid, canonical_dest);
-        }
-        Ok(())
+    ) {
+        let Ok(Some((source, parsed_branch, canonical_dest))) =
+            dest_commit_mapping(repo, branch, oid, key)
+        else {
+            return;
+        };
+        self.record_unbounded(source, oid, parsed_branch, oid, canonical_dest);
     }
 
     /// Walks `head`'s first-parent source history, recording every
@@ -581,38 +596,53 @@ impl MappingIndex {
     /// newly built commits are recorded — a stale entry must not survive to
     /// anchor a branch scheduled later in the same run onto dest history
     /// this run itself just discarded.
+    /// decisions/0046 Addendum 2, Finding E: this used to walk
+    /// `new_dest_tip`'s entire ancestry with a `Revwalk` and `bail!` past
+    /// `MAX_MARKER_SCAN_COMMITS`, so a dest tip whose history crossed that
+    /// bound killed the whole run on every mirror-only rewrite with no
+    /// operator remedy. Git already has a safe, unbounded primitive for
+    /// "is this dest commit still reachable from the replacement tip" —
+    /// `graph_descendant_of` — so this instead asks it per distinct
+    /// `canonical_dest` among `branch`'s own records, memoized so each
+    /// distinct destination is queried at most once regardless of how many
+    /// source commits map to it. A destination absent from the local object
+    /// database is stale by definition, established with `find_commit`
+    /// before any reachability query — the same existence gate
+    /// `resolve_for_anchor` already applies — rather than by relying on
+    /// `graph_descendant_of` never being asked about a missing OID.
+    /// `new_dest_tip` itself always counts as reachable.
     pub(crate) fn plan_replaced_chain_invalidation(
         &self,
         repo: &Repository,
         branch: &str,
         new_dest_tip: Oid,
     ) -> Result<Vec<(Oid, Oid, String)>> {
-        // Walk the replacement chain once and compare all of the old
-        // branch's mappings against that set.  Besides being linear in the
-        // new chain, this deliberately treats an unfetched old destination
-        // as stale without asking git2 to inspect it (which would fail after
-        // the push if the OID is missing locally).
-        let mut reachable = HashSet::new();
-        let mut revwalk = repo
-            .revwalk()
-            .context("starting replacement destination ancestry walk")?;
-        revwalk
-            .push(new_dest_tip)
-            .context("seeding replacement destination ancestry walk")?;
-        for (scanned, oid) in revwalk.enumerate() {
-            if scanned >= crate::limits::MAX_MARKER_SCAN_COMMITS {
-                anyhow::bail!(
-                    "replacement destination ancestry exceeds the {} commit invalidation limit",
-                    crate::limits::MAX_MARKER_SCAN_COMMITS
-                );
-            }
-            reachable.insert(oid.context("walking replacement destination ancestry")?);
-        }
-
+        let mut reachable_memo: HashMap<Oid, bool> = HashMap::new();
         let mut stale = Vec::new();
         for (source, records) in &self.entries {
             for record in records {
-                if record.branch == branch && !reachable.contains(&record.canonical_dest) {
+                if record.branch != branch {
+                    continue;
+                }
+                let dest = record.canonical_dest;
+                let reachable = match reachable_memo.get(&dest) {
+                    Some(reachable) => *reachable,
+                    None => {
+                        let reachable = repo.find_commit(dest).is_ok()
+                            && (dest == new_dest_tip
+                                || repo.graph_descendant_of(new_dest_tip, dest).with_context(
+                                    || {
+                                        format!(
+                                            "comparing replaced destination {dest} against \
+                                             rebuild tip {new_dest_tip}"
+                                        )
+                                    },
+                                )?);
+                        reachable_memo.insert(dest, reachable);
+                        reachable
+                    }
+                };
+                if !reachable {
                     stale.push((*source, record.marker, record.branch.clone()));
                 }
             }
@@ -666,24 +696,13 @@ impl MappingIndex {
     /// canonical destination here.
     ///
     /// This run's own push already succeeded before this is ever called —
-    /// already bounded by the pending-history limits, so recording it must
-    /// never fail an otherwise-successful run over index bookkeeping
-    /// (decisions/0046 addendum): exempt from the aggregate mapping-entry
-    /// bound, unlike a reconstruction scan's own [`Self::record_bounded`].
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "kept fallible: mirrors add_dest_commit's call shape and \
-                  leaves room for a future genuinely-fallible check without \
-                  a call-site signature change"
-    )]
-    pub(crate) fn record_built_mapping(
-        &mut self,
-        branch: &str,
-        source: Oid,
-        dest: Oid,
-    ) -> Result<()> {
+    /// already bounded by the pending-history limits, so recording it never
+    /// fails an otherwise-successful run over index bookkeeping
+    /// (decisions/0046 Addendum 2, Finding H): exempt from the aggregate
+    /// mapping-entry bound, unlike a reconstruction scan's own
+    /// [`Self::record_bounded`].
+    pub(crate) fn record_built_mapping(&mut self, branch: &str, source: Oid, dest: Oid) {
         self.record_unbounded(source, dest, branch.to_owned(), dest, dest);
-        Ok(())
     }
 
     /// Used only by a reconstruction scan (decisions/0046 addendum): hitting
@@ -1148,7 +1167,7 @@ mod tests {
         let dest = root;
         let mut index = MappingIndex::new();
 
-        index.record_built_mapping("feature", source, dest).unwrap();
+        index.record_built_mapping("feature", source, dest);
 
         let mapping = index.resolve(&repo, source).unwrap().unwrap();
         assert_eq!(mapping.dest, dest);
@@ -1198,27 +1217,39 @@ mod tests {
         // bookkeeping for it must never fail the run afterward, even once
         // the aggregate bound reconstruction uses has already been reached.
         let mut index = MappingIndex::with_limit(1);
-        index
-            .record_built_mapping(
-                "first",
-                Oid::from_bytes(&[1; 20]).unwrap(),
-                Oid::from_bytes(&[2; 20]).unwrap(),
-            )
-            .unwrap();
+        index.record_built_mapping(
+            "first",
+            Oid::from_bytes(&[1; 20]).unwrap(),
+            Oid::from_bytes(&[2; 20]).unwrap(),
+        );
         assert_eq!(index.entry_count, 1);
 
-        index
-            .record_built_mapping(
-                "second",
-                Oid::from_bytes(&[3; 20]).unwrap(),
-                Oid::from_bytes(&[4; 20]).unwrap(),
-            )
-            .unwrap();
+        index.record_built_mapping(
+            "second",
+            Oid::from_bytes(&[3; 20]).unwrap(),
+            Oid::from_bytes(&[4; 20]).unwrap(),
+        );
         assert_eq!(
             index.entry_count, 2,
             "recording a mapping this run's own push just authored must succeed \
              past the aggregate limit, never error"
         );
+    }
+
+    #[test]
+    fn record_pushed_dest_commit_records_nothing_for_an_oid_absent_from_the_object_database() {
+        // decisions/0046 Addendum 2, Finding H: `record_pushed_dest_commit`
+        // is called after the corresponding push already landed, so it must
+        // never fail the run — a commit it cannot re-read simply records no
+        // mapping. The consequence is a later branch finding no anchor and
+        // halting per-branch, never anchoring wrongly.
+        let (_dir, repo, _root) = empty_repo();
+        let missing = Oid::from_bytes(&[9; 20]).unwrap();
+        let mut index = MappingIndex::new();
+
+        index.record_pushed_dest_commit(&repo, "feature", missing, &marker::load_key().unwrap());
+
+        assert_eq!(index.entry_count, 0);
     }
 
     #[test]
@@ -1432,9 +1463,7 @@ mod tests {
         // fallible ancestry query (and therefore remain safe after the
         // corresponding force-with-lease push).
         let missing_dest = Oid::from_bytes(&[7; 20]).unwrap();
-        index
-            .record_built_mapping("feature", root, missing_dest)
-            .unwrap();
+        index.record_built_mapping("feature", root, missing_dest);
         index
             .invalidate_replaced_chain(&repo, "feature", d3)
             .unwrap();
@@ -1459,6 +1488,75 @@ mod tests {
                 .iter()
                 .all(|record| record.branch == "sibling"),
             "no remaining provenance for S2 may still claim the invalidated feature branch"
+        );
+    }
+
+    #[test]
+    fn plan_replaced_chain_invalidation_handles_a_replacement_chain_and_orphan_count_far_beyond_a_trivial_handful_without_erroring()
+     {
+        // decisions/0046 Addendum 2, Finding E: the old implementation
+        // walked the entire replacement chain with a `Revwalk` and
+        // `bail!`ed past `MAX_MARKER_SCAN_COMMITS`. The new implementation
+        // queries `graph_descendant_of` once per distinct destination
+        // instead, so its cost is independent of the replacement chain's
+        // depth. A real `MAX_MARKER_SCAN_COMMITS`-deep repository is
+        // impractical to build in a unit test; this proves the same
+        // property structurally, at a chain length and orphaned-mapping
+        // count clearly beyond this file's other tests (a handful of
+        // commits) — nothing in `plan_replaced_chain_invalidation` any
+        // longer references that limit.
+        let (_dir, repo, root) = empty_repo();
+
+        let chain_len = 300usize;
+        let mut tip = root;
+        for step in 0..chain_len {
+            let tree = tree_with_file(&repo, Some(tip), &format!("d{step}.txt"), b"d");
+            tip = commit(
+                &repo,
+                "refs/heads/feature",
+                &[tip],
+                tree,
+                &format!("d{step}"),
+            );
+        }
+        let new_dest_tip = tip;
+
+        let mut index = MappingIndex::new();
+        let orphan_count = 100usize;
+        for n in 0..orphan_count {
+            let mut dest_bytes = [0u8; 20];
+            dest_bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            let mut source_bytes = [0u8; 20];
+            source_bytes[8..16].copy_from_slice(&(n as u64).to_be_bytes());
+            index.record_built_mapping(
+                "feature",
+                Oid::from_bytes(&source_bytes).unwrap(),
+                Oid::from_bytes(&dest_bytes).unwrap(),
+            );
+        }
+        // A mapping still reachable from the rebuild tip (root is an
+        // ancestor of every commit in the chain built above) must survive
+        // invalidation, and a mapping provenanced to another branch must
+        // never be considered at all.
+        let survivor_source = Oid::from_bytes(&[42; 20]).unwrap();
+        index.record_built_mapping("feature", survivor_source, root);
+        let other_branch_source = Oid::from_bytes(&[43; 20]).unwrap();
+        index.record_built_mapping("sibling", other_branch_source, root);
+
+        let stale = index
+            .plan_replaced_chain_invalidation(&repo, "feature", new_dest_tip)
+            .unwrap();
+
+        assert_eq!(stale.len(), orphan_count);
+        assert!(
+            !stale
+                .iter()
+                .any(|(source, _, _)| *source == survivor_source)
+        );
+        assert!(
+            !stale
+                .iter()
+                .any(|(source, _, _)| *source == other_branch_source)
         );
     }
 
@@ -1559,10 +1657,8 @@ mod tests {
 
         let missing_dest = Oid::from_bytes(&[9; 20]).unwrap();
         let mut index = MappingIndex::new();
-        index
-            .record_built_mapping("feature", newer, missing_dest)
-            .unwrap();
-        index.record_built_mapping("feature", older, root).unwrap();
+        index.record_built_mapping("feature", newer, missing_dest);
+        index.record_built_mapping("feature", older, root);
 
         let nearest = match index
             .nearest_first_parent_mapping(&repo, newer, None)
@@ -1590,12 +1686,8 @@ mod tests {
         let missing_dest = Oid::from_bytes(&[9; 20]).unwrap();
 
         let mut index = MappingIndex::new();
-        index
-            .record_built_mapping("left", root, present_dest)
-            .unwrap();
-        index
-            .record_built_mapping("right", root, missing_dest)
-            .unwrap();
+        index.record_built_mapping("left", root, present_dest);
+        index.record_built_mapping("right", root, missing_dest);
 
         let lookup = index
             .nearest_first_parent_mapping(&repo, root, None)
@@ -1700,7 +1792,7 @@ mod tests {
         // only to itself, must still resolve during its own rewrite.)
         let (_dir, repo, root) = empty_repo();
         let mut index = MappingIndex::new();
-        index.record_built_mapping("feature", root, root).unwrap();
+        index.record_built_mapping("feature", root, root);
 
         let resolved = match index
             .resolve_for_anchor(&repo, root, Some("feature"))
@@ -1935,8 +2027,8 @@ mod tests {
         let source = commit(&repo, "refs/heads/source", &[root], source_tree, "source");
 
         let mut index = MappingIndex::new();
-        index.record_built_mapping("left", source, left).unwrap();
-        index.record_built_mapping("right", source, right).unwrap();
+        index.record_built_mapping("left", source, left);
+        index.record_built_mapping("right", source, right);
         index
             .truncated_scans
             .push("dest branch \"right\" history scan stopped".to_owned());
@@ -1947,6 +2039,37 @@ mod tests {
         assert!(
             matches!(lookup, MappingLookup::Contradictory(_)),
             "an incomplete index must not select a visible mapping, got {lookup:?}"
+        );
+    }
+
+    #[test]
+    fn an_index_noted_incomplete_from_outside_the_history_scans_refuses_an_exact_lookup_that_would_otherwise_resolve()
+     {
+        // decisions/0046 Addendum 2, Finding F: a truncated dest branch
+        // listing is an incompleteness observed outside
+        // `scan_source_history`/`scan_dest_history` themselves, but it must
+        // taint exact lookups exactly the same way a truncated internal
+        // scan already does — an unlisted dest branch could carry an
+        // incomparable mapping for a source commit this run did observe.
+        let (_dir, repo, root) = empty_repo();
+        let dest_tree = tree_with_file(&repo, Some(root), "dest.txt", b"dest");
+        let dest = commit(&repo, "refs/heads/dest", &[root], dest_tree, "dest");
+
+        let mut index = MappingIndex::new();
+        index.record_built_mapping("feature", root, dest);
+        assert!(index.resolve(&repo, root).unwrap().is_some());
+
+        index.note_incomplete_reconstruction(
+            "dest branch listing truncated at the 4096 branch limit".to_owned(),
+        );
+
+        let lookup = index
+            .nearest_first_parent_mapping(&repo, root, None)
+            .unwrap();
+        assert!(
+            matches!(lookup, MappingLookup::Contradictory(_)),
+            "an index noted incomplete outside its own scans must refuse an otherwise-resolvable \
+             lookup, got {lookup:?}"
         );
     }
 
