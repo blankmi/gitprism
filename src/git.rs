@@ -571,6 +571,65 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
     }
 }
 
+/// Every branch name currently on `url` — a real `git ls-remote --heads`
+/// subprocess, parsed for `refs/heads/<name>` lines. decisions/0046, F-A:
+/// mapping-index reconstruction must see a mirror-only branch's own dest
+/// ref even after its local source branch is deleted (decisions/0018 Case
+/// 2's routine post-merge cleanup) — `source`'s own branch listing cannot
+/// name a branch source no longer has, so dest itself is asked directly.
+/// Bounded the same way `commands::sync::list_source_branches` bounds its
+/// own local listing, and a name that doesn't pass
+/// [`validate_branch_name`] is skipped rather than failing the whole
+/// listing — decisions/0024's precedent for a discovered oddity gitprism
+/// can't act on.
+pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<Vec<String>> {
+    validate_remote(url)?;
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("ls-remote")
+        .arg("--heads")
+        .arg("--")
+        .arg(url)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // A SHA-1 ref advertisement is at least dozens of bytes per branch, so
+    // SMALL_OUTPUT would reject the valid 4,096-branch boundary before the
+    // explicit branch-count guard below gets a chance to run.  PARSE_OUTPUT
+    // is still a fixed cap (not an unbounded capture) and comfortably covers
+    // the Git refname limit multiplied by MAX_SOURCE_BRANCHES.
+    let output = run_git_output(command, PARSE_OUTPUT)
+        .context("running git ls-remote --heads against configured remote")?;
+    if !output.status.success() {
+        let diagnostic = git_diagnostic(&output.stderr, Some(url));
+        anyhow::bail!(
+            "git ls-remote --heads against configured remote failed ({}): {diagnostic}",
+            output.status
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        let Some(refname) = line.split_ascii_whitespace().nth(1) else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if validate_branch_name(name).is_err() {
+            continue;
+        }
+        if names.len() >= crate::limits::MAX_SOURCE_BRANCHES {
+            anyhow::bail!(
+                "dest branch listing exceeds the {} branch limit",
+                crate::limits::MAX_SOURCE_BRANCHES
+            );
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
 /// What happened to a [`push`] attempt: either it landed, or it was
 /// rejected because the remote ref had moved since gitprism last looked at
 /// it — a plain non-fast-forward rejection (decisions/0009) or a stale
@@ -2469,5 +2528,32 @@ mod tests {
     #[test]
     fn ensure_merge_tree_supported_accepts_the_git_on_this_machine() {
         ensure_merge_tree_supported().expect("the git on this dev/CI machine must be new enough");
+    }
+
+    #[test]
+    fn remote_branch_names_accepts_the_declared_branch_limit() {
+        let dir = tempdir().unwrap();
+        let source = Repository::init(dir.path().join("source")).unwrap();
+        let dest = Repository::init_bare(dir.path().join("dest")).unwrap();
+        let tree = dest
+            .find_tree(dest.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let oid = dest
+            .commit(None, &signature, &signature, "root", &tree, &[])
+            .unwrap();
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES {
+            dest.reference(&format!("refs/heads/b{index:04}"), oid, true, "test")
+                .unwrap();
+        }
+
+        let names = remote_branch_names(
+            source
+                .workdir()
+                .expect("non-bare source repository has a worktree"),
+            dest.path().to_str().unwrap(),
+        )
+        .expect("the valid branch boundary must not hit the small output cap");
+        assert_eq!(names.len(), crate::limits::MAX_SOURCE_BRANCHES);
     }
 }

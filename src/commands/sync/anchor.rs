@@ -167,9 +167,9 @@ pub(crate) fn dest_resume_point_for_branch(
         return Ok(Some(boundary));
     }
 
-    // The trailer might name a commit this clone doesn't even have — a
-    // another clone's own source commit is never transmitted to dest, only
-    // the filtered commit it produced is, so an unrelated or behind clone has
+    // The trailer might name a commit this clone doesn't even have — another
+    // clone's own source commit is never transmitted to dest, only the
+    // filtered commit it produced is, so an unrelated or behind clone has
     // no way to have fetched it. That's just as unsafe to build on as a
     // confirmed non-ancestor, so it's checked (and rejected) before asking
     // libgit2 to compare ancestry, whose own error surface for a missing
@@ -287,11 +287,18 @@ pub(super) enum DestAnchor {
 
 /// Per-run cache for destination refs and fetched tips, plus the authenticated
 /// source-to-destination mapping index reconstructed from both repositories.
+///
+/// `mapping_index` is populated exactly once, by [`run`](super::run) right
+/// after dest→source has run and before source→dest scheduling starts
+/// (decisions/0046) — never lazily, and never left unset for a call site to
+/// discover. A default-constructed cache carries an empty index, which is
+/// only ever the right starting point for that one init site or for a test
+/// that builds its own via [`reconstruct_mapping_index`].
 #[derive(Default)]
 pub(super) struct RunCache {
     pub(super) dest_ref_exists: HashMap<String, bool>,
     pub(super) dest_tip: HashMap<String, Oid>,
-    pub(super) mapping_index: Option<MappingIndex>,
+    pub(super) mapping_index: MappingIndex,
 }
 
 pub(super) fn dest_ref_exists_cached(
@@ -355,8 +362,25 @@ pub(super) fn reconstruct_mapping_index(
             Ok((branch.clone(), tip))
         })
         .collect::<Result<Vec<_>>>()?;
+    // decisions/0046, F-A: a mirror-only branch's dest ref must still
+    // contribute its own SourceToDest mappings once its local source branch
+    // is deleted (decisions/0018 Case 2's routine post-merge cleanup) —
+    // `source_branches` can no longer name it, so dest's actual branches are
+    // asked for directly rather than inferred from what source still has.
+    let mut dest_branch_names = source_branches.to_vec();
+    // Existence for every listed name is already known from this one
+    // subprocess — recorded into the same cache `dest_ref_exists_cached`
+    // reads below so it never re-queries per branch (decisions/0043's own
+    // quadratic-cost lesson).
+    for name in git::remote_branch_names(source_root, dest_url)? {
+        run_cache.dest_ref_exists.insert(name.clone(), true);
+        if !dest_branch_names.contains(&name) {
+            dest_branch_names.push(name);
+        }
+    }
+
     let mut dest_heads = Vec::new();
-    for branch in source_branches {
+    for branch in &dest_branch_names {
         if dest_ref_exists_cached(source_root, dest_url, branch, run_cache)? {
             let tip = fetch_dest_tip_cached(repo, source_root, dest_url, branch, run_cache)?;
             dest_heads.push((branch.clone(), tip));
@@ -365,32 +389,25 @@ pub(super) fn reconstruct_mapping_index(
     MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)
 }
 
+/// `branch` is excluded from canonicalization (decisions/0046, F-C):
+/// `branch`'s own rewrite is what's being anchored here, so a mapping whose
+/// only provenance is `branch` itself is that branch's own now-discarded
+/// chain, never a valid anchor for its own rebuild — matching main's old
+/// `if candidate == branch { continue; }` sibling-search exclusion, applied
+/// at both of this function's own call sites (a brand-new branch's first
+/// mirror, and a detected mirror-only rewrite's rebuild).
 pub(super) fn dest_anchor_for_branch(
     repo: &Repository,
-    source_root: &Path,
-    dest_url: &str,
     source_tip: Oid,
-    key: &marker::StateKey,
-    run_cache: &mut RunCache,
+    branch: &str,
+    run_cache: &RunCache,
 ) -> Result<DestAnchor> {
-    if run_cache.mapping_index.is_none() {
-        let (source_branches, _skipped) = super::list_source_branches(repo)?;
-        let index = reconstruct_mapping_index(
-            repo,
-            source_root,
-            dest_url,
-            &source_branches,
-            key,
-            run_cache,
-        )?;
-        run_cache.mapping_index = Some(index);
-    }
-    let index = run_cache
-        .mapping_index
-        .as_ref()
-        .expect("mapping index initialized above");
     Ok(
-        match index.nearest_first_parent_mapping(repo, source_tip)? {
+        match run_cache.mapping_index.nearest_first_parent_mapping(
+            repo,
+            source_tip,
+            Some(branch),
+        )? {
             MappingLookup::Resolved(mapping) => DestAnchor::Resolved(mapping.source, mapping.dest),
             MappingLookup::None => DestAnchor::None,
             MappingLookup::Contradictory(diagnostic) => DestAnchor::Contradictory(diagnostic),
@@ -410,12 +427,9 @@ pub(super) fn mapping_distance_for_branch(
         .peel_to_commit()
         .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
         .id();
-    let index = run_cache
+    let Some((distance, lookup)) = run_cache
         .mapping_index
-        .as_ref()
-        .context("mapping index was not reconstructed before branch scheduling")?;
-    let Some((distance, lookup)) =
-        index.nearest_first_parent_mapping_with_distance(repo, source_tip)?
+        .nearest_first_parent_mapping_with_distance(repo, source_tip, None)?
     else {
         return Ok(None);
     };

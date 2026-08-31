@@ -2341,3 +2341,43 @@ Local final gates passed: `cargo fmt --all -- --check`; `cargo test
 --workspace --all-features --locked` (288/288); `cargo clippy --workspace
 --all-targets --all-features --locked -- -D warnings`; and `cargo build
 --release --locked`. GitHub pipeline status is not recorded here.
+
+## 2026-08-31 — review of the 0046 implementation branch; bounded-completeness tradeoff remains
+
+**Update**: A code review of `codex/exact-mapping-anchors` confirmed seven
+correctness/availability findings and three cleanups against the 0046
+implementation. The concrete correctness and cleanup fixes are implemented on
+the branch, each behavior change failing-test-first; the scan-horizon finding
+exposes an architectural tradeoff that still needs an owner decision, recorded
+below. Correctness: a mirror-only force rebuild now invalidates
+the replaced dest chain's index entries (no same-run resurrection of an
+orphaned projection); index scans self-verify markers against the marker's own
+recorded branch and scan dest refs that actually exist, so a deleted branch's
+mappings still contribute (closing a silent content-loss path 0046's text
+already promised); mapped dest OIDs are existence-checked before use (a
+missing canonical object causes a per-branch halt rather than walking past a
+potentially content-bearing DestToSource marker, never a run abort or crash);
+and a branch's own-only stale projection no longer competes against a genuine
+alternative during its rewrite rebuild. Availability/scale: reconstruction
+dedups shared first-parent history via a run-wide visited set, treats
+`MAX_MARKER_SCAN_COMMITS` as a per-scan truncation horizon and conservatively
+refuses mapping lookups against any incomplete index (which may repeat while
+history remains beyond the horizon), records
+post-push mappings infallibly (a run can no longer fail after dest was
+mutated), and schedules by computing each remaining branch's distance once per
+round. Marker scans size-gate before parsing and parse once (`verify_self`).
+The mislabeled loop-prevention test was renamed to state what it proves and a
+genuine cross-branch loop-prevention regression test was added. Behavior
+adjustments to scan bounds are recorded as a dated addendum in decision 0046.
+
+The follow-up review also made truncation conservative for exact lookups (a
+visible mapping cannot hide a contradictory mapping beyond an incomplete
+horizon), replaced force-rebuild invalidation's per-mapping ancestry queries
+with one bounded ancestry walk planned before push and applied infallibly
+after acceptance, and raised `ls-remote --heads` to the fixed parse-output
+limit so the declared 4,096-branch boundary is reachable. Added regressions
+covering missing-object invalidation, the content-loss rewrite path, and the
+remote branch boundary.
+
+Local final gates passed: `cargo fmt --check`; `cargo test` (320/320);
+`cargo clippy --all-targets -- -D warnings`; `cargo build --release --locked`.

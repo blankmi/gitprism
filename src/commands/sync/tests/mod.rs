@@ -31,6 +31,7 @@ mod limit_tests;
 mod local_advance;
 mod policy_check;
 mod run_entrypoint;
+mod scheduling;
 mod source_to_dest;
 
 fn add_commit(repo: &Repository, branch: &str, files: &[(&str, &str)]) -> Oid {
@@ -428,6 +429,33 @@ fn sync_pair_to_dest(
     // every branch, never a per-branch read).
     let ignore_raw =
         std::fs::read_to_string(source_root.join(exclude::FILENAME)).unwrap_or_default();
+    // decisions/0046: `run` builds the mapping index exactly once, from the
+    // current repo/dest state, before any branch is processed — the one
+    // init site F-B moved the old lazy-rebuild-on-`None` into. This test-only
+    // wrapper calls a single branch at a time rather than scheduling a whole
+    // run, so it stands in for that init site itself, rebuilding fresh from
+    // the current state on every call. A test that needs the "built once,
+    // carried across several branches in one run" invariant under test calls
+    // `run` directly instead (see `tests::anchor`'s scheduling tests).
+    //
+    // A reconstruction failure (e.g. a deliberately shallow/incomplete test
+    // clone whose own source history can't be walked past its fetch
+    // boundary) is swallowed here rather than propagated: this branch's own
+    // sync may never actually consult the index at all — the same as before
+    // this wrapper started seeding it explicitly — and a real `run` still
+    // propagates its own single reconstruction's errors untouched.
+    let dest_url = config.dest_url()?;
+    let (source_branches, _skipped) = list_source_branches(repo)?;
+    if let Ok(mapping_index) = reconstruct_mapping_index(
+        repo,
+        source_root,
+        &dest_url,
+        &source_branches,
+        &key,
+        run_cache,
+    ) {
+        run_cache.mapping_index = mapping_index;
+    }
     sync_pair_to_dest_with_key(
         repo,
         source_root,

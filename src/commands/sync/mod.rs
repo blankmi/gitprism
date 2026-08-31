@@ -118,6 +118,50 @@ fn divergence_after_exhausted_retries_message(branch: &str, ff_target: &str) -> 
     )
 }
 
+/// One round of decisions/0046's distance-based scheduling: computes each
+/// remaining branch's mapping distance exactly once (never once per
+/// pairwise comparison, as the previous ~2·B² revwalks per run did — see
+/// decisions/0046 addendum) and selects the minimum by `(has-no-mapping,
+/// distance, name)`. A branch whose distance computation itself fails
+/// (e.g. Finding A's own-scan-horizon refusal, or any other unexpected git
+/// error) is never selected and never aborts the round for every other
+/// branch — it's returned instead, for the caller to report as its own
+/// per-branch halt (decisions/0045's shape) before trying the next round
+/// with it removed. Recomputing every round (rather than caching across
+/// rounds) is deliberate: a push earlier in this same run can add a
+/// mapping a later branch's distance depends on (decisions/0046).
+///
+/// Returns `(halted, None)` when at least one branch's distance errored
+/// this round — nothing is selected from a round that saw an error, so the
+/// caller retries with the halted branches removed. Otherwise returns
+/// `(empty, Some(branch))`, or `(empty, None)` only when `remaining` itself
+/// is empty.
+fn select_next_branch_by_mapping_distance(
+    remaining: &[String],
+    mut distance_for: impl FnMut(&str) -> Result<Option<usize>>,
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut keys: Vec<(bool, usize, String)> = Vec::with_capacity(remaining.len());
+    let mut halted = Vec::new();
+    for branch in remaining {
+        match distance_for(branch) {
+            Ok(distance) => keys.push((
+                distance.is_none(),
+                distance.unwrap_or(usize::MAX),
+                branch.clone(),
+            )),
+            Err(error) => halted.push((
+                branch.clone(),
+                format!("{branch:?} halted — could not determine its mapping distance: {error:#}"),
+            )),
+        }
+    }
+    if !halted.is_empty() {
+        return (halted, None);
+    }
+    let selected = keys.into_iter().min().map(|(_, _, branch)| branch);
+    (halted, selected)
+}
+
 pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // Repository discovery first, so a wrong cwd reports that, not a
     // missing/malformed state key (F-14) — the pair secret is still
@@ -234,7 +278,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         &state_key,
         &mut run_cache,
     )?;
-    run_cache.mapping_index = Some(mapping_index);
+    run_cache.mapping_index = mapping_index;
 
     // One cache for this whole `run()` invocation — destination ref
     // existence, fetched destination tips, and the authenticated mapping
@@ -243,27 +287,38 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // its child later in this run (decisions/0046).
     let mut remaining_branches = source_branches.clone();
     while !remaining_branches.is_empty() {
-        let mut selected_index = 0;
-        for candidate_index in 1..remaining_branches.len() {
-            let candidate = &remaining_branches[candidate_index];
-            let selected = &remaining_branches[selected_index];
-            let candidate_distance = mapping_distance_for_branch(&repo, candidate, &run_cache)?;
-            let selected_distance = mapping_distance_for_branch(&repo, selected, &run_cache)?;
-            let candidate_key = (
-                candidate_distance.is_none(),
-                candidate_distance.unwrap_or(usize::MAX),
-                candidate.as_str(),
-            );
-            let selected_key = (
-                selected_distance.is_none(),
-                selected_distance.unwrap_or(usize::MAX),
-                selected.as_str(),
-            );
-            if candidate_key < selected_key {
-                selected_index = candidate_index;
+        let (halted_by_distance_error, selected) =
+            select_next_branch_by_mapping_distance(&remaining_branches, |branch| {
+                mapping_distance_for_branch(&repo, branch, &run_cache)
+            });
+        if !halted_by_distance_error.is_empty() {
+            // decisions/0045's per-branch halt shape, applied to a distance
+            // computation failure too (e.g. Finding A's own-scan-horizon
+            // refusal): one branch's problem must not starve every other
+            // branch's turn this run.
+            for (branch, message) in &halted_by_distance_error {
+                let round_tripped = config.branches.iter().any(|b| b == branch);
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::SourceToDest,
+                    round_tripped,
+                    Some(message),
+                );
             }
+            any_branch_halted = true;
+            remaining_branches.retain(|branch| {
+                !halted_by_distance_error
+                    .iter()
+                    .any(|(halted, _)| halted == branch)
+            });
+            continue;
         }
-        let branch = remaining_branches.remove(selected_index);
+        let branch = selected.expect(
+            "select_next_branch_by_mapping_distance returns a branch whenever nothing halted \
+             and the candidate list is non-empty",
+        );
+        remaining_branches.retain(|candidate| candidate != &branch);
         let halted = sync_pair_to_dest_with_key(
             &repo,
             &source_root,
@@ -506,12 +561,7 @@ fn sync_pair_to_dest_with_key(
                     // does source's ancestry say the boundary is," which is
                     // exactly the condition that arm was already built for.
                     let (boundary, rebuild_dest_tip) = match dest_anchor_for_branch(
-                        repo,
-                        source_root,
-                        &dest_url,
-                        source_tip,
-                        state_key,
-                        run_cache,
+                        repo, source_tip, branch, run_cache,
                     )? {
                         DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
                         DestAnchor::Contradictory(diagnostic) => {
@@ -574,12 +624,7 @@ fn sync_pair_to_dest_with_key(
             // decisions/0017 merely discovered, so one such branch warns and
             // the run moves on rather than stopping every other branch too.
             let (boundary, dest_tip) = match dest_anchor_for_branch(
-                repo,
-                source_root,
-                &dest_url,
-                source_tip,
-                state_key,
-                run_cache,
+                repo, source_tip, branch, run_cache,
             )? {
                 DestAnchor::Resolved(boundary, dest_tip) => (boundary, dest_tip),
                 DestAnchor::Contradictory(diagnostic) => {
@@ -731,6 +776,20 @@ fn sync_pair_to_dest_with_key(
         };
 
         if let Some(new_dest_tip) = new_dest_tip {
+            // All fallible ancestry work needed to discard the replaced
+            // branch's stale mappings happens before the remote mutation.
+            // Applying the resulting plan after an accepted push is
+            // deliberately infallible, so cache maintenance can never turn
+            // a successful force-with-lease into a failed sync.
+            let invalidation_plan = if force_rebuild {
+                Some(run_cache.mapping_index.plan_replaced_chain_invalidation(
+                    repo,
+                    branch,
+                    new_dest_tip,
+                )?)
+            } else {
+                None
+            };
             match git::push(source_root, &dest_url, new_dest_tip, branch, push_mode)? {
                 git::PushOutcome::Accepted => {
                     // The destination ref and exact authenticated mapping
@@ -738,16 +797,55 @@ fn sync_pair_to_dest_with_key(
                     // run, with no re-query or re-fetch.
                     run_cache.dest_ref_exists.insert(branch.to_string(), true);
                     run_cache.dest_tip.insert(branch.to_string(), new_dest_tip);
-                    if let Some(mapping_index) = run_cache.mapping_index.as_mut() {
-                        for generated_dest_oid in &build.generated_dest_oids {
-                            mapping_index.add_dest_commit(
-                                repo,
-                                branch,
-                                *generated_dest_oid,
-                                state_key,
-                            )?;
-                        }
-                        mapping_index.add_dest_commit(repo, branch, new_dest_tip, state_key)?;
+                    // decisions/0046, F-A: a `ForceMirrorOnly` push just
+                    // replaced `branch`'s own dest chain wholesale — any
+                    // mapping this run recorded from that replaced chain
+                    // whose dest commit didn't survive into `new_dest_tip`'s
+                    // own ancestry is now a mapping to an orphan. Left alone,
+                    // a branch scheduled later in this same run could anchor
+                    // on it and push straight back onto history this run
+                    // itself just discarded. A mapping for the same source
+                    // commit recorded via some other branch's own markers is
+                    // untouched — this only clears `branch`'s own stale
+                    // entries. Done before recording this push's own new
+                    // mappings below, though the order doesn't matter: they
+                    // are, by construction, already reachable from
+                    // `new_dest_tip`.
+                    if force_rebuild {
+                        run_cache.mapping_index.apply_replaced_chain_invalidation(
+                            invalidation_plan
+                                .as_deref()
+                                .expect("force rebuild always planned invalidation"),
+                        );
+                    }
+                    // F-C: `build_dest_commit` already returned the exact
+                    // (source, dest) pair for each of these — recorded
+                    // straight into the index, with no re-read or
+                    // re-HMAC-verify of a commit this very call just
+                    // authored.
+                    for &(source_oid, generated_dest_oid) in &build.generated_mappings {
+                        run_cache.mapping_index.record_built_mapping(
+                            branch,
+                            source_oid,
+                            generated_dest_oid,
+                        )?;
+                    }
+                    // When `build.new_tip` is `Some`, `new_dest_tip` is
+                    // exactly the last mapping just recorded above — adding
+                    // it again would only be rediscovered and discarded by
+                    // `record`'s own dedup. The remaining cases (a brand-new
+                    // branch or a rebuild reusing `dest_tip` unchanged, or
+                    // `branch_scoped_dest_tip`'s own possibly-aliased marker
+                    // commit) didn't come from this call's build loop at
+                    // all, so they still go through the verifying,
+                    // alias-canonicalizing path.
+                    if build.new_tip.is_none() {
+                        run_cache.mapping_index.record_pushed_dest_commit(
+                            repo,
+                            branch,
+                            new_dest_tip,
+                            state_key,
+                        )?;
                     }
                 }
                 git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
@@ -875,7 +973,11 @@ struct Conflict {
 /// (decisions/0007's "Consequences": later commits may depend on it).
 struct PendingDestBuild {
     new_tip: Option<Oid>,
-    generated_dest_oids: Vec<Oid>,
+    /// `(source oid, dest oid)` for every commit actually built this call —
+    /// `build_dest_commit`'s own trusted output, recorded into the mapping
+    /// index directly on push acceptance rather than re-read and
+    /// re-verified from the repo (decisions/0046, F-C).
+    generated_mappings: Vec<(Oid, Oid)>,
     conflict: Option<Conflict>,
 }
 
@@ -957,7 +1059,7 @@ fn build_pending_dest_tip(
 
     let mut parent = dest_tip;
     let mut built_any = false;
-    let mut generated_dest_oids = Vec::new();
+    let mut generated_mappings = Vec::new();
     for source_oid in pending {
         let source_commit = repo
             .find_commit(source_oid)
@@ -993,7 +1095,7 @@ fn build_pending_dest_tip(
             git::MergeTreeOutcome::Conflict { paths } => {
                 return Ok(PendingDestBuild {
                     new_tip: built_any.then_some(parent),
-                    generated_dest_oids,
+                    generated_mappings,
                     conflict: Some(Conflict {
                         commit: source_oid,
                         paths,
@@ -1011,7 +1113,7 @@ fn build_pending_dest_tip(
 
                 parent =
                     build_dest_commit(repo, config, parent, &source_commit, merged, branch, key)?;
-                generated_dest_oids.push(parent);
+                generated_mappings.push((source_oid, parent));
                 built_any = true;
             }
         }
@@ -1019,7 +1121,7 @@ fn build_pending_dest_tip(
 
     Ok(PendingDestBuild {
         new_tip: built_any.then_some(parent),
-        generated_dest_oids,
+        generated_mappings,
         conflict: None,
     })
 }

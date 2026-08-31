@@ -98,8 +98,10 @@ mapping index from the fetched source and dest histories:
   contributes `S -> D` with the marker's recorded branch as provenance;
 * a verified `Setup` or `DestToSource` marker on source commit `S`, naming dest
   commit `D`, contributes `S -> D` with its recorded branch as provenance; and
-* unverified, malformed, wrong-branch, or otherwise invalid markers contribute
-  nothing, exactly as in every current resume and loop-prevention scan.
+* unverified, malformed, or otherwise invalid markers contribute nothing.
+  Marker HMAC verification authenticates the branch recorded inside the
+  marker, so a valid marker inherited while scanning another branch is still
+  accepted; the scanning head's name is not a second branch-scope check.
 
 The index is a cache, not state. It may be discarded when the process exits and
 must be reconstructible by a fresh CI clone from Git alone. Each source-to-dest
@@ -295,3 +297,170 @@ commit still makes the new ref self-accounting on the next run.
 7. **Verify the complete change.** Run formatting, the full locked test suite,
    Clippy with warnings denied, and the locked release build. Record exact test
    counts and results in `design/log.md` when implementation lands.
+
+# Addendum (2026-08-31): reconstruction is deduplicated and horizon-bounded, not full-history-and-fail
+
+A repository review found that `MappingIndex::reconstruct`'s own scans
+(`scan_source_history`/`scan_dest_history`) walked every scanned head's
+*complete* first-parent history with no early exit, and that both
+`MAX_MARKER_SCAN_COMMITS` and `MAX_MAPPING_ENTRIES` were hard `anyhow::bail!`
+limits inside `reconstruct_mapping_index`, called unconditionally from `run()`
+with `?`. A repository whose scanned history genuinely crossed either bound —
+100,000 first-parent commits on some branch, or 100,000 lifetime mapping
+entries, both realistic for a long-lived deployment since every
+gitprism-generated dest commit is one permanent, never-pruned entry — failed
+*every* future run before anything synced, with no operator remedy short of
+history surgery. That contradicts this decision's own "never normally hit
+fail-safe" framing of these limits (decisions/0032) and the project's rule
+that a limit with no operator remedy is a design bug, not safety. Separately,
+every scanned commit was parsed twice (once by a caller's own `marker::parse`
+pre-check, once again inside `marker::verify`), with the pre-parse running
+before `verify`'s own size gate could apply to it.
+
+## Decision
+
+**Parse once, gated once (Finding D).** `marker::verify_self` is a new
+sibling of `marker::verify` for exactly the self-verification shape
+`add_source_commit`/`add_dest_commit`/`record_pushed_dest_commit` already
+used (verifying a marker against its own recorded branch, never against the
+scanning head's name): both now share one internal `verify_parsed`
+implementation that size-gates and parses the message exactly once and
+returns the full `ParsedMarker` on success, instead of a caller pre-parsing
+the message and `verify` parsing it again internally. `verify`'s own
+behavior and signature are unchanged.
+
+**Shared visited set removes the multiplied work (Finding A, part 1).**
+`MappingIndex::reconstruct` now threads one `HashSet<Oid>` through every
+`scan_source_history` call and a separate one through every
+`scan_dest_history` call (kept per-side, not combined, because a source
+commit and a dest commit can legitimately share an OID at the `setup` graft
+while requiring different marker directions to be checked). A commit already
+visited by an earlier head's walk this reconstruction is not re-loaded or
+re-parsed; that walk simply stops there, since first-parent history is
+deterministic and everything from that shared commit onward was already
+either recorded or already marked truncated by whichever walk reached it
+first. Total reconstruction work is now O(unique first-parent commits
+scanned), not O(heads × history) — this is what makes this decision's
+original "each verified mapping is indexed once and reused by every branch"
+consequence actually hold under repeated/overlapping branch histories, not
+just under a single linear one.
+
+**Both bounds are now a horizon, not a run-ending failure (Finding A part 2,
+Finding B).** `MAX_MARKER_SCAN_COMMITS` and `MAX_MAPPING_ENTRIES` are both
+still enforced, but hitting either during one head's reconstruction scan now
+keeps every mapping already found, appends a human-readable note to the
+index's own `truncated_scans`, and stops that one walk — never an
+`anyhow::bail!`. `record_bounded` (used only by reconstruction) returns
+whether it actually recorded, rather than erroring, so the calling scan can
+treat "no more room" exactly like "no more scan budget." A mapping this run's
+own push already produced — `record_built_mapping` and the new
+`record_pushed_dest_commit` (replacing `add_dest_commit` at the
+accepted-push call site in `run()`) — go through a separate, always-succeeds
+`record_unbounded` instead: that mapping is already bounded by the
+pending-history limits before dest was ever mutated, so recording it in the
+index must never fail an otherwise-successful run. `MAX_MAPPING_ENTRIES` now
+means "how much of reconstruction's own scan work to do," the same kind of
+bound `MAX_MARKER_SCAN_COMMITS` already was, not a lifetime ceiling on
+authenticated history. The entries retained before this horizon are not
+necessarily the newest or oldest globally: scan order is determined by the
+source/dest head order and shared-history traversal.
+
+**A truncated horizon never silently downgrades an outcome.** The one
+`MappingIndex` a run builds tracks whether any scan was truncated at all
+(`is_truncated`). `nearest_first_parent_mapping_with_distance` — the single
+walk both anchor resolution and distance scheduling call — treats its own
+scan exceeding `MAX_MARKER_SCAN_COMMITS` as a `Contradictory` result naming
+the limit, not an `anyhow::bail!`. It also refuses *any* exact lookup while
+the reconstructed index is incomplete, including a source commit that already
+has a recorded mapping: an unscanned marker may provide an incomparable
+mapping for that same source commit, and resolving the visible mapping would
+silently hide the contradiction. A
+`Contradictory` result already gets decisions/0045's per-branch-halt
+treatment everywhere it's produced (`dest_anchor_for_branch` →
+`Outcome::Error`, `return Ok(true)`; `mapping_distance_for_branch` still
+returns a usable distance so scheduling isn't starved either) — no new halt
+plumbing was needed, only reusing the existing shape for a new cause.
+
+This conservative choice has an unavoidable availability tradeoff under the
+no-persistent-state constraint. After a bounded scan, the observed index is
+identical whether an omitted commit contains no marker or contains an
+incomparable mapping for a source commit already observed. A resolver that
+returns an anchor in both worlds would violate the contradiction-safety
+invariant; a resolver that scans the omitted history to distinguish them has
+abandoned the bound. Therefore a repository whose history remains beyond the
+horizon can repeatedly halt mapped branches until an operator changes the
+history or a future decision changes the static implementation limit. Avoiding
+that repeated halt requires a durable scan cursor/summary or an unbounded
+verification pass, both outside this decision. The horizon still prevents a
+whole-run error and does not create a lifetime entry ceiling; branches with a
+complete index are unaffected.
+
+An exact mapping whose canonical destination object is absent from the local
+object database is also a per-branch refusal, even when an older mapping is
+available. Walking past it can skip destination-native content represented by
+a `DestToSource` marker, which replay intentionally loop-prevents; the
+operator must fetch the missing object or resync from a complete clone.
+
+**Scheduling computes each round's distances once (Finding C).** The
+distance-based scheduling loop in `run()` previously called
+`mapping_distance_for_branch` for both sides of every pairwise comparison,
+recomputing the already-selected branch's distance on every iteration
+(~2·B² revwalks across a whole run). `select_next_branch_by_mapping_distance`
+is a new, pure per-round helper: it computes each remaining branch's
+`(distance, name)` key exactly once, then takes the minimum. Distances are
+still recomputed at the start of every round (not cached across rounds),
+since a push earlier in the same run can add a mapping a later round's
+distance depends on — this decision's own scheduling rationale. A single
+branch's distance computation failing (most commonly Finding A's own-scan-
+horizon refusal now, but any error) is routed to that branch's own
+decisions/0045-shaped per-branch halt instead of aborting the round or the
+run; the round is retried with that branch removed.
+
+## Why
+
+The original bounds were justified as protection against *per-run* multiplied
+work, never as a lifetime ceiling on authenticated history. The visited set
+removes the branch-count multiplier, and the aggregate bound remains a
+reconstruction work horizon rather than a lifetime entry ceiling. A bounded
+scan nevertheless cannot prove that an omitted marker does not contradict a
+visible one. Degrading that uncertainty to a per-branch refusal preserves
+the project's "stop and involve the operator" safety rule and never fails
+after dest has already been mutated by an accepted push. Under the current
+no-persistent-state constraint, repeated refusal while a repository remains
+beyond the horizon is the explicit availability tradeoff documented above.
+
+## Consequences
+
+* `MappingIndex` gains `scan_limit` (mirroring the existing `limit` field for
+  aggregate entries) and `truncated_scans`; both are test-overridable
+  (`with_scan_limit`, `with_limit`, `reconstruct_with_scan_limit`) so
+  truncation is tested without needing a real 100,000-commit repository.
+* `add_source_commit` and `add_dest_commit` now return `Result<bool>` (was
+  `Result<()>`) — `false` means the aggregate bound was hit, signaling the
+  calling scan to stop. Both are `pub(crate)` but have no callers outside
+  `mapping_index.rs`'s own scans.
+* `run()`'s accepted-push arm calls the new `record_pushed_dest_commit`
+  instead of `add_dest_commit`, so an index bookkeeping limit can never fail
+  a run after dest has already been mutated.
+* ForceMirrorOnly invalidation plans one bounded ancestry walk before the
+  force-with-lease push and applies only the resulting infallible cache
+  deletion after acceptance; missing old destination objects are stale
+  mappings, not post-push errors.
+* `marker::verify`'s signature and behavior are unchanged; `marker::verify_self`
+  is new and used only by `mapping_index.rs`'s reconstruction scans.
+* **Tests added:** shared first-parent history across two branches is
+  scanned once, not once per branch (a call-count assertion, since a real
+  100,000-commit repository is impractical in a unit test); a scan exceeding
+  its commit horizon keeps prior mappings and returns `Ok`, not `Err`; a
+  branch whose own walk exceeds the horizon with no mapping found refuses
+  per-branch; an unrelated branch's own complete, mapping-free walk still
+  refuses once any scan this run was truncated; a visible mapping beyond an
+  incomplete horizon cannot mask a contradiction; exact mappings with
+  missing canonical destinations halt rather than walking past them
+  (including an end-to-end rewrite that would otherwise loop-prevent and lose
+  imported content); a reconstruction scan hitting the aggregate entry limit
+  stops without erroring; `record_built_mapping` never fails past the
+  aggregate limit; `verify_self` rejects an oversized message before parsing
+  it; and `select_next_branch_by_mapping_distance` computes each branch's
+  distance exactly once per round, breaks ties by name, and turns a single
+  branch's distance error into just that branch's halt.
