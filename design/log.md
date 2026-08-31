@@ -2303,3 +2303,24 @@ existed, not a live reference.
 ## 2026-08-28 — review F-15 (resolution worktree under `temp_dir()`) left as is
 
 **Decision**: Not changing the worktree location. Conflicts are never resolved on the CI runner (a conflict fails the pipeline, decisions/0007); resolution happens on a workstation and is expected to take hours, not the days a tmp-aging cleaner needs to become a factor. A swept worktree fails closed ("worktree not registered") and the state ref survives, so the worst case is redoing a short manual merge. Revisit only if resolution turnaround changes.
+
+## 2026-08-28 — exact authenticated mappings replace global anchor inference
+
+**Decision**: Added
+[decisions/0046](decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md),
+superseding decisions/0043's global sibling `merge_base`/ancestry comparison
+for destination-anchor selection. A production workflow — round-trip a
+`develop` change, merge it into a round-tripped feature, then rebase a
+mirror-only task onto that feature — halted because unrelated mirrored refs
+produced incomparable merge-base groups even though the developer's operation
+was routine. Gitprism will instead reconstruct a bounded in-memory exact
+source→dest mapping index from the authenticated `SourceToDest`, `Setup`, and
+`DestToSource` markers already stored in Git, walk each branch first-parent to
+its nearest mapped ancestor, and process source branches by increasing distance
+from known mapping state so a parent projected earlier in the same CI run is
+immediately available to its children. No database, Git notes, dedicated mapping
+refs, persistent runner cache, or developer command is added. Content-empty
+branch-marker aliases and comparable exact mappings normalize automatically;
+only incomparable canonical dest mappings for the same nearest source OID remain
+a genuine operator boundary. The decision includes the TDD implementation and
+verification plan; code is not changed yet.
