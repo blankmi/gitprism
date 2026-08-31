@@ -2805,3 +2805,228 @@ fn sync_pair_to_dest_wrong_order_rewrite_of_task_picks_up_feature_as_the_anchor(
         .unwrap();
     assert_eq!(blob.content(), b"rewritten\n");
 }
+
+#[test]
+fn run_reproduces_the_round_tripped_feature_rebase_anchor_ambiguity() {
+    // Production topology: develop is round-tripped, a round-tripped
+    // feature receives develop's change on dest and brings it back to source,
+    // a sibling task is mirrored, and a mirror-only task is then rebased onto
+    // the feature. The task's resulting graph has the feature as its first
+    // parent and the round-tripped develop commit as a second parent, so the
+    // old global merge-base search sees two incomparable candidates.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip =
+        bare_repo_with_a_commit_on(dest_dir.path(), "develop", &[("shared.txt", "v1\n")]);
+    dest_repo
+        .reference(
+            "refs/heads/feat/supplier-specific-accounting-data",
+            dest_tip,
+            true,
+            "seed feature",
+        )
+        .unwrap();
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "develop", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("develop", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    source_repo
+        .branch(
+            "feat/supplier-specific-accounting-data",
+            &source_repo.find_commit(graft).unwrap(),
+            false,
+        )
+        .unwrap();
+    add_commit(
+        &source_repo,
+        "feat/supplier-specific-accounting-data",
+        &[("feature.txt", "feature base\n")],
+    );
+    source_repo
+        .branch(
+            "tasks/supplier-specific-accounting-data/add_tax_tables",
+            &source_repo.find_commit(graft).unwrap(),
+            false,
+        )
+        .unwrap();
+    add_commit(
+        &source_repo,
+        "tasks/supplier-specific-accounting-data/add_tax_tables",
+        &[("task.txt", "before rebase\n")],
+    );
+    let develop_change = add_commit(
+        &source_repo,
+        "develop",
+        &[("develop.txt", "develop change\n")],
+    );
+
+    let source_remote_dir = tempdir().unwrap();
+    Repository::init_bare(source_remote_dir.path()).unwrap();
+    let source_url = source_remote_dir.path().display().to_string();
+    for branch in ["develop", "feat/supplier-specific-accounting-data"] {
+        let tip = source_repo
+            .find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            git::push(
+                source_dir.path(),
+                &source_url,
+                tip,
+                branch,
+                PushMode::FastForwardOnly,
+            )
+            .unwrap(),
+            git::PushOutcome::Accepted
+        );
+    }
+
+    let config = write_config(
+        &source_url,
+        &dest_dir.path().display().to_string(),
+        &["develop", "feat/supplier-specific-accounting-data"],
+    );
+    run(source_dir.path(), config.path()).expect("initial round-trip branches must sync");
+
+    // The feature branch lands an independent merge of develop on dest. The
+    // next full run reflects that merge back into source as a DestToSource
+    // marker, which deliberately has feature's branch scope and is therefore
+    // not accepted as the target task's own anchor marker.
+    let dest_develop_tip = dest_repo
+        .find_branch("develop", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let dest_feature_tip = dest_repo
+        .find_branch(
+            "feat/supplier-specific-accounting-data",
+            git2::BranchType::Local,
+        )
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let dest_feature_merge = {
+        let feature_commit = dest_repo.find_commit(dest_feature_tip).unwrap();
+        let mut tree_builder = dest_repo
+            .treebuilder(Some(&feature_commit.tree().unwrap()))
+            .unwrap();
+        let blob = dest_repo.blob(b"develop change\n").unwrap();
+        tree_builder
+            .insert("develop.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree = dest_repo.find_tree(tree_builder.write().unwrap()).unwrap();
+        let signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+        dest_repo
+            .commit(
+                Some("refs/heads/feat/supplier-specific-accounting-data"),
+                &signature,
+                &signature,
+                "Merge develop into feature",
+                &tree,
+                &[
+                    &feature_commit,
+                    &dest_repo.find_commit(dest_develop_tip).unwrap(),
+                ],
+            )
+            .unwrap()
+    };
+    run(source_dir.path(), config.path())
+        .expect("the dest-side feature merge must round-trip into source");
+    let source_feature_tip = source_repo
+        .find_branch(
+            "feat/supplier-specific-accounting-data",
+            git2::BranchType::Local,
+        )
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert!(
+        marker::verify(
+            &source_repo.find_commit(source_feature_tip).unwrap(),
+            "feat/supplier-specific-accounting-data",
+            &[MarkerDirection::DestToSource],
+            Some(dest_feature_merge),
+            &marker::load_key().unwrap(),
+        )
+        .is_some(),
+        "the feature merge must be represented by its authenticated source marker"
+    );
+
+    let sibling = "tasks/supplier-specific-accounting-data/unmapping_zfsglobus";
+    source_repo
+        .branch(
+            sibling,
+            &source_repo.find_commit(source_feature_tip).unwrap(),
+            false,
+        )
+        .unwrap();
+    add_commit(&source_repo, sibling, &[("sibling.txt", "sibling\n")]);
+    run(source_dir.path(), config.path()).expect("the sibling task must mirror");
+    assert!(
+        dest_repo
+            .find_branch(sibling, git2::BranchType::Local)
+            .is_ok(),
+        "the sibling task must have a dest projection before the rewrite"
+    );
+
+    // Rebase the mirror-only task onto feature while retaining develop as a
+    // second parent in the resulting graph. This is the graph shape that
+    // makes the old algorithm's develop and feature merge bases incomparable.
+    let task = "tasks/supplier-specific-accounting-data/add_tax_tables";
+    source_repo
+        .branch(
+            task,
+            &source_repo.find_commit(source_feature_tip).unwrap(),
+            true,
+        )
+        .unwrap();
+    let feature_commit = source_repo.find_commit(source_feature_tip).unwrap();
+    let develop_commit = source_repo.find_commit(develop_change).unwrap();
+    let signature = Signature::now("A Developer", "dev@example.com").unwrap();
+    source_repo
+        .commit(
+            Some(&format!("refs/heads/{task}")),
+            &signature,
+            &signature,
+            "Rebase task onto feature",
+            &feature_commit.tree().unwrap(),
+            &[&feature_commit, &develop_commit],
+        )
+        .unwrap();
+    add_commit(&source_repo, task, &[("task.txt", "after rebase\n")]);
+
+    run(source_dir.path(), config.path())
+        .expect("a routine mirror-only rebase must not halt on global merge-base ambiguity");
+
+    let rebuilt_task_tip = dest_repo
+        .find_branch(task, git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(
+        rebuilt_task_tip.parent_id(0).unwrap(),
+        dest_feature_merge,
+        "the rebased task must rebuild from the feature projection"
+    );
+    let tree = rebuilt_task_tip.tree().unwrap();
+    let task_blob = dest_repo
+        .find_blob(tree.get_name("task.txt").unwrap().id())
+        .unwrap();
+    assert_eq!(task_blob.content(), b"after rebase\n");
+}
