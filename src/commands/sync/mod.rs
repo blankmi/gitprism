@@ -92,7 +92,7 @@ use crate::progress::{Direction, Outcome, Reporter};
 
 use anchor::{
     DestAnchor, RunCache, dest_anchor_for_branch, dest_ref_exists_cached,
-    dest_resume_point_for_branch, mirror_only_rewrite_detected,
+    dest_resume_point_for_branch, mapping_distance_for_branch, mirror_only_rewrite_detected,
 };
 use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
@@ -238,13 +238,37 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
 
     // One cache for this whole `run()` invocation — destination ref
     // existence, fetched destination tips, and the authenticated mapping
-    // index — is shared across every branch below.
-    for branch in &source_branches {
+    // index — is shared across every branch below. Select the next branch
+    // from the nearest exact mapping so a parent projection is available to
+    // its child later in this run (decisions/0046).
+    let mut remaining_branches = source_branches.clone();
+    while !remaining_branches.is_empty() {
+        let mut selected_index = 0;
+        for candidate_index in 1..remaining_branches.len() {
+            let candidate = &remaining_branches[candidate_index];
+            let selected = &remaining_branches[selected_index];
+            let candidate_distance = mapping_distance_for_branch(&repo, candidate, &run_cache)?;
+            let selected_distance = mapping_distance_for_branch(&repo, selected, &run_cache)?;
+            let candidate_key = (
+                candidate_distance.is_none(),
+                candidate_distance.unwrap_or(usize::MAX),
+                candidate.as_str(),
+            );
+            let selected_key = (
+                selected_distance.is_none(),
+                selected_distance.unwrap_or(usize::MAX),
+                selected.as_str(),
+            );
+            if candidate_key < selected_key {
+                selected_index = candidate_index;
+            }
+        }
+        let branch = remaining_branches.remove(selected_index);
         let halted = sync_pair_to_dest_with_key(
             &repo,
             &source_root,
             &config,
-            branch,
+            &branch,
             &reporter,
             &state_key,
             &exclude_list,
@@ -387,10 +411,9 @@ fn sync_pair_to_dest_with_key(
         // same-named counterpart on dest at all yet (a brand-new feature
         // branch, say) — checked explicitly rather than attempting a fetch
         // and treating "no such ref" as the same failure it would be for a
-        // branch that's supposed to already exist. Read-through the same
+        // branch that's supposed to already exist. Read through the same
         // per-run cache decisions/0046's anchor lookup shares (see
-        // `dest_ref_exists_cached`), so this check's own result is what the
-        // anchor search's candidate loop sees for `branch` too.
+        // `dest_ref_exists_cached`).
         let dest_ref_exists = dest_ref_exists_cached(source_root, &dest_url, branch, run_cache)?;
         // decisions/0038, decisions/0039: force is requested only once this
         // very run has established both that `branch` is mirror-only and

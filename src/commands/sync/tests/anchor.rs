@@ -1823,6 +1823,68 @@ fn fetch_dest_tip_cached_hits_the_cache_without_fetching_again() {
 }
 
 #[test]
+fn run_schedules_a_new_parent_before_a_lexically_earlier_new_child() {
+    // Both branches start without destination refs. The child sorts first,
+    // but its first-parent path has one extra unmapped commit, so distance
+    // scheduling must project the parent before the child.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    source_repo
+        .branch("z-feature", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    let feature_source_tip = add_commit(&source_repo, "z-feature", &[("feature.txt", "feature\n")]);
+    source_repo
+        .branch(
+            "a-task",
+            &source_repo.find_commit(feature_source_tip).unwrap(),
+            false,
+        )
+        .unwrap();
+    add_commit(&source_repo, "a-task", &[("task.txt", "task\n")]);
+
+    let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+    run(source_dir.path(), config.path()).expect("distance scheduling must project both branches");
+
+    let dest_feature_tip = dest_repo
+        .find_branch("z-feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    let dest_task_tip = dest_repo
+        .find_branch("a-task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(
+        dest_task_tip.parent_id(0).unwrap(),
+        dest_feature_tip.id(),
+        "the lexically earlier child must anchor on the parent projection created earlier in this run"
+    );
+    assert!(
+        dest_task_tip
+            .tree()
+            .unwrap()
+            .get_name("feature.txt")
+            .is_some()
+    );
+    assert!(dest_task_tip.tree().unwrap().get_name("task.txt").is_some());
+}
+
+#[test]
 fn run_reproduces_the_round_tripped_feature_rebase_anchor_ambiguity() {
     // Production topology: develop is round-tripped, a round-tripped
     // feature receives develop's change on dest and brings it back to source,

@@ -157,6 +157,17 @@ impl MappingIndex {
         repo: &Repository,
         tip: Oid,
     ) -> Result<MappingLookup> {
+        let Some((_, lookup)) = self.nearest_first_parent_mapping_with_distance(repo, tip)? else {
+            return Ok(MappingLookup::None);
+        };
+        Ok(lookup)
+    }
+
+    pub(crate) fn nearest_first_parent_mapping_with_distance(
+        &self,
+        repo: &Repository,
+        tip: Oid,
+    ) -> Result<Option<(usize, MappingLookup)>> {
         let mut revwalk = first_parent_walk(repo, tip, "source")?;
         for (scanned, oid) in (&mut revwalk).enumerate() {
             if scanned >= crate::limits::MAX_MARKER_SCAN_COMMITS {
@@ -168,10 +179,10 @@ impl MappingIndex {
             let oid = oid.context("walking source history for an exact mapping")?;
             match self.resolve_for_anchor(repo, oid)? {
                 MappingLookup::None => {}
-                mapping => return Ok(mapping),
+                mapping => return Ok(Some((scanned, mapping))),
             }
         }
-        Ok(MappingLookup::None)
+        Ok(None)
     }
 
     pub(crate) fn add_source_commit(

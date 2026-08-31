@@ -397,3 +397,30 @@ pub(super) fn dest_anchor_for_branch(
         },
     )
 }
+
+pub(super) fn mapping_distance_for_branch(
+    repo: &Repository,
+    branch: &str,
+    run_cache: &RunCache,
+) -> Result<Option<usize>> {
+    let source_tip = repo
+        .find_branch(branch, git2::BranchType::Local)
+        .with_context(|| format!("resolving source branch {branch:?}"))?
+        .get()
+        .peel_to_commit()
+        .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
+        .id();
+    let index = run_cache
+        .mapping_index
+        .as_ref()
+        .context("mapping index was not reconstructed before branch scheduling")?;
+    let Some((distance, lookup)) =
+        index.nearest_first_parent_mapping_with_distance(repo, source_tip)?
+    else {
+        return Ok(None);
+    };
+    Ok(match lookup {
+        MappingLookup::None => None,
+        MappingLookup::Resolved(_) | MappingLookup::Contradictory(_) => Some(distance),
+    })
+}
