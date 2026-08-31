@@ -73,6 +73,7 @@
 pub(crate) mod anchor;
 pub(crate) mod filter;
 mod local_advance;
+mod mapping_index;
 mod marker_scan;
 pub(crate) mod policy_check;
 
