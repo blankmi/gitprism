@@ -322,15 +322,18 @@ pub(super) fn dest_ref_exists_cached(
 /// listing is refreshed at most once per run (via `refreshed_listing`,
 /// shared across every branch this run reconstructs) and the two outcomes
 /// are handled differently on purpose. A branch absent from the refreshed
-/// listing is fully recovered: the branch genuinely has no dest ref any
-/// more, so it contributes no mappings, and reconstruction stays complete.
-/// Any other fetch failure — auth, network, transport, a corrupt remote, or
-/// the branch still being advertised — propagates instead: silently
-/// skipping it would leave the mapping index incomplete while every other
-/// branch's lookup still believed it complete, the exact "a visible mapping
-/// hides an unscanned contradiction" hole Addendum 1 closed. A per-branch
-/// halt is the right shape for a per-branch fact; reconstruction's
-/// completeness is a whole-run fact.
+/// listing is fully recovered — *if* that listing can actually support "dest
+/// has no branch by this name" (decisions/0047 addendum:
+/// `can_establish_absence()`, true unless the branch-limit horizon was hit —
+/// an unrelated undecodable ref elsewhere never blocks this, since it
+/// doesn't stop the scan and can't be `branch` itself). Any other fetch
+/// failure — auth, network, transport, a corrupt remote, the branch still
+/// being advertised, or the listing unable to establish absence — propagates
+/// instead: silently skipping it would leave the mapping index incomplete
+/// while every other branch's lookup still believed it complete, the exact
+/// "a visible mapping hides an unscanned contradiction" hole Addendum 1
+/// closed. A per-branch halt is the right shape for a per-branch fact;
+/// reconstruction's completeness is a whole-run fact.
 pub(super) fn fetch_dest_head_for_reconstruction(
     repo: &Repository,
     source_root: &Path,
@@ -358,7 +361,9 @@ pub(super) fn fetch_dest_head_for_reconstruction(
         );
     }
     let listing = refreshed_listing.as_ref().expect("just populated above");
-    if !listing.truncated && !listing.names.iter().any(|name| name == branch) {
+    if listing.completeness.can_establish_absence()
+        && !listing.names.iter().any(|name| name == branch)
+    {
         run_cache.dest_ref_exists.insert(branch.to_string(), false);
         return Ok(None);
     }
@@ -395,23 +400,26 @@ pub(super) fn reconstruct_mapping_index(
     // asked for directly rather than inferred from what source still has.
     let mut dest_branch_names = source_branches.to_vec();
     let dest_listing = git::remote_branch_names(source_root, dest_url)?;
-    // Existence for every listed name — and, when the listing is complete,
-    // non-existence for every source branch it didn't list — is now known
-    // from this one subprocess, recorded into the same cache
+    // Existence for every listed name — and, when the listing can establish
+    // absence, non-existence for every source branch it didn't list — is now
+    // known from this one subprocess, recorded into the same cache
     // `dest_ref_exists_cached` reads below so it never re-queries per
     // branch (decisions/0043's own quadratic-cost lesson; decisions/0046
-    // Addendum 2, Finding J for the non-existence half). A truncated
-    // listing can't support that negative claim — an unlisted name might
-    // still have a dest ref beyond the horizon — so only the positives are
-    // seeded in that case, and `dest_ref_exists_cached` is left to query
-    // the rest itself.
+    // Addendum 2, Finding J for the non-existence half). Only the
+    // branch-limit horizon blocks that negative claim (decisions/0047
+    // addendum: `can_establish_absence()`) — an unlisted name might still
+    // have a dest ref beyond it. An undecodable ref elsewhere doesn't: it
+    // never stops the scan and can't be a distinct, valid-UTF-8 source
+    // branch itself, so absence still seeds for every other case, and
+    // `dest_ref_exists_cached` is left to query only what a real horizon
+    // left unresolved.
     for name in &dest_listing.names {
         run_cache.dest_ref_exists.insert(name.clone(), true);
         if !dest_branch_names.contains(name) {
             dest_branch_names.push(name.clone());
         }
     }
-    if !dest_listing.truncated {
+    if dest_listing.completeness.can_establish_absence() {
         for branch in source_branches {
             if !dest_listing.names.contains(branch) {
                 run_cache.dest_ref_exists.insert(branch.clone(), false);
@@ -437,15 +445,14 @@ pub(super) fn reconstruct_mapping_index(
         }
     }
     let mut index = MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)?;
-    if dest_listing.truncated {
-        // decisions/0046 Addendum 2, Finding F: an unlisted dest branch may
-        // carry an incomparable mapping for a source commit already
-        // observed, so this incompleteness must taint exact lookups the
-        // same way a truncated history scan already does.
-        index.note_incomplete_reconstruction(format!(
-            "dest branch listing truncated at the {} branch limit",
-            crate::limits::MAX_SOURCE_BRANCHES
-        ));
+    if !dest_listing.completeness.is_complete() {
+        // decisions/0046 Addendum 2, Finding F; decisions/0047 and its
+        // addendum: an unlisted or undecodable dest branch may carry an
+        // incomparable mapping for a source commit already observed, so any
+        // recorded cause must taint exact lookups the same way a truncated
+        // history scan already does — `describe()` names every cause found,
+        // not just one.
+        index.note_incomplete_reconstruction(dest_listing.completeness.describe());
     }
     Ok(index)
 }

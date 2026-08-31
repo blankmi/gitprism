@@ -2495,3 +2495,119 @@ boundary object is missing, and asserts `run()` reaches decisions/0045's
 per-branch halt (the aggregate "one or more branches halted" error) with no
 `git2::Error` anywhere in the returned error's chain, and that dest is left
 exactly as the previous sync produced it.
+
+## 2026-08-31 — third review's malformed-ref findings fixed (M-01, M-02 / 0047)
+
+The 2026-08-31 repository review (`docs/2026-08-31_REPOSITORY_REVIEW.md`), once
+checked against the tree and the decisions, left two real findings, both about
+what happens when a ref name isn't valid UTF-8. Neither challenged an existing
+decision; both were the code failing to hold one.
+
+* **M-01 — the source branch budget didn't count what it couldn't parse.**
+  `list_source_branches` checked `source_branches.len()` against
+  `MAX_SOURCE_BRANCHES`, but a non-UTF-8 branch name goes to `skipped`, not to
+  `source_branches`, so it consumed no budget: a repository with more than
+  4,096 non-UTF-8 refs drove enumeration, allocation and warning output past
+  decisions/0032's declared bound. The loop now counts every enumerated branch
+  (`.enumerate()`), parseable or not. Boundary semantics are unchanged —
+  exactly `MAX_SOURCE_BRANCHES` accepted, the next one bails with the same
+  message — and `skipped` is bounded as a consequence. Two regressions in
+  `src/commands/sync/tests/limit_tests.rs`: one exceeding the bound with
+  *only* non-UTF-8 packed refs, one holding the boundary exactly with a mix,
+  asserting `branches.len() + skipped.len() == MAX_SOURCE_BRANCHES`.
+
+* **M-02 — the dest listing invented names it then failed to fetch.**
+  `git::remote_branch_names` read `git ls-remote --heads` stdout through
+  `String::from_utf8_lossy`, so an undecodable advertised ref became a U+FFFD
+  name that `git2::Branch::name_is_valid` accepts. It was recorded as an
+  existing dest ref, fetched, failed (no such ref exists), and — because the
+  refresh path repeated the same lossy conversion and still saw it listed —
+  propagated as a whole-run abort. One malformed ref on dest denied every
+  branch its sync, and decisions/0030's own "reject, never transform" rule was
+  being broken at the one boundary where dest's ref names enter gitprism.
+
+  Recorded as
+  `design/decisions/0047-an-undecodable-dest-ref-makes-the-listing-incomplete.md`
+  before implementation, since skip-vs-fail is a policy choice, not a bug fix.
+  The listing is now parsed as bytes; an undecodable name is dropped and marks
+  the listing **incomplete** — decisions/0046 Addendum 2, Finding F's existing
+  signal — so reconstruction taints its exact lookups and the run degrades to
+  per-branch refusals instead of aborting. The two rejected alternatives are
+  argued in the decision: skipping silently would reopen Addendum 1's
+  "a visible mapping hides an unscanned contradiction" hole, and failing the
+  listing outright would keep the very asymmetry Finding F rejected — dest's
+  ref names are not something a source-side operator can necessarily fix.
+
+  `RemoteBranchListing.truncated: bool` became
+  `incomplete: Option<ListingIncomplete>` so the per-branch refusal names the
+  real cause rather than always claiming a branch-limit horizon. A name that
+  *decodes* but fails `validate_branch_name` keeps decisions/0024's silent
+  skip, listing still complete: gitprism has fully read and judged it.
+
+The parsing loop was then extracted into a pure `parse_ls_remote_heads(&[u8])`
+— a behaviour-preserving test seam, with the three subprocess-level tests left
+untouched as proof it is wired up. It exists because 0047's decodable-but-
+invalid case cannot be provoked end to end: Git will not advertise a ref whose
+name `validate_branch_name` rejects, so that clause was otherwise untestable.
+
+Release gates on the finished tree: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+and `cargo test --workspace --all-features --locked` all clean at 335 passing,
+up from 328.
+
+The review's other findings needed no code. H-01 (Git hooks/config as a
+code-execution boundary) is decisions/0029 working as designed and already
+documented in the README; a hardened subprocess mode would reopen that decision
+and is not an incidental remediation. L-01 (no Windows equivalent of
+`limits.rs`'s Unix dev/ino and hard-link checks) and the release-provenance item
+stay open as P2/P3. The review also confirmed the 2026-08-28 sync split is
+finished work: `sync/mod.rs` is the intended orchestration residue, and the
+three marker revwalks stay unmerged for the reason recorded then.
+
+## 2026-08-31 — M-03: an undecodable dest ref no longer blocks deleted-ref recovery
+
+A follow-up review of the M-02 fix found that it had traded one availability
+failure for a smaller one. `fetch_dest_head_for_reconstruction` recovers from a
+failed fetch by re-listing dest and treating a now-unlisted branch as deleted
+(decisions/0046 Addendum 2, Finding G), but decisions/0047 gated that recovery
+on the listing being complete *for any reason*. One unrelated undecodable ref
+therefore disabled it, so a valid branch genuinely deleted between the listing
+and its fetch aborted the whole run.
+
+The two causes are not equivalent for the claim "dest has no branch by this
+name". The branch-limit horizon stops the scan, so absence is unprovable. An
+undecodable ref does not stop the scan, and its bytes can never equal a
+valid-UTF-8 branch name, so absence of a distinct valid branch stays fully
+established. Recorded as an addendum to decisions/0047, which also corrects
+that decision's own point 3 ("both causes suppress the negative existence claim
+identically" was the wrong instruction).
+
+Implementing it exposed a second defect in the M-02 code: the parser recorded
+only the *first* incompleteness cause, so an undecodable ref followed by the
+branch limit reported only the undecodable ref — under which the new predicate
+would have approved an absence claim despite a real unscanned horizon. A
+single-cause enum cannot express the distinction safely, so
+`Option<ListingIncomplete>` became `ListingCompleteness { branch_limit,
+undecodable_ref }`, carrying both, with `can_establish_absence()` (false only
+under the horizon) and a `describe()` that names every cause. The global
+mapping-index taint still applies under either cause: an undecodable dest
+branch may carry markers for a source commit already observed, which is what
+that taint exists for. Only the per-branch absence claim is separable.
+
+`reconstruct_mapping_index`'s negative-existence seeding makes the same absence
+claim, so it uses the same predicate — restoring, for this input class, what
+that site did before decisions/0047, without the fabricated name.
+
+Two tests were needed, not one, and the first attempt at the second one was
+wrong. The seeding site records a never-advertised branch as non-existent
+*before* the per-branch loop, so a reconstruction-level test of the deletion
+race never reaches the fetch path at all: reverting the recovery gate left that
+test passing. The real coverage calls `fetch_dest_head_for_reconstruction`
+directly against a dest carrying both a deleted `target` and an unrelated
+undecodable ref, and was verified to fail against the reverted gate. The
+reconstruction-level test stays, describing what it actually proves (absence
+still seeded, no abort, index still tainted). The parser's two-cause case has
+its own regression.
+
+Gates on the finished tree: fmt, clippy `-D warnings`, `cargo test` at 338
+passing (up from 335), and `cargo build --release --locked`, all clean.

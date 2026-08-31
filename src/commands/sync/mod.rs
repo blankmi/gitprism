@@ -407,17 +407,20 @@ pub(crate) struct SkippedSourceBranch {
 /// branch` enumeration; no fetch involved. A branch whose name isn't valid
 /// UTF-8 is reported back via the second element rather than failing the
 /// whole listing — decisions/0024's precedent for a branch gitprism
-/// discovered but can't act on.
+/// discovered but can't act on — but it still counts against
+/// `MAX_SOURCE_BRANCHES` (decisions/0032: the bound is on branches
+/// enumerated, not on how many gitprism could parse).
 pub(super) fn list_source_branches(
     repo: &Repository,
 ) -> Result<(Vec<String>, Vec<SkippedSourceBranch>)> {
     let mut source_branches = Vec::new();
     let mut skipped = Vec::new();
-    for entry in repo
+    for (enumerated, entry) in repo
         .branches(Some(git2::BranchType::Local))
         .context("listing source's local branches")?
+        .enumerate()
     {
-        if source_branches.len() >= limits::MAX_SOURCE_BRANCHES {
+        if enumerated >= limits::MAX_SOURCE_BRANCHES {
             anyhow::bail!(
                 "source branch enumeration exceeds the {} branch limit",
                 limits::MAX_SOURCE_BRANCHES

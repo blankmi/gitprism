@@ -1913,6 +1913,72 @@ fn reconstruct_mapping_index_caches_a_source_branchs_missing_dest_ref_as_nonexis
 }
 
 #[test]
+fn reconstruct_mapping_index_degrades_to_a_per_branch_refusal_instead_of_aborting_on_an_undecodable_dest_ref()
+ {
+    // decisions/0047: a dest ref gitprism cannot decode must not abort the
+    // whole run the way a propagated fetch error would (decisions/0046
+    // Addendum 2, Finding G) — reconstruction stays `Ok`, and the taint
+    // shows up as a per-branch refusal on `main`'s own otherwise-exact
+    // mapping, naming the real cause rather than a branch-limit horizon.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    // Raw invalid UTF-8 bytes, not a literal U+FFFD — see
+    // `git::remote_branch_names_skips_an_undecodable_ref_and_marks_the_listing_incomplete`
+    // for why a literal U+FFFD would prove nothing.
+    let mut packed_refs = Vec::new();
+    packed_refs.extend_from_slice(b"# pack-refs with: peeled fully-peeled sorted\n");
+    packed_refs.extend_from_slice(dest_tip.to_string().as_bytes());
+    packed_refs.push(b' ');
+    packed_refs.extend_from_slice(b"refs/heads/bad-");
+    packed_refs.extend_from_slice(&[0xFF, 0xFE]);
+    packed_refs.push(b'\n');
+    std::fs::write(dest_repo.path().join("packed-refs"), packed_refs).unwrap();
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let dest_url = dest_dir.path().display().to_string();
+    let key = marker::load_key().unwrap();
+    let mut run_cache = RunCache::default();
+
+    let index = reconstruct_mapping_index(
+        &repo,
+        source_dir.path(),
+        &dest_url,
+        &["main".to_string()],
+        &key,
+        &mut run_cache,
+    )
+    .expect(
+        "an undecodable dest ref must degrade reconstruction, not propagate a fetch error and \
+         abort the run",
+    );
+
+    let err = index
+        .resolve(&repo, graft)
+        .expect_err("an incomplete index must refuse main's own otherwise-exact mapping");
+    let message = err.to_string();
+    assert!(
+        message.contains("not valid UTF-8"),
+        "the refusal must name the real cause, not a branch-limit horizon: {message}"
+    );
+    assert!(
+        !message.contains("branch limit"),
+        "an undecodable ref is not a branch-count horizon: {message}"
+    );
+}
+
+#[test]
 fn fetch_dest_head_for_reconstruction_recovers_a_dest_branch_deleted_between_the_listing_and_its_fetch()
  {
     // decisions/0046 Addendum 2, Finding G: stands in for the listing
@@ -1957,6 +2023,136 @@ fn fetch_dest_head_for_reconstruction_recovers_a_dest_branch_deleted_between_the
         run_cache.dest_ref_exists.get("target"),
         Some(&false),
         "the branch must be recorded as no longer having a dest ref"
+    );
+}
+
+#[test]
+fn fetch_dest_head_for_reconstruction_recovers_a_deleted_branch_alongside_an_unrelated_undecodable_ref()
+ {
+    // decisions/0047's addendum: an unrelated undecodable ref in the
+    // refreshed listing must not disable the line ~364 `can_establish_absence()`
+    // gate for a distinct, valid-UTF-8 branch — only the branch-limit
+    // horizon may. Otherwise identical to
+    // `fetch_dest_head_for_reconstruction_recovers_a_dest_branch_deleted_between_the_listing_and_its_fetch`.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
+    // HEAD must point elsewhere before `target` can be deleted.
+    dest_repo.set_head("refs/heads/unused").unwrap();
+    dest_repo
+        .find_branch("target", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    // See `git::remote_branch_names_skips_an_undecodable_ref_and_marks_the_listing_incomplete`
+    // for why this needs raw invalid UTF-8 bytes, not a literal U+FFFD.
+    let mut packed_refs = Vec::new();
+    packed_refs.extend_from_slice(b"# pack-refs with: peeled fully-peeled sorted\n");
+    packed_refs.extend_from_slice(tip.to_string().as_bytes());
+    packed_refs.push(b' ');
+    packed_refs.extend_from_slice(b"refs/heads/bad-");
+    packed_refs.extend_from_slice(&[0xFF, 0xFE]);
+    packed_refs.push(b'\n');
+    std::fs::write(dest_repo.path().join("packed-refs"), packed_refs).unwrap();
+
+    let source_dir = tempdir().unwrap();
+    Repository::init(source_dir.path()).unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let dest_url = dest_dir.path().display().to_string();
+    let mut run_cache = RunCache::default();
+    run_cache.dest_ref_exists.insert("target".to_string(), true);
+    let mut refreshed_listing = None;
+
+    let head = fetch_dest_head_for_reconstruction(
+        &repo,
+        source_dir.path(),
+        &dest_url,
+        "target",
+        &mut run_cache,
+        &mut refreshed_listing,
+    )
+    .expect("an unrelated undecodable ref must not disable the deleted-ref recovery");
+
+    assert_eq!(
+        head, None,
+        "a deleted dest ref contributes no dest head to reconstruction"
+    );
+    assert_eq!(
+        run_cache.dest_ref_exists.get("target"),
+        Some(&false),
+        "the branch must be recorded as no longer having a dest ref"
+    );
+}
+
+#[test]
+fn reconstruct_mapping_index_recovers_a_deleted_branch_alongside_an_unrelated_undecodable_ref() {
+    // decisions/0047's addendum: an unrelated undecodable ref must not
+    // disable absence for a source branch dest never advertised — `target`
+    // is seeded `dest_ref_exists = false` by `reconstruct_mapping_index`'s
+    // own listing-driven seeding (line ~422) rather than being queried or
+    // fetched at all. `main` carries the undecodable ref and is used to
+    // build a real exact mapping, so the run-wide taint from the
+    // undecodable ref is actually observable, and the run must not abort.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    // See `git::remote_branch_names_skips_an_undecodable_ref_and_marks_the_listing_incomplete`
+    // for why this needs raw invalid UTF-8 bytes, not a literal U+FFFD.
+    let mut packed_refs = Vec::new();
+    packed_refs.extend_from_slice(b"# pack-refs with: peeled fully-peeled sorted\n");
+    packed_refs.extend_from_slice(dest_tip.to_string().as_bytes());
+    packed_refs.push(b' ');
+    packed_refs.extend_from_slice(b"refs/heads/bad-");
+    packed_refs.extend_from_slice(&[0xFF, 0xFE]);
+    packed_refs.push(b'\n');
+    std::fs::write(dest_repo.path().join("packed-refs"), packed_refs).unwrap();
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    source_repo
+        .branch("target", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let dest_url = dest_dir.path().display().to_string();
+    let key = marker::load_key().unwrap();
+    let mut run_cache = RunCache::default();
+
+    let index = reconstruct_mapping_index(
+        &repo,
+        source_dir.path(),
+        &dest_url,
+        &["main".to_string(), "target".to_string()],
+        &key,
+        &mut run_cache,
+    )
+    .expect(
+        "an unrelated undecodable dest ref must not disable the deleted-ref recovery for a \
+         distinct, valid-UTF-8 branch",
+    );
+
+    assert_eq!(
+        run_cache.dest_ref_exists.get("target"),
+        Some(&false),
+        "target's genuinely absent dest ref must still be recovered, not propagated as an error"
+    );
+
+    let err = index
+        .resolve(&repo, graft)
+        .expect_err("the index must still be tainted globally by the undecodable ref on main");
+    let message = err.to_string();
+    assert!(
+        message.contains("not valid UTF-8"),
+        "the refusal must name the real cause: {message}"
     );
 }
 
