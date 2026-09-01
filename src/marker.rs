@@ -13,7 +13,7 @@ use std::env;
 use anyhow::Context;
 use anyhow::Result;
 use git2::{Commit, Oid, Signature};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
