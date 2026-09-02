@@ -10,3 +10,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      rustcrypto:
+        patterns:
+          - "hmac"
+          - "sha2"
+          - "digest"
+          - "crypto-common"
+          - "block-buffer"
