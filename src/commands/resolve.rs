@@ -3021,4 +3021,113 @@ mod tests {
             .delete()
             .unwrap();
     }
+
+    /// decisions/0048's own scenario 1 (see `sync::tests::dest_to_source`'s
+    /// `mirror_only_branch_later_added_to_config_branches_only_reflects_dest_native_commits`,
+    /// the review's adopted repro), exercised through `gitprism resolve`'s
+    /// dest→source path instead of `sync` — resolve and sync must never
+    /// disagree about which dest commit is next (decisions/0008). Before the
+    /// fix, `resolve`'s own `pending_dest_commits` call picks up main's own
+    /// already-mirrored commit as the phantom first pending commit and hits
+    /// the identical same-line conflict CODE-001 reports; the fix requires
+    /// no change to `resolve` itself.
+    #[test]
+    fn resolve_dest_to_source_selects_the_customer_commit_not_a_mirrored_commit_after_a_branch_is_promoted()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+
+        // Two source commits on main touching the same line.
+        add_commit(&source_repo, "main", &[("shared.txt", "v2\n")]);
+        let s2 = add_commit(&source_repo, "main", &[("shared.txt", "v3\n")]);
+
+        let config_main_only = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+        crate::commands::sync::run(source_dir.path(), config_main_only.path()).expect("first sync");
+
+        // Cut a release branch from main AFTER setup; mirror it (mirror-only).
+        source_repo
+            .branch("release", &source_repo.find_commit(s2).unwrap(), false)
+            .unwrap();
+        crate::commands::sync::run(source_dir.path(), config_main_only.path())
+            .expect("second sync mirrors release");
+        let dest_release_tip = dest_repo
+            .find_branch("release", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // Customer merges a PR into dest's release.
+        let c = add_independent_dest_commit_on(
+            &dest_repo,
+            dest_release_tip,
+            "release",
+            ("customer.txt", "customer\n"),
+        );
+
+        // Seed source's remote with release, then promote release to
+        // round-tripped.
+        git::push(
+            source_repo.workdir().unwrap(),
+            &source_remote.path().display().to_string(),
+            s2,
+            "release",
+            PushMode::FastForwardOnly,
+        )
+        .unwrap();
+        let config_both = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        );
+
+        source_repo.set_head("refs/heads/release").unwrap();
+        checkout_head_exact(&source_repo);
+
+        run(source_dir.path(), config_both.path(), "release", false).expect(
+            "resolve must pick up the customer's commit cleanly, not a phantom conflict on main's \
+             own mirrored history",
+        );
+
+        let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+        let release_tip = source_remote_repo
+            .find_branch("release", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            release_tip
+                .message()
+                .unwrap()
+                .contains(&format!("Gitprism-Dest-Commit: {c}")),
+            "resolve must select the customer's own dest commit as the pending one, not a \
+             mirrored commit"
+        );
+        let mut revwalk = source_remote_repo.revwalk().unwrap();
+        revwalk.push(release_tip.id()).unwrap();
+        revwalk.hide(s2).unwrap();
+        assert_eq!(
+            revwalk.count(),
+            1,
+            "only the customer's commit should be reflected into source's release"
+        );
+    }
 }

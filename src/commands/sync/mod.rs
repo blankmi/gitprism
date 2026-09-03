@@ -40,19 +40,32 @@
 //! already brought back, for the branches configured to round-trip.
 //!
 //! **dest→source**: for every branch named in `config.branches`, find every
-//! dest commit not yet reflected into source by scanning *source's* history
-//! for the most recent `Gitprism-Dest-Commit` trailer (decisions/0003) —
-//! setup's own graft commit (decisions/0006) always carries one, so this
-//! never needs a special-cased first run — then for each pending dest commit
-//! merge source's current chain-tip tree (`ours`) against the dest commit's
-//! own tree (`theirs`), unfiltered (dest never holds source-only content),
-//! and push the result to source's own remote. A real content conflict
-//! hard-stops that branch (decisions/0007): whatever merged cleanly before
-//! the conflict is still pushed, and the conflicting commit is left for a
-//! human to resolve (decisions/0008), retried automatically on the next run
-//! once it is. Branches not in `config.branches` (e.g. a transient feature
-//! branch) never round-trip this way — decisions/0017's deliberate
-//! asymmetry — and no branch is ever deleted on either side.
+//! dest commit not yet reflected into source. The boundary (decisions/0048)
+//! is the end of the longest contiguous prefix of dest's own first-parent
+//! line, starting immediately after B1 — the dest commit named by the most
+//! recent `Gitprism-Dest-Commit` trailer on *source's* history
+//! (decisions/0003 — setup's own graft commit, decisions/0006, always
+//! carries one, so this never needs a special-cased first run) — for which
+//! every commit is *represented* in source's current tip: either a
+//! self-authenticated `SourceToDest` marker whose own source counterpart is
+//! still an ancestor of source's tip, or, regardless of marker shape (even a
+//! bare dest-native commit with no marker at all), a commit named by some
+//! `DestToSource` marker reachable from source's tip. The walk stops at the
+//! first unrepresented commit; the boundary is the commit before it, which
+//! may be B1 itself, a qualifying `SourceToDest` marker, or an accepted
+//! dest-native commit. This is what lets a branch created after `setup` and
+//! only later promoted into `config.branches` skip its parent's own
+//! already-mirrored commits instead of replaying them as phantom pending
+//! ones. Then for each pending dest commit merge source's current chain-tip
+//! tree (`ours`) against the dest commit's own tree (`theirs`), unfiltered
+//! (dest never holds source-only content), and push the result to source's
+//! own remote. A real content conflict hard-stops that branch
+//! (decisions/0007): whatever merged cleanly before the conflict is still
+//! pushed, and the conflicting commit is left for a human to resolve
+//! (decisions/0008), retried automatically on the next run once it is.
+//! Branches not in `config.branches` (e.g. a transient feature branch) never
+//! round-trip this way — decisions/0017's deliberate asymmetry — and no
+//! branch is ever deleted on either side.
 //!
 //! Same discovery convention as `setup` (decisions/0012): `cwd` is a
 //! starting point for git-style upward discovery, and a relative `--config`
@@ -96,7 +109,7 @@ use anchor::{
 };
 use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
-use marker_scan::newest_dest_marker;
+use marker_scan::dest_to_source_boundary;
 use policy_check::{find_control_file_policy_mismatch, policy_mismatch_message};
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
@@ -1635,17 +1648,26 @@ fn sync_pair_from_dest_with_key(
 
 /// Every dest commit still pending reconciliation onto source, oldest first,
 /// with loop-prevention already applied (decisions/0003) — exactly what
-/// [`sync_pair_from_dest`] would attempt to build next. Pulled out as its own
-/// function so `gitprism resolve` (decisions/0008, 0015) can compute the
-/// identical list — resolve and sync must never disagree about which dest
-/// commit is next.
+/// [`sync_pair_from_dest_with_key`] would attempt to build next. Pulled out
+/// as its own function so `gitprism resolve` (decisions/0008, 0015) can
+/// compute the identical list — resolve and sync must never disagree about
+/// which dest commit is next.
 ///
-/// `boundary` names a dest-space commit (via [`marker_scan::newest_dest_marker`]);
-/// it's verified to actually be an ancestor of (or equal to) `dest_tip`
-/// before trusting it to scope the walk — dest is fast-forward-only in
-/// normal operation (requirements/0001), so this should always hold, but a
-/// missing object or a genuine non-ancestor both mean something is wrong
-/// enough to fail loudly rather than silently mis-walk.
+/// The boundary comes from [`marker_scan::dest_to_source_boundary`]
+/// (decisions/0048): the end of the longest contiguous prefix of dest
+/// `branch`'s first-parent line, starting immediately after the dest commit
+/// source's own history names (B1), for which every commit is *represented*
+/// in `source_tip` — either it is itself a valid `SourceToDest` marker whose
+/// own source counterpart is reachable from `source_tip`, or a self-verified
+/// `DestToSource` marker reachable from `source_tip` (on any branch) names
+/// that exact dest commit. Not B1 alone, which would replay a branch's own
+/// already-mirrored history as phantom pending commits once it's been
+/// created after `setup` and later promoted into `config.branches`.
+/// `dest_to_source_boundary` itself enforces that B1 is an ancestor of (or
+/// equal to) `dest_tip` before trusting anything above it — dest is
+/// fast-forward-only in normal operation (requirements/0001), so this should
+/// always hold, but a missing object or a genuine non-ancestor both mean
+/// something is wrong enough to fail loudly rather than silently mis-walk.
 pub(crate) fn pending_dest_commits(
     repo: &Repository,
     source_tip: Oid,
@@ -1653,18 +1675,7 @@ pub(crate) fn pending_dest_commits(
     branch: &str,
     key: &marker::StateKey,
 ) -> Result<Vec<Oid>> {
-    let (_, boundary) = newest_dest_marker(repo, source_tip, branch, key)?;
-    if boundary != dest_tip {
-        let is_ancestor = repo.find_commit(boundary).is_ok()
-            && repo
-                .graph_descendant_of(dest_tip, boundary)
-                .with_context(|| format!("checking whether {dest_tip} descends from {boundary}"))?;
-        if !is_ancestor {
-            anyhow::bail!(
-                "gitprism sync: source's last-synced dest commit ({boundary}) isn't an ancestor of dest's current tip ({dest_tip})"
-            );
-        }
-    }
+    let boundary = dest_to_source_boundary(repo, source_tip, dest_tip, branch, key)?;
 
     let pending = pending_commits(repo, boundary, dest_tip)?;
     let mut result = Vec::with_capacity(pending.len());
@@ -1672,9 +1683,15 @@ pub(crate) fn pending_dest_commits(
         let commit = repo
             .find_commit(oid)
             .context("resolving a pending dest commit")?;
-        // Loop prevention (decisions/0003): a dest commit that itself came
-        // from source (source→dest sync) already exists on source — cherry-
-        // picking it back would loop.
+        // Loop prevention (decisions/0003) stays scoped to `branch`'s own
+        // name, unchanged by decisions/0048's widened boundary above: a dest
+        // commit that itself came from source (source→dest sync) *for this
+        // branch* already exists on source — cherry-picking it back would
+        // loop. Widening this to `verify_self` (matching the boundary check)
+        // would be wrong: a customer fast-forwarding a sibling branch's
+        // independent content into this one must still have that content
+        // reflected back into source under this branch's own name
+        // (decisions/0048's scenario 3).
         if marker::verify(&commit, branch, &[MarkerDirection::SourceToDest], None, key).is_none() {
             result.push(oid);
         }

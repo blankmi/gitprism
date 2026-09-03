@@ -711,16 +711,21 @@ fn sync_pair_from_dest_carries_dests_edit_onto_a_file_source_renamed() {
     );
 }
 
-// decisions/0048 (pending): the dest→source boundary must resume from
-// whichever of source's own inherited marker (B1) or a self-authenticated
-// SourceToDest marker reachable on dest's own line (B2) is newest — not B1
-// alone. The tests below are `docs/plans/2026-09-02/CODE-001-dest-to-source-
-// boundary.md`'s step 2: scenario 1 is the review's own repro, adopted
-// verbatim; scenarios 2, 3 and 5 fail against today's B1-only boundary for
-// the reason the plan predicts (a phantom conflict or an extra/missing
-// phantom commit — CODE-001, `docs/2026-09-02_REPOSITORY_REVIEW.md` §3);
-// scenarios 4 and 6 pin behavior the fix must *not* change (today's code
-// already gets these right) and are expected to pass already.
+// decisions/0048: the dest→source boundary is the end of the longest
+// contiguous prefix of dest's first-parent line, starting immediately after
+// source's own inherited marker (B1), for which every commit is
+// *represented* in source_tip — either a self-authenticated SourceToDest
+// marker whose own counterpart is reachable from source_tip (case 1), or a
+// self-verified DestToSource marker reachable from source_tip naming that
+// exact dest commit (case 2) — not B1 alone. The tests below are
+// `docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`'s step 2,
+// extended by decisions/0048's own scenarios 7-10: scenario 1 is the
+// review's own repro, adopted verbatim; scenarios 2, 3 and 5 fail against a
+// B1-only boundary for the reason the plan predicts (a phantom conflict or
+// an extra/missing phantom commit — CODE-001, `docs/2026-09-02_REPOSITORY_
+// REVIEW.md` §3); scenarios 4 and 6 pin behavior the fix must *not* change;
+// scenarios 7-10 (`dest_to_source_case_two...` and friends, below) cover the
+// represented-prefix model's case 2 and its interaction with case 1.
 
 #[test]
 fn mirror_only_branch_later_added_to_config_branches_only_reflects_dest_native_commits() {
@@ -1010,11 +1015,21 @@ fn dest_to_source_resumes_from_its_own_import_marker_when_nothing_new_has_landed
     // other candidate, so B1 wins without a walk being needed at all. A
     // second run must be a true no-op. Unlike scenarios 2/3/5, today's B1-
     // only code already gets this right — this pins that the fix must not
-    // regress it. An older SourceToDest marker (D, release's own first
-    // mirror) sits below B1 on dest's first-parent line so a broken
-    // implementation that forgot the B1 lower bound on the walk — and
-    // wandered past it looking for any B2 match — has something to
-    // wrongly land on instead of vacuously passing.
+    // regress it.
+    //
+    // This fixture does NOT exercise the walk's B1 lower bound: on dest
+    // release's own first-parent line, B1 is dest_tip itself (the customer's
+    // just-imported commit), so the walk terminates on its very first
+    // iteration and never inspects anything below B1 at all — release's own
+    // first mirror (D), further down, is never a candidate the walk even
+    // reaches. Verified empirically: disabling the B1 stop entirely does
+    // make this test fail, but not by silently resuming from D — it errors
+    // on the very first import already, once the walk for *that* boundary
+    // runs off dest's real history looking for a B1 nothing stops it at,
+    // hitting decisions/0019's first-parent-line bail
+    // (`marker_scan::dest_to_source_boundary`'s decisions/0048 refusal). The B1
+    // lower bound itself is covered directly, at the unit level, by
+    // `marker_scan::tests::ignores_a_qualifying_b2_shaped_marker_below_b1`.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
@@ -1144,11 +1159,13 @@ fn dest_to_source_stops_at_the_branchs_own_shared_base_not_an_inherited_earlier_
     // phantom: its own marker says branch "main", so branch-scoped loop
     // prevention never recognizes it as release's own already-had content,
     // and it gets replayed like CODE-001's other cases even though it's a
-    // pure no-op. D(s2) — dest release's own tip — must itself be rejected
-    // by the walk: its counterpart s2 is *not* an ancestor of source
-    // release's tip s1 (s2 comes after it). The boundary must instead
-    // resolve to D(s1) (self-verified, its counterpart *is* source
-    // release's own tip) — C0 and D(s2) are what's actually pending.
+    // pure no-op. The walk represents D(s1) (self-verified, its counterpart
+    // *is* source release's own tip s1) and then stops at C0 — the first
+    // unrepresented commit: dest-native, and nothing reachable from source
+    // release's own tip names it, since release has never imported anything
+    // yet. D(s2) — dest release's own tip — is never evaluated at all; the
+    // walk breaks at C0 before it ever gets there. The boundary therefore
+    // resolves to D(s1) — C0 and D(s2) are what's actually pending.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
@@ -1473,4 +1490,481 @@ fn dest_to_source_refuses_when_dest_is_force_rewound_past_an_already_imported_co
         );
     let message = format!("{err:#}");
     assert!(message.contains("isn't an ancestor of dest's current tip"));
+}
+
+#[test]
+fn dest_to_source_case_two_represents_an_imported_dest_native_commit_beneath_a_cross_branch_mirror_marker()
+ {
+    // decisions/0048's scenario 8: dest release's own first-parent line is
+    // graft (B1) -> C0 (a customer's dest-native commit) -> F (a real,
+    // authenticated SourceToDest mirror marker, but branded "main" — as if
+    // release had been aliased onto main's own mirrored history at that
+    // exact point, the way decisions/0043's sibling-anchoring can do — whose
+    // counterpart, release's own source tip, trivially satisfies case 1's
+    // ancestor check).
+    //
+    // Unlike round 1's insufficiency (covered by
+    // `marker_scan::tests::case_one_alone_does_not_represent_a_dest_native_commit_beneath_it`
+    // and this same fixture shape before this decision), C0 here really was
+    // imported first — a DestToSource marker reachable from release's
+    // source_tip names its exact oid — so case 2 represents it, and the
+    // boundary can legitimately advance all the way through C0 and F to
+    // dest_tip. `sync` must report nothing pending, not replay C0.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+
+    // release is cut from main's s1, with no commits of its own.
+    let s1 = add_commit_with_message(&source_repo, "main", &[("main.txt", "m1\n")], "s1");
+    source_repo
+        .branch("release", &source_repo.find_commit(s1).unwrap(), false)
+        .unwrap();
+    git::push(
+        source_repo.workdir().unwrap(),
+        &source_remote.path().display().to_string(),
+        s1,
+        "release",
+        PushMode::FastForwardOnly,
+    )
+    .unwrap();
+
+    // C0: a customer's dest-native commit landing directly on dest release,
+    // on top of the graft.
+    let c0 = add_independent_dest_commit_on(
+        &dest_repo,
+        "release",
+        d0,
+        ("customer.txt", "customer\n"),
+        "customer PR merged directly onto dest release",
+    );
+
+    // Import C0 into source *before* F exists — a DestToSource marker
+    // directly on release's own first-parent source line, satisfying case 2
+    // for C0 once F is checked below. Built by hand (not via
+    // `sync_pair_from_dest`) and branded "sibling", not "release": tagging
+    // it "release" would let `newest_dest_marker`'s own branch-scoped scan
+    // pick it up directly as B1, making the boundary trivially `dest_tip`
+    // via the precondition alone rather than via case 2 — confirmed
+    // empirically the same way as
+    // `marker_scan::tests::case_two_represents_a_dest_native_commit_that_a_reachable_marker_names`.
+    let import_parent = source_repo.find_commit(s1).unwrap();
+    let import_tree = import_parent.tree().unwrap();
+    let import_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+    let import_message = marker::build_message(
+        "gitprism sync: dest -> source",
+        MarkerDirection::DestToSource,
+        "sibling",
+        c0,
+        "Gitprism-Dest-Commit",
+        &[s1],
+        import_tree.id(),
+        &import_signature,
+        &import_signature,
+        &marker::load_key().unwrap(),
+    );
+    let tip_after_import = source_repo
+        .commit(
+            Some("refs/heads/release"),
+            &import_signature,
+            &import_signature,
+            &import_message,
+            &import_tree,
+            &[&import_parent],
+        )
+        .unwrap();
+    git::push(
+        source_repo.workdir().unwrap(),
+        &source_remote.path().display().to_string(),
+        tip_after_import,
+        "release",
+        PushMode::FastForwardOnly,
+    )
+    .unwrap();
+
+    let config = Config::load(
+        write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+
+    // F: a real, authenticated SourceToDest mirror marker on top of C0 —
+    // branded "main", standing in for release having been aliased onto
+    // main's own mirrored history — whose counterpart is exactly release's
+    // own source tip, s1.
+    let f = {
+        let parent_commit = dest_repo.find_commit(c0).unwrap();
+        let tree = parent_commit.tree().unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let message = marker::build_message(
+            "gitprism sync: source -> dest",
+            MarkerDirection::SourceToDest,
+            "main",
+            s1,
+            "Gitprism-Source-Commit",
+            &[c0],
+            tree.id(),
+            &signature,
+            &signature,
+            &marker::load_key().unwrap(),
+        );
+        dest_repo
+            .commit(
+                Some("refs/heads/release"),
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap()
+    };
+
+    // A second run must be a true no-op: C0 is represented via case 2, F via
+    // case 1, so the boundary is F (dest_tip) itself and nothing is pending.
+    let repo = Repository::open(source_dir.path()).unwrap();
+    sync_pair_from_dest(&repo, source_dir.path(), &config, "release", &reporter).expect(
+        "dest->source must be a no-op: C0 is already represented via case 2, and F via case 1",
+    );
+
+    let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+    let tip_after_second_run = source_remote_repo
+        .find_branch("release", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        tip_after_second_run, tip_after_import,
+        "F's own case-1 match, together with C0's case-2 match, must fully represent dest_tip — \
+         nothing further should be pushed to source"
+    );
+
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let key = marker::load_key().unwrap();
+    let boundary = dest_to_source_boundary(&repo, tip_after_import, f, "release", &key).unwrap();
+    assert_eq!(
+        boundary, f,
+        "the boundary must resolve to F itself (dest_tip), not stop at C0 or the graft"
+    );
+}
+
+#[test]
+fn dest_to_source_case_two_fails_when_native_content_was_never_imported_for_this_branch() {
+    // decisions/0048's scenario 7: dest release is cut before anything ever
+    // imports its native commit C0 — release's own source_tip never reaches
+    // any commit naming C0. Round 1's case 1 has nothing to say about C0 (it
+    // carries no marker at all), and case 2 also fails (nothing reachable
+    // from source_tip names C0's oid). The boundary must stay at B1 (the
+    // graft), and C0 must genuinely be reflected into source — not silently
+    // dropped, and not deferred forever.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+
+    // release is cut from main's s1, before anything ever imports C0.
+    let s1 = add_commit_with_message(&source_repo, "main", &[("main.txt", "m1\n")], "s1");
+    source_repo
+        .branch("release", &source_repo.find_commit(s1).unwrap(), false)
+        .unwrap();
+    git::push(
+        source_repo.workdir().unwrap(),
+        &source_remote.path().display().to_string(),
+        s1,
+        "release",
+        PushMode::FastForwardOnly,
+    )
+    .unwrap();
+
+    // C0: a customer's dest-native commit, never imported anywhere.
+    let c0 = add_independent_dest_commit_on(
+        &dest_repo,
+        "release",
+        d0,
+        ("customer.txt", "customer\n"),
+        "customer PR merged directly onto dest release",
+    );
+
+    let config = Config::load(
+        write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+    sync_pair_from_dest(&repo, source_dir.path(), &config, "release", &reporter)
+        .expect("C0 must be genuinely reflected into source, not silently skipped");
+
+    let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+    let new_tip = source_remote_repo
+        .find_branch("release", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    assert!(
+        new_tip
+            .message()
+            .unwrap()
+            .contains(&format!("Gitprism-Dest-Commit: {c0}")),
+        "the boundary must resolve past C0 by actually reflecting it into source from B1, not \
+         by treating it as already represented"
+    );
+    let mut revwalk = source_remote_repo.revwalk().unwrap();
+    revwalk.push(new_tip.id()).unwrap();
+    revwalk.hide(s1).unwrap();
+    assert_eq!(
+        revwalk.count(),
+        1,
+        "only C0 should be reflected into source release"
+    );
+}
+
+#[test]
+fn dest_to_source_bare_dest_native_commit_is_a_valid_boundary_when_it_is_dest_tip() {
+    // decisions/0048's scenario 9: dest release's first-parent line is B1 ->
+    // C0, and dest_tip *is* C0 itself — no later mirror or marker commit at
+    // all. C0 is represented purely via case 2 (a DestToSource marker
+    // reachable from release's own source_tip names it, branded "sibling"
+    // so it doesn't also double as B1's own branch-scoped match — see
+    // `marker_scan::tests::bare_dest_native_commit_is_a_valid_boundary_in_its_own_right`'s
+    // doc comment). The boundary must resolve to dest_tip itself, a shape
+    // the pre-0048 B1-or-B2 formulation never named.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+
+    let s1 = add_commit_with_message(&source_repo, "main", &[("main.txt", "m1\n")], "s1");
+    source_repo
+        .branch("release", &source_repo.find_commit(s1).unwrap(), false)
+        .unwrap();
+    git::push(
+        source_repo.workdir().unwrap(),
+        &source_remote.path().display().to_string(),
+        s1,
+        "release",
+        PushMode::FastForwardOnly,
+    )
+    .unwrap();
+
+    // C0: a bare customer commit, nothing above it on dest's line.
+    let c0 = add_independent_dest_commit_on(
+        &dest_repo,
+        "release",
+        d0,
+        ("customer.txt", "customer\n"),
+        "customer PR merged directly onto dest release",
+    );
+
+    // Import C0 by hand, branded "sibling" — case 2's proof, deliberately
+    // not "release" itself.
+    let import_parent = source_repo.find_commit(s1).unwrap();
+    let import_tree = import_parent.tree().unwrap();
+    let import_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+    let import_message = marker::build_message(
+        "gitprism sync: dest -> source",
+        MarkerDirection::DestToSource,
+        "sibling",
+        c0,
+        "Gitprism-Dest-Commit",
+        &[s1],
+        import_tree.id(),
+        &import_signature,
+        &import_signature,
+        &marker::load_key().unwrap(),
+    );
+    let tip_after_import = source_repo
+        .commit(
+            Some("refs/heads/release"),
+            &import_signature,
+            &import_signature,
+            &import_message,
+            &import_tree,
+            &[&import_parent],
+        )
+        .unwrap();
+    git::push(
+        source_repo.workdir().unwrap(),
+        &source_remote.path().display().to_string(),
+        tip_after_import,
+        "release",
+        PushMode::FastForwardOnly,
+    )
+    .unwrap();
+
+    let config = Config::load(
+        write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+    sync_pair_from_dest(&repo, source_dir.path(), &config, "release", &reporter)
+        .expect("dest_tip == C0 must resolve as a no-op — C0 is already represented via case 2");
+
+    let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+    let tip_after_run = source_remote_repo
+        .find_branch("release", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        tip_after_run, tip_after_import,
+        "nothing further should be pushed to source — C0 already represents dest_tip"
+    );
+}
+
+#[test]
+fn dest_to_source_case_one_and_two_both_fail_for_a_marker_reachable_only_from_a_sibling_branch() {
+    // decisions/0048's scenario 10: a SourceToDest marker D(sX) sits on dest
+    // release's line, naming a real, locally present commit (sX) reachable
+    // only from main's own source tip, not release's own. Branded "main"
+    // (not "release") so loop prevention — scoped to release's own branch
+    // name — doesn't independently drop it before the boundary walk is even
+    // exercised (`pending_dest_commits`'s own filter stays scoped to
+    // `branch`'s own name, decisions/0048's "Decision"). Case 1 fails (sX
+    // isn't an ancestor of release's own source_tip); case 2 fails too
+    // (nothing reachable from release's own source_tip names D(sX)'s own
+    // oid). D(sX) must not be silently treated as already imported.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+
+    // release is cut from the graft itself, before main's own sX exists.
+    source_repo
+        .branch("release", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    git::push(
+        source_repo.workdir().unwrap(),
+        &source_remote.path().display().to_string(),
+        graft,
+        "release",
+        PushMode::FastForwardOnly,
+    )
+    .unwrap();
+
+    // main gets its own later commit — never reachable from release's own
+    // source tip.
+    let s_x = add_commit_with_message(&source_repo, "main", &[("main.txt", "m1\n")], "sX");
+
+    // D(sX): a real, authenticated SourceToDest marker on dest release,
+    // naming sX.
+    let d = {
+        let parent_commit = dest_repo.find_commit(d0).unwrap();
+        let tree = parent_commit.tree().unwrap();
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let message = marker::build_message(
+            "gitprism sync: source -> dest",
+            MarkerDirection::SourceToDest,
+            "main",
+            s_x,
+            "Gitprism-Source-Commit",
+            &[d0],
+            tree.id(),
+            &signature,
+            &signature,
+            &marker::load_key().unwrap(),
+        );
+        dest_repo
+            .commit(
+                Some("refs/heads/release"),
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap()
+    };
+
+    let config = Config::load(
+        write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+    sync_pair_from_dest(&repo, source_dir.path(), &config, "release", &reporter).expect(
+        "D(sX) must not be silently treated as already imported; it must be reflected into \
+         source like any other unrepresented commit",
+    );
+
+    let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+    let new_tip = source_remote_repo
+        .find_branch("release", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    assert!(
+        new_tip
+            .message()
+            .unwrap()
+            .contains(&format!("Gitprism-Dest-Commit: {d}")),
+        "D(sX) must itself be reflected into source, proving it was never treated as an \
+         already-represented boundary"
+    );
 }
