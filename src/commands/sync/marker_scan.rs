@@ -167,3 +167,9 @@ pub(super) fn newest_source_marker(
 
     Ok(None)
 }
+
+// TODO(plan `docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`,
+// step 4): once `dest_to_source_boundary` exists here, add unit tests
+// covering the `MAX_MARKER_SCAN_COMMITS` bail on the dest-side walk and
+// scenario 6 (B1 missing from the local odb; dest force-rewound behind an
+// already-imported B1 whose older tip would otherwise satisfy B2).
