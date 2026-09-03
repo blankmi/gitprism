@@ -2611,3 +2611,37 @@ its own regression.
 
 Gates on the finished tree: fmt, clippy `-D warnings`, `cargo test` at 338
 passing (up from 335), and `cargo build --release --locked`, all clean.
+
+## 2026-09-03 — dest→source resumes from the newest authenticated boundary (0048)
+
+**Decided [decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)**,
+step 3 of `docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`, fixing
+the 2026-09-02 repository review's CODE-001 (HIGH/P0): a branch cut from a
+round-tripped branch after `setup`, later added to `config.branches`,
+inherits only the parent's `Setup` graft in its own first-parent history, so
+`pending_dest_commits` (`src/commands/sync/mod.rs`) resumes from dest's tip
+at setup time — every dest commit since, including commits gitprism itself
+mirrored from the parent branch, becomes pending, and each hard-stops the
+branch on a phantom conflict once it collides with the parent's own already-
+synced content. `setup` refuses to re-graft such a branch (it already carries
+an inherited `Setup`/`DestToSource` marker), so there was no supported
+recovery. Reproduced by execution in the review's Appendix.
+
+The boundary becomes the newest commit on dest's first-parent line that is
+either B1 (today's `Setup`/`DestToSource` marker boundary, unchanged) or B2
+(a `SourceToDest` marker commit, self-verified against its own recorded
+branch via `marker::verify_self`, whose source counterpart is an ancestor of
+source's current tip via `graph_descendant_of`). B1 stays a precondition,
+checked before any dest-side walk for B2 runs, so a dest branch force-rewound
+behind an already-imported commit is refused exactly as today rather than
+silently accepted — the first draft of the plan missed this and was revised
+before this decision was written (plan's own revision history). Loop
+prevention inside `pending_dest_commits` stays scoped to the branch's own
+name; widening it to `verify_self` would drop a fast-forwarded sibling
+branch's independent content instead of reflecting it back (scenario 3 in the
+plan). Rejected deriving the boundary from decisions/0046's mapping index,
+built only after dest→source runs by that decision's own ordering.
+
+`design/decisions/index.md` gains the 0048 entry; no code changed. Step 4
+implements `marker_scan::dest_to_source_boundary` and wires it into
+`pending_dest_commits`.
