@@ -2964,11 +2964,11 @@ B1-bounded range are corrected to describe the whole first-parent line.
 Decision 0048's addendum (its own "Decision" condition 2 and "Rejected
 mid-flight" bullet, both of which described the range-bounded rule), its
 front-matter description, and `design/decisions/index.md`'s 0048 entry are
-all updated to match — the decision file gains a new "Corrected after this
-addendum was committed" section, distinct from the addendum's existing
-"Rejected mid-flight, before either was committed" list, since (unlike every
-earlier correction in this decision's own history) this one was found after
-the code it corrects had already been committed.
+all updated to match — the decision file gains a new "Corrected by a second
+review, also before commit" section, distinct from the addendum's existing
+"Rejected mid-flight, before either was committed" list, since this one was
+found by a second review of the addendum, still before any of it was ever
+committed.
 
 Full suite: 369 passed (368 before this round, plus the one new regression
 test), all five of step 5's own tests (the positive round-trip test, the
@@ -2978,3 +2978,29 @@ regression test) still passing under the corrected whole-line logic;
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
 --all-features -- -D warnings` clean; `cargo build --release --locked`
 succeeds.
+
+## 2026-09-03 — CODE-001 closed
+
+`docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md` is fully
+implemented (steps 1-6). Original finding: a branch cut from a
+round-tripped branch after `setup`, later added to `config.branches`,
+inherited only the parent's `Setup` graft, so `pending_dest_commits` resumed
+from dest's tip at setup time and replayed the parent's own already-mirrored
+commits into a phantom conflict, with no supported recovery (`setup` refuses
+to re-graft a branch carrying an inherited marker). [Decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+fixed the dest→source boundary itself (step 4: the represented-prefix walk,
+after two more predicates were found insufficient and rejected before either
+was committed) and then, by its own 2026-09-03 addendum (step 5), widened
+source→dest's push-safety gate to agree with it (three more review-found
+bugs — a stale-boundary disjunct, a whole-run-abort, and a range mismatch —
+fixed before commit), so a
+promoted branch now round-trips both directions in one run. Step 6 removes
+the interim limitation notes this plan's step 1 put in `README.md` and
+`design/requirements/0001-workflow-and-scope.md`, replacing them with the
+now-supported path (add the branch, run `sync`; `setup` is not involved) and
+a pointer to decisions/0048.
+
+Full suite: 369 passed (unchanged from the previous entry — this step is
+doc-only); `cargo fmt --all -- --check` and `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo build --release
+--locked` succeeds.

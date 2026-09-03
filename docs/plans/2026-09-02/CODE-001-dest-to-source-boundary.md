@@ -8,7 +8,7 @@
 | Decision required | Yes — new decision 0048, written before step 3 |
 | Depends on | — |
 | Unblocks | Round-tripping any branch created after `setup` |
-| Status | Proposed |
+| Status | Implemented 2026-09-03 (steps 1-6) |
 
 ## Problem
 

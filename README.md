@@ -265,7 +265,12 @@ url = "git@example.com:group/dest.git"
 
 * **`branches`** — the branches `dest → source` watches for independent
   changes to bring back into source. (`source → dest` doesn't read this list;
-  it discovers and mirrors every branch on source automatically.)
+  it discovers and mirrors every branch on source automatically.) The list
+  can grow later: a branch mirrored to dest before it was configured (e.g.
+  cut from an existing round-tripped branch) doesn't need `setup` run against
+  it — add its name here and run `sync`, which resumes it from the newest
+  authenticated boundary on either side
+  ([decisions/0048](design/decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)).
 * **`[committer]`** *(required)* — the identity gitprism stamps as committer
   on every commit it creates. The original author is preserved untouched;
   gitprism only ever stamps itself as committer, the same way `git`'s own
@@ -327,16 +332,6 @@ introduce a brand-new file under a path source excludes entirely (a CI config
 directory, say). That file lands in source exactly as dest committed it and
 may run in source's own CI. Treat dest as capable of adding, not just
 reflecting, content in source.
-
-**Current limitation:** `branches` must be complete before `setup` runs.
-`setup` is not a way to add one later: it refuses only when the branch's tip
-is still gitprism's own marker commit, and otherwise re-grafts — creating a
-second `setup` merge on that branch and on `main`. Neither is supported;
-`sync` also mis-syncs a branch added this way — dest→source picks the wrong
-resume boundary and can hard-stop on a phantom conflict. See
-[`docs/2026-09-02_REPOSITORY_REVIEW.md`](docs/2026-09-02_REPOSITORY_REVIEW.md),
-section 3, CODE-001, and the fix plan,
-[`docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`](docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md).
 
 ## Excluding paths: `.gitprismignore`
 

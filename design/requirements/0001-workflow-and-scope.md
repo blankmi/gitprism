@@ -65,14 +65,12 @@ finalized — see open questions).
   [decisions/0010](../decisions/0010-preserve-author-stamp-committer.md).
 * ~~Exact exclude-list filename/syntax~~ — resolved, see
   [decisions/0011](../decisions/0011-exclude-list-is-gitignore-syntax.md).
-* Can a branch be added to `branches` after `setup` has already run for the
-  others? Not as a supported path — `setup` refuses only when the branch's
-  tip is still gitprism's own marker commit, and otherwise re-grafts (a
-  second `setup` merge on that branch and on `main`); `sync` also mis-syncs
-  it. See
-  [`docs/2026-09-02_REPOSITORY_REVIEW.md`](../../docs/2026-09-02_REPOSITORY_REVIEW.md),
-  section 3, CODE-001, and the fix plan,
-  [`docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`](../../docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md).
+* ~~Can a branch be added to `branches` after `setup` has already run for the
+  others?~~ — resolved, see
+  [decisions/0048](../decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md):
+  yes, for a branch already mirrored to dest — `setup` is not involved; add
+  the branch and run `sync`, which resumes it from the newest authenticated
+  boundary on either side.
 
 # Cited by
 
