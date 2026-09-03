@@ -993,9 +993,9 @@ fn mirror_only_skip_note(landing: &str) -> String {
 /// directions, since both now go through the same `git merge-tree` primitive
 /// and therefore cannot disagree about what a conflict is (decisions/0007,
 /// decisions/0016).
-struct Conflict {
-    commit: Oid,
-    paths: Vec<String>,
+pub(crate) struct Conflict {
+    pub(crate) commit: Oid,
+    pub(crate) paths: Vec<String>,
 }
 
 /// The result of [`build_pending_dest_tip`]: `new_tip` is the chain's tip if
@@ -1004,14 +1004,14 @@ struct Conflict {
 /// names the first source commit that couldn't be merged cleanly onto dest,
 /// if any (decisions/0007, decisions/0016) — processing always stops there
 /// (decisions/0007's "Consequences": later commits may depend on it).
-struct PendingDestBuild {
-    new_tip: Option<Oid>,
+pub(crate) struct PendingDestBuild {
+    pub(crate) new_tip: Option<Oid>,
     /// `(source oid, dest oid)` for every commit actually built this call —
     /// `build_dest_commit`'s own trusted output, recorded into the mapping
     /// index directly on push acceptance rather than re-read and
     /// re-verified from the repo (decisions/0046, F-C).
     generated_mappings: Vec<(Oid, Oid)>,
-    conflict: Option<Conflict>,
+    pub(crate) conflict: Option<Conflict>,
 }
 
 /// Builds, in `repo`'s object database, a chain of new commits reflecting
@@ -1063,7 +1063,7 @@ pub(super) fn loop_prevented(commit: &git2::Commit, key: &marker::StateKey) -> b
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_pending_dest_tip(
+pub(crate) fn build_pending_dest_tip(
     repo: &Repository,
     config: &Config,
     exclude_list: &ExcludeList,
