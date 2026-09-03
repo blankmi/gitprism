@@ -2645,3 +2645,95 @@ built only after dest→source runs by that decision's own ordering.
 `design/decisions/index.md` gains the 0048 entry; no code changed. Step 4
 implements `marker_scan::dest_to_source_boundary` and wires it into
 `pending_dest_commits`.
+
+## 2026-09-03 — step 4 code review: B2 needed no dest-native commit beneath it (0048 amendment)
+
+A code review of step 4's implementation found the B2 predicate as decided
+insufficient: `verify_self` plus `graph_descendant_of(source_tip,
+counterpart)` alone only proves the *candidate commit's own* source
+counterpart is reachable — not that everything beneath it, on *this*
+branch's own dest history, was ever imported. The "Why" section's
+`dest_tip_accounted_for` argument only holds for the branch a marker
+commit was actually pushed for, not for an arbitrary later branch
+mirror-aliased onto the same dest commit. Reproduced end to end via
+`sync::run`, no hand-crafted markers: a dest-native commit imported on one
+branch, then a later branch mirror-aliased past it, left the later
+branch's own dest-native content — a customer commit added after the
+alias — silently unreflected, with `sync` reporting "nothing new to
+reflect back."
+
+Specified as an amendment to
+[decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+— found flawed and superseded by the corrected model (below) before it was
+ever committed to the file itself.
+A B2 candidate now also needs no dest-native commit — one that isn't
+itself a valid, self-verified `SourceToDest` marker — sitting strictly
+between B1 and it; `marker_scan::dest_to_source_boundary` finds the newest
+qualifying candidate within the contiguous run of markers starting
+immediately above B1, and the first dest-native commit in that run ends
+it. A related gap in the same review — the walk is first-parent-only but
+its B1 precondition checks full ancestry, so a B1 reachable only via a
+non-first-parent merge could run the walk off dest's history with a raw
+error — is fixed alongside: the walk now bails clearly, naming
+decisions/0019's first-parent limitation, once it exhausts dest's
+first-parent line without reaching B1.
+
+A regression test
+(`dest_to_source_does_not_drop_dest_native_content_beneath_a_cross_branch_mirror_marker`
+in `src/commands/sync/tests/dest_to_source.rs`) reproduces the review's
+scenario end to end and was verified to fail against the pre-amendment
+code with exactly the reported symptom. Scenario 4's existing test
+(`dest_to_source_resumes_from_its_own_import_marker_when_nothing_new_has_landed`)
+had a comment claiming it caught a missing B1 lower bound; verified false
+(disabling the bound still fails the fixture, but earlier, and for the
+new first-parent-line reason above, not by silently resuming from an
+older marker) — the comment now says so, and a dedicated unit test
+(`ignores_a_qualifying_b2_shaped_marker_below_b1` in `marker_scan.rs`)
+isolates the lower bound itself.
+
+Gates on the finished tree: fmt, clippy `-D warnings`, `cargo test
+--workspace --all-features` at 356 passing (up from 354), and `cargo build
+--release --locked`, all clean.
+
+## 2026-09-03 — 0048's dest-native-disqualification amendment itself corrected
+
+The project owner reviewed the previous entry's amendment and found it also
+wrong, before any of it was committed: "unimported dest-native commit" is
+narrower than the real invariant. Disqualifying *any* dest-native commit
+between B1 and a B2 candidate cannot distinguish one source has already
+imported (via a marker reachable from `source_tip` that lives on a different
+branch's dest line) from one it hasn't — so it stops the frontier at the
+first native commit unconditionally, reintroducing CODE-001's own headline
+symptom for any branch descended from a parent that has imported dest-native
+content, exactly the scenario this decision exists to fix. It also had no
+way to name a bare dest-native `dest_tip` (with nothing later) as a boundary
+at all.
+
+[Decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+is rewritten in place (Decision, Why, Consequences, and a new Rejected
+alternatives section) to the corrected model: the boundary is the end of the
+longest contiguous prefix of dest's first-parent line past B1 for which every
+commit is proven **represented** in `source_tip` — a `SourceToDest` marker
+represented via its own counterpart's reachability (case 1, unchanged from
+the first round), any other commit (dest-native, or an invalid/unauthenticated
+marker) represented only via a self-verified `DestToSource` marker reachable
+from `source_tip`, regardless of its own recorded branch, naming that exact
+dest oid (case 2, new). The walk stops at the first unrepresented commit; the
+boundary is the commit before it, which may now be an accepted dest-native
+commit, not only a marker. This is the same branch-agnostic-authentication/
+branch-specific-reachability invariant decisions/0043's 2026-08-27 addendum
+(F-04) already established for the mirror-image problem, cited directly.
+Both rejected rounds — the bare ancestor check and the blanket
+disqualification rule — are recorded in the decision's new "Rejected
+alternatives" section with the worked `source: s3 ── M(C0)` /
+`dest: C0 ── D(s3)` example showing why case 1 alone under- and
+over-shoots depending on branch-cut timing. Four required test scenarios
+(the two branch-cut timings around `M(C0)`, `dest_tip == C0` with no later
+marker, and an authenticated `SourceToDest` marker unreachable from this
+branch's own `source_tip`) are specified in the decision for the
+implementation rework.
+
+`design/decisions/index.md`'s 0048 entry is updated to match. Decision-only
+change: `src/commands/sync/marker_scan.rs` and its tests still encode the
+now-rejected round-2 rule as of this entry; rewriting them against the
+corrected model is CODE-001 step 4's rework, not done here.

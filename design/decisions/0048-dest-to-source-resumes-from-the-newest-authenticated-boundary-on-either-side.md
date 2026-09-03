@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: dest-to-source resumes from the newest authenticated boundary on either side
-description: Fixes CODE-001 (docs/2026-09-02_REPOSITORY_REVIEW.md, section 3) — a branch cut from a round-tripped branch after `setup`, later added to `config.branches`, only inherited the parent's `Setup` graft, so `pending_dest_commits` replayed the parent's own mirrored commits and hard-stopped on a phantom conflict, with no supported path since `setup` refuses a branch that already carries an inherited marker. `pending_dest_commits`'s boundary is now the newest commit on dest's first-parent line that is either the existing `Setup`/`DestToSource` marker boundary or a self-verified `SourceToDest` marker whose source counterpart is an ancestor of source's current tip — computed only after the existing boundary is confirmed to still be on dest's line, so a force-rewound dest tip is refused exactly as before rather than silently accepted.
+description: Fixes CODE-001 (docs/2026-09-02_REPOSITORY_REVIEW.md, section 3) — a branch cut from a round-tripped branch after `setup`, later added to `config.branches`, only inherited the parent's `Setup` graft, so `pending_dest_commits` replayed the parent's own mirrored commits and hard-stopped on a phantom conflict, with no supported path since `setup` refuses a branch that already carries an inherited marker. The dest→source boundary is now the end of the longest contiguous prefix of dest's first-parent line, starting immediately after the existing `Setup`/`DestToSource` marker boundary (B1), for which every commit is proven **represented** in source's current tip: a commit is represented when either it is itself a valid `SourceToDest` marker whose own source counterpart is reachable from source's tip (case 1), or a self-verified `DestToSource` marker reachable from source's tip — regardless of that marker's own recorded branch — names that exact dest commit (case 2); a `SourceToDest` marker whose own counterpart isn't reachable can still be represented by case 2, so the two cases are not a partition by commit shape — only a dest-native or invalid/unauthenticated marker commit is restricted to case 2 alone, because it can never satisfy case 1 at all. The walk stops at the first unrepresented commit; the boundary is the commit before it, which may be B1 itself, a qualifying `SourceToDest` marker, or an accepted dest-native commit. Supersedes two insufficient predicates found during implementation, before either was committed: a bare ancestor check on each marker's own counterpart (blind to dest-native content skipped when a branch is mirror-aliased onto another branch's marker), and a blanket "any dest-native commit disqualifies" rule (cannot distinguish an imported dest-native commit from an unimported one, reintroducing CODE-001's own bug for any branch descended from a parent with import history).
 tags: [architecture, branches, markers, dest-to-source]
 status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-09-03T00:00:00Z }
@@ -56,44 +56,115 @@ comparing branch topology — but that index is built only after dest→source
 has already run (0046, "Configured dest-to-source processing remains first");
 dest→source itself has no equivalent to anchor on.
 
+Implementing this decision (CODE-001 step 4) went through two more rounds,
+both found wrong before either was ever committed. The first draft's B2
+predicate — a `SourceToDest` marker commit, self-verified against its own
+recorded branch, whose own source counterpart is an ancestor of `source_tip`
+— is not sufficient by itself: it proves the *candidate's own* counterpart is
+reachable, not that everything on this branch's dest history beneath it was
+ever imported for this branch. A branch mirror-aliased onto another branch's
+own mirror commit (an anchor decisions/0046's nearest-exact-mapping
+resolution can select, made self-accounting for the new branch by
+decisions/0044's own-branch alias marker) can pass that check while a
+dest-native commit sitting underneath was never imported *for it*. A
+same-day fix attempted to close that gap by disqualifying any B2 candidate
+with a dest-native commit anywhere between it and B1. That over-corrected:
+"dest-native commit" cannot
+distinguish a commit source has already imported (via some marker reachable
+from `source_tip` that isn't itself on this branch's dest line) from one it
+hasn't, so it stops the walk at the first native commit unconditionally —
+reintroducing, for any branch ever descended from a parent with import
+history, exactly the phantom-resume symptom this decision exists to fix. The
+model below (the project owner's own specification) replaces both attempts
+with a per-commit proof rule that tells the two cases apart.
+
 # Decision
 
-The dest→source boundary for branch `B` is the **newest commit on dest `B`'s
-first-parent line** that is either:
+The dest→source boundary for branch `B` is the end of the **longest
+contiguous prefix of dest `B`'s first-parent line, starting immediately after
+B1**, for which every commit is **represented** in source `B`'s current tip
+(`source_tip`).
 
-1. **B1** — the dest commit named by the newest `Setup`/`DestToSource` marker
-   on source `B`'s first-parent line: today's boundary, `newest_dest_marker`'s
-   unchanged result.
-2. **B2** — a `SourceToDest` marker commit, self-verified against its own
-   recorded branch (`marker::verify_self`, not `B`'s name), whose source
-   counterpart is an ancestor of (or equal to) source `B`'s current tip
-   (`repo.graph_descendant_of`).
+**B1** is unchanged: the dest commit named by the newest `Setup`/
+`DestToSource` marker on source `B`'s first-parent line (`newest_dest_marker`,
+`scan_for_dest_marker`). It remains a precondition, checked first and
+unconditionally, exactly as `pending_dest_commits` enforces today: if B1 is
+missing from the local object database, or `graph_descendant_of(dest_tip,
+B1)` is false (and `B1 != dest_tip`), refuse with today's "isn't an ancestor
+of dest's current tip" message before any further walk.
 
-B1 remains a precondition, exactly as `pending_dest_commits` enforces today:
-if B1 is missing from the local object database, or
-`graph_descendant_of(dest_tip, B1)` is false (and `B1 != dest_tip`), refuse
-with today's "isn't an ancestor of dest's current tip" message before any
-further walk. Only once B1 is confirmed does a second, bounded walk of dest's
-first-parent line run — from `dest_tip` down to B1 inclusive, newest first,
-stopping at the first commit satisfying B2. If none does, the boundary stays
-B1. This second walk is bounded both by reaching B1 and by
-`MAX_MARKER_SCAN_COMMITS`, the same static limit every other marker scan in
-this codebase uses ([decisions/0032](0032-bounded-repository-controlled-data.md)).
+Only once B1 is confirmed does a second, bounded walk of dest `B`'s
+first-parent line run, from the commit immediately above B1 up toward
+`dest_tip`, testing each commit in turn for representation.
 
-The precondition on B1 is what keeps this fail-closed rather than opening a
-new hole. Without it, a dest branch force-rewound to an older commit that is
-itself a valid `SourceToDest` marker whose counterpart is an ancestor of
-source's tip would be accepted as B2 before the walk could ever reach the
-newer, already-imported commit B1 names — silently reintroducing the exact
-divergence today's ancestor check exists to catch. B1's precondition is
-checked first, unconditionally, so this can't happen: a dest tip that fails
-it is refused before B2 is ever evaluated.
+Locating B1 on that first-parent line is itself part of this walk, and it
+can fail even after the precondition above has passed: the B1 precondition
+is a full-ancestry `graph_descendant_of` check, but the walk that has to
+find "the commit immediately above B1" moves first-parent-only, and
+decisions/0019's documented limitation (a tracked branch must stay
+first-parent of its own merges for a marker scan to see it) applies to this
+walk exactly as it already applies to `newest_dest_marker`'s own scan. A B1
+that is a real ancestor of `dest_tip` only via a non-first-parent merge is
+never reached by this walk. If dest `B`'s first-parent line is exhausted —
+its root commit reached, or `MAX_MARKER_SCAN_COMMITS` hit — without ever
+encountering B1 itself, this is a clear, named refusal citing
+decisions/0019's first-parent limitation, not a raw walked-off-the-end
+error and not a silent fallback to some other boundary.
+
+**A dest commit `D` is represented in `source_tip` when either:**
+
+1. `D` is a valid `SourceToDest` marker, self-verified against its own
+   recorded branch (`marker::verify_self`, not necessarily `B`'s own name),
+   whose source counterpart is an ancestor of, or equal to, `source_tip`
+   (`repo.graph_descendant_of`). A counterpart oid absent from the local
+   object database (e.g. a sibling branch's source commit this clone never
+   fetched) simply disqualifies `D` from case 1 — it does not end the walk,
+   halt the run, or fall back to case 2 on its own; `D` may still qualify
+   via case 2 below; or
+2. A valid, self-verified `DestToSource` marker — self-verified the same way,
+   against its own recorded branch, whatever that is — reachable from
+   `source_tip` on source's first-parent history (decisions/0019) carries a
+   `Gitprism-Dest-Commit` trailer naming `D`'s exact oid, regardless of that
+   marker's own recorded branch.
+
+(Case 2 deliberately names `DestToSource` only, not `Setup`: a `Setup` graft
+is already B1's own baseline or below it — `setup` runs once
+(decisions/0006, 0012) — so a case-2 search above B1 would never find one
+that case 1 or B1 itself hasn't already accounted for.)
+
+| Commit between B1 and the proposed boundary | Required proof |
+| --- | --- |
+| `SourceToDest` marker | Case 1 (its own counterpart reachable from `source_tip`), **or** case 2 (an inherited marker reachable from `source_tip` names this exact dest commit) |
+| Dest-native commit (no marker at all) | Case 2 only |
+| Invalid or unauthenticated marker (fails `verify_self`) | Treated as dest-native: case 2 only |
+
+The walk stops at the **first commit represented by neither case**. The
+boundary is the commit immediately before it — which may be:
+
+* B1 itself, if the very first commit above B1 is already unrepresented;
+* a qualifying `SourceToDest` marker — case 1 (today's B2) if its own
+  counterpart is reachable, or case 2 if it isn't but an inherited marker
+  names it anyway; or
+* an accepted **dest-native commit**, proven only by case 2 (it can never
+  satisfy case 1, having no `SourceToDest` counterpart of its own) — a
+  boundary shape the earlier B1/B2-only formulation never named in its own
+  right.
+
+If every commit up to `dest_tip` is represented, the boundary is `dest_tip`
+itself.
+
+Both the outer walk (dest's first-parent line, B1 to `dest_tip`) and each
+case-2 inner search (source's first-parent line, from `source_tip`) are
+independently bounded by `MAX_MARKER_SCAN_COMMITS`
+([decisions/0032](0032-bounded-repository-controlled-data.md)), the same
+static limit every other marker scan in this codebase uses. Reaching either
+limit before a definite answer is a limit error, not a guess.
 
 Loop prevention inside `pending_dest_commits` — filtering out a pending
 commit that itself carries a `SourceToDest` marker for `branch` — stays
 scoped to `branch`'s own name, unchanged. This decision only widens the
-*boundary* B2 can name; it does not change which pending commits are dropped
-once the boundary is found. Widening loop prevention itself to
+*boundary* the walk can name; it does not change which pending commits are
+dropped once the boundary is found. Widening loop prevention itself to
 `verify_self` (accepting any branch's `SourceToDest` marker, not just `B`'s
 own) would be a different, wrong fix: a customer fast-forwarding dest
 `release` into dest `main` must still import `release`'s independent content
@@ -104,58 +175,86 @@ of reflecting it back.
 
 # Why
 
-* **Dest's first-parent line is the only place both candidate boundaries are
-  directly comparable.** B1 and B2 are each expressed on a different side —
-  B1 is discovered on *source*'s history and only then checked against dest;
-  B2 lives natively on *dest*'s history. Neither side's own history orders
-  them against each other; only a single revwalk of dest's first-parent line,
-  newest-to-oldest, can ask "which of these did I reach first."
-* **`verify_self` plus the ancestor check is what makes trusting an inherited
-  marker safe.** A `SourceToDest` marker commit on the new branch's dest
-  history was written by source→dest for whatever branch it was mirroring at
-  the time (`main`, not the new branch) — `marker::verify` against the new
-  branch's own name would reject it outright, by design (decisions/0003's
-  per-branch scoping). `verify_self` (decisions/0046, its addendum
-  introducing exactly this self-verification shape for an inherited marker)
-  authenticates it against its *own* recorded branch instead, so the HMAC
-  still proves it's a genuine gitprism commit, just not necessarily this
-  branch's own. That alone isn't sufficient — an inherited marker only means
-  "source, at some point, definitely knew about the source commit this dest
-  commit was built from," not "source knows about it *now*." The
-  `graph_descendant_of(source_tip, counterpart)` check supplies the missing
-  half: source's current tip must still descend from that source commit, so
-  resuming from this dest commit can never skip content source no longer has
-  reachable, or has since diverged from.
-* **A qualifying B2 can never sit above an unimported dest-native commit.**
-  `dest_tip_accounted_for` (`src/commands/sync/anchor.rs:62-102`) only lets
-  source→dest push a mirror commit onto a dest tip gitprism already
-  recognizes: the tip is itself a marker (case 1), the tip is exactly the
-  setup graft (case 2), or source's own history already carries a
-  `Gitprism-Dest-Commit` trailer naming that tip exactly, i.e. dest→source
-  already imported it (case 3). So any dest-native commit sitting on `B`'s
-  first-parent line below a `SourceToDest` marker commit was necessarily
-  already imported into source before that marker commit was ever pushed.
-  When a later B2 candidate's `graph_descendant_of(source_tip, counterpart)`
-  check passes against the *current* source tip, that import is still
-  reachable from it, so resuming from B2 carries the same guarantee forward:
-  no dest-native commit between B1 and B2 was skipped, because it was
-  already in source before B2 existed. Scenario 5 (`C0` beneath `D(s2)`)
-  shows the converse — when the ancestor check fails, the walk correctly
-  keeps going past the disqualified B2 candidate instead of trusting it, so
-  `C0` is still picked up. This is also why the B1 precondition alone isn't
-  sufficient: B2's own soundness depends on this chain, not merely on being
-  newer than B1.
-* **`graph_descendant_of` is Git's own primitive for exactly this
-  question**, already the mechanism `pending_dest_commits` uses for B1's own
-  precondition and that every other ancestor check in this codebase
-  ([decisions/0028](0028-operation-lock-and-local-advance-cas.md)'s
-  local-advance CAS guard, [decisions/0045](0045-discovered-branch-refusals-are-per-branch-halts.md)'s
-  "point this clone can safely build on" check,
-  [decisions/0039](0039-mirror-only-source-rewrites-rebuild-the-projection.md)'s
-  rewrite detection) reaches for first, per AGENTS.md's "ask whether Git
-  already provides a safe primitive" rule. No new mechanism is introduced —
-  B2 reuses the same primitive B1 already depends on, applied to a different
-  pair of commits.
+* **Branch-agnostic authentication, branch-specific reachability.** This is
+  the same invariant decisions/0043's 2026-08-27 addendum (F-04) already
+  settled for the mirror-image problem: a branch-scoped `DestToSource`
+  marker's HMAC proves gitprism genuinely wrote it, for *some* branch, at
+  some point (`verify_self` — branch-agnostic authentication); it does not
+  by itself prove that *this* branch's history has ever seen the commit it
+  names as already imported. Only an actual reachability check supplies the
+  missing, branch-specific half — there, whether the marker is an ancestor
+  of the branch being processed (`loop_prevented`, `src/commands/sync/mod.rs`,
+  called only against commits the caller's own walk already found on that
+  branch's history — not a check over the marker's own recorded branch,
+  which would prove nothing about the branch actually being processed);
+  here, case 1's `graph_descendant_of(source_tip, counterpart)` or case 2's
+  search for an inherited marker reachable from `source_tip` specifically. A
+  marker that authenticates cleanly but sits on unrelated history does not
+  count in either decision.
+* **Worked example: why case 1 alone is not enough.**
+  ```
+  source: s3 ── M(C0)
+  dest:   C0 ── D(s3)
+  ```
+  Dest→source imports native commit `C0`, writing `M(C0)` on source *after*
+  `s3` already exists there. Source→dest later mirrors `s3` onto dest as
+  `D(s3)`, built directly on top of `C0` — decisions/0046's
+  nearest-exact-mapping anchor resolution (self-accounted for via
+  decisions/0044's own-branch alias marker) can place a new or rebuilt
+  branch's mirror exactly here, reusing another branch's own mapping to `s3`
+  rather than writing this branch's from scratch. `D(s3)` is a
+  genuine, self-verified `SourceToDest` marker naming `s3`: case 1's
+  ancestor check on `D(s3)` alone passes as soon as some `source_tip`
+  descends from `s3`, regardless of whether that same `source_tip` also
+  descends from `M(C0)`. `D(s3)` naming `s3` is not itself proof that a
+  branch descending from `s3` also contains `M(C0)` — those are two
+  independent facts about two different commits, and `s3` can be reached by
+  a path that never passed through `M(C0)`. Trusting case 1 alone would then
+  resume from `D(s3)` and skip `C0` forever, exactly the cross-branch
+  mirror-alias failure the first implementation round missed. Case 2
+  supplies the missing, exact, branch-specific proof: not "is `D(s3)`'s own
+  counterpart reachable" but "does something reachable from *this*
+  `source_tip` name `C0` itself."
+* **Why round 2's "any dest-native commit disqualifies" over-corrects.**
+  If `M(C0)` is created *before* `s3` — release cut from `s3` before `M(C0)`
+  exists — `M(C0)` is genuinely not reachable from that release's
+  `source_tip`, and the frontier correctly stops before `C0`: round 2 got
+  this timing right, because it happens to agree with case 2 here. But if
+  `M(C0)` is created *after* `s3` and is reachable from `source_tip` (the
+  release was cut later, or its source line merges from a point past
+  `M(C0)`), `C0` is genuinely represented — case 2 proves it — and the
+  frontier must advance through `C0` and `D(s3)`. Round 2's rule cannot make
+  this distinction: it disqualifies `C0` unconditionally, for being
+  dest-native at all, without ever asking whether it was actually imported.
+  The result is that `pending_dest_commits` resumes from B1 and replays
+  `C0` (and everything above it) as new commits against the current source
+  tree — the exact phantom-conflict failure CODE-001 exists to fix,
+  reintroduced for the plan's own headline scenario: any branch descended
+  from a parent that has imported dest-native content. Round 2's
+  candidate-only formulation also has no answer at all when `dest_tip`
+  *is* `C0` with nothing later — it only ever asks "does a later B2
+  candidate's own run stay unbroken," so it would still report B1 as the
+  boundary and replay an already-imported commit; the represented-prefix
+  walk here treats `C0` itself as a boundary the moment it is proven
+  represented, with or without anything above it.
+* **Dest's first-parent line is the only place both proof shapes are
+  ordered against each other.** Case 1's proof (does a marker's own
+  counterpart chain to `source_tip`) and case 2's proof (does something on
+  *source's* history name this dest commit) are each evaluated on a
+  different side, but only a single revwalk of dest's own first-parent
+  line, oldest-to-newest from B1, can ask "how far does the *contiguous*
+  proven prefix reach" — the property the boundary is actually defined by.
+* **`verify_self` plus `graph_descendant_of` are Git/decisions/0046's
+  existing primitives, reused, not a new mechanism.** Case 1 is unchanged
+  from the first implementation round. Case 2 reuses the identical pair —
+  `verify_self` to authenticate a marker regardless of its recorded branch,
+  `graph_descendant_of` (via plain reachability from `source_tip`, since the
+  search itself already restricts the candidate set to commits reachable
+  from `source_tip`) to confirm it — applied to the *reverse* lookup
+  direction: instead of asking whether a given marker's counterpart is
+  reachable, it asks whether anything reachable names a given dest oid.
+  Per AGENTS.md's "ask whether Git already provides a safe primitive"
+  rule, no new mechanism is introduced for either case.
 * **Rejected: deriving the boundary from the decision-0046 mapping index.**
   That index is reconstructed once per run, but only *after* dest→source has
   already run for every configured branch — 0046's own "Configured
@@ -168,33 +267,100 @@ of reflecting it back.
 
 # Consequences
 
-* One additional bounded revwalk of dest's first-parent line per configured
-  branch, run only after B1's precondition already succeeds. The added walk
-  is bounded by O(dest_tip..B1) — the same range `pending_commits`'s own
-  revwalk already traverses once the boundary is found — so no new
-  asymptotic cost is introduced. For an already round-tripped branch the
-  boundary typically does move from B1 to a later B2 commit (dest's tip is
-  usually gitprism's own `SourceToDest` commit, whose counterpart is
-  source's own tip, so B2 is found immediately) — the resulting
-  pending-commit set is unchanged regardless, because branch-scoped loop
-  prevention already excludes those commits whichever boundary is chosen.
+* This is a real walk, not a single check, and its cost is higher than the
+  first implementation round's "no new asymptotic cost" claim, which no
+  longer holds now that case 2 exists. The outer walk over dest's
+  first-parent line (B1 to `dest_tip`) is unchanged in shape — bounded by
+  `MAX_MARKER_SCAN_COMMITS`, the same range `pending_commits`'s own revwalk
+  already traverses once the boundary is found. But each commit that fails
+  case 1 (every dest-native or invalid-marker commit, and any
+  `SourceToDest` marker whose own counterpart isn't reachable) requires an
+  *independent* case-2 search of `source_tip`'s first-parent history, itself
+  bounded by `MAX_MARKER_SCAN_COMMITS`. In the worst case — a long dest
+  prefix of dest-native commits, each needing its own case-2 search — total
+  work is the product of the two bounds, not their sum. This decision does
+  not mandate a specific mitigation, but an implementer should expect to
+  need one for realistic branch counts and history lengths: e.g. a single
+  forward scan of `source_tip`'s first-parent history, built once per
+  boundary computation, recording every `DestToSource` marker's named dest
+  oid into a set, turns every case-2 check for that computation into O(1)
+  against it — reducing the total cost back to the sum of the two bounds.
+  Whether and how to do this is an implementation concern for CODE-001 step
+  4's rework, not a change to the rule itself.
+* [Decisions/0019](0019-marker-scans-are-first-parent-only.md)'s documented
+  limitation (marker scans assume the tracked branch stays first-parent of
+  its own merges) applies to *both* scans this decision uses: the outer walk
+  over dest's own first-parent line (as it already did for
+  `newest_dest_marker`'s source-side walk and `newest_source_marker`'s
+  dest-side walk), and now also each case-2 search over source's
+  first-parent line — the same accepted tradeoff `scan_for_dest_marker`
+  already carries for B1, exercised again per case-2 lookup rather than
+  once. No new exposure, but exercised more often.
 * `setup`'s refusal of a branch whose local tip already carries an inherited
   `Setup`/`DestToSource` marker (`src/commands/setup.rs:229-241`) is
   unchanged — `setup` remains a one-time step (decisions/0006, 0012) — but it
   now has a real supported path on the other side: `sync` correctly resumes
   such a branch instead of mis-resuming it, so promoting a mirrored branch
   into `config.branches` after the fact is no longer a dead end.
-* The documented limitation from
-  [decisions/0019](0019-marker-scans-are-first-parent-only.md) (marker scans
-  assume the tracked branch stays first-parent of its own merges) applies to
-  this new dest-side walk exactly as it already applies to
-  `newest_dest_marker`'s source-side walk and `newest_source_marker`'s
-  dest-side walk — a B2 candidate merged into `B` other than as first parent
-  is not reachable by this scan, same accepted tradeoff, no new exposure.
 * `pending_dest_commits`'s doc comment, and `newest_dest_marker`/
-  `scan_for_dest_marker`'s, need updating to describe the boundary as B1 *or*
-  a qualifying B2, not B1 alone (step 4).
+  `scan_for_dest_marker`'s, need updating to describe the boundary as the end
+  of a represented prefix past B1, not B1 *or* a single qualifying B2
+  commit.
 * `gitprism resolve`'s dest→source path, which calls `pending_dest_commits`
   directly (`resolve.rs:1171`, `:1258`), picks up the fix with no change of
   its own — resolve and sync must never disagree about which dest commit is
   next ([decisions/0008](0008-ship-resolve-helper.md)'s original invariant).
+* `src/commands/sync/marker_scan.rs`'s current, uncommitted implementation of
+  `dest_to_source_boundary` and its tests still encode round 2's "no
+  dest-native commit between B1 and B2" rule, not the model above. Rewriting
+  them is CODE-001 step 4's rework, out of scope for this decision-only
+  change.
+
+# Rejected alternatives
+
+* **Round 1: a bare ancestor check on each candidate's own counterpart, with
+  no dest-native check at all.** Insufficient, not merely simpler — the
+  worked example above (`D(s3)` naming `s3`, with `M(C0)` unreachable from
+  some `source_tip` that still descends from `s3` by another path) shows a
+  case-1-only check accepting a boundary that silently skips an unimported
+  dest-native commit forever.
+* **Round 2: disqualify any B2 candidate with a dest-native commit anywhere
+  between it and B1.** Not merely too strong — it cannot tell an *imported*
+  dest-native commit from an *unimported* one, so it stops the frontier at
+  the first native commit unconditionally. For any branch descended from a
+  parent that has ever imported dest-native content — the plan's own
+  headline scenario — this reintroduces CODE-001's exact symptom: the
+  frontier stays behind already-imported content and `pending_dest_commits`
+  replays it, hard-stopping on a phantom conflict. It also has no way to
+  name a bare dest-native commit as a boundary in its own right, so
+  `dest_tip == C0` with no later marker still wrongly falls back to B1.
+* **Derive the boundary from the decision-0046 mapping index.** See "Why"
+  above — the index is built after dest→source runs, by 0046's own design.
+
+# Test scenarios
+
+Four scenarios, extending `docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`'s
+own scenario table (continuing its numbering) — required before the
+represented-prefix model is implemented (CODE-001 step 4's rework):
+
+| # | Setup | Expected boundary | Expected pending |
+| --- | --- | --- | --- |
+| 7 | Branch cut **before** `M(C0)` exists: dest `release` carries native `C0`; `release`'s `source_tip` never reaches any commit importing `C0` (its source line was cut, or last touched, before dest→source ever wrote `M(C0)` on `main`) | B1 (`C0` fails case 2 — no inherited marker reachable from this `source_tip` names it) | `[C0, ...]` — `C0` and everything above it on dest's line |
+| 8 | Setup grafts `release` (B1). Dest `release`'s first-parent line: `B1 ── C0 ── D(s3)` — `C0` a customer commit added directly to dest, later imported into source as `M(C0)` on `release`'s own first-parent source line (reachable from `release`'s `source_tip`, whether imported before the branch was cut or merged in since); `D(s3)` is `release`'s own `SourceToDest` marker for source commit `s3` — either its own organic mirror, or, if `s3` was already mirrored on a sibling branch, decisions/0044's own-branch alias marker built on the decisions/0046 anchor (so `release`'s dest ref is never literally another branch's own marker commit) | `D(s3)` (`C0` represented via case 2; `D(s3)` represented via case 1) | `[]` |
+| 9 | Setup grafts `release` (B1). Dest `release`'s first-parent line: `B1 ── C0`, and `dest_tip` **is** `C0` itself — a customer commit added directly to dest, imported into source as `M(C0)` on `release`'s own first-parent source line and reachable from `source_tip`; no later mirror or marker commit at all (a bare dest-native commit carries no gitprism marker to begin with, so it needs no decisions/0044 alias) | `C0` (`dest_tip` itself, not B1) | `[]` |
+| 10 | A `SourceToDest` marker `D(sX)` on dest `release`'s line names a real, locally present `sX` that is reachable only from a **different** branch's source tip, not `release`'s own `source_tip` | the commit immediately before `D(sX)` (case 1 fails — not an ancestor of *this* `source_tip`; case 2 fails — no inherited marker reachable from this `source_tip` names `D(sX)`'s own oid) | `[D(sX), ...]` — not silently treated as already-imported |
+
+Scenario 7 confirms round 1 remains correct where it always was — including
+when the replayed prefix above `C0` also contains a later `SourceToDest`
+marker for content `source_tip` already has (e.g. a mirror `D(s3)` for an
+`s3` reachable from `source_tip`, sitting above `C0` on `release`'s dest
+line, if the branch cut happened to still include one): `build_pending_source_tip`
+(`src/commands/sync/mod.rs`) 3-way merges it against the growing source
+chain to a clean, empty-diff result, and, per that function's own documented
+asymmetry with source→dest's skip rule, still builds a real (content-
+identical) marker commit for it — it is neither silently dropped from
+`pending` nor reported as a conflict merely for merging to no change.
+Scenario 8 confirms round 2's over-correction is gone; scenario 9 confirms a
+bare dest-native commit is a valid boundary in its own right; scenario 10
+confirms an authenticated, self-verified marker is not automatically trusted
+without branch-specific reachability (the "Why" section's first bullet).

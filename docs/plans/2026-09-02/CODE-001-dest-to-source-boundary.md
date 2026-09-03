@@ -24,6 +24,14 @@ phantom conflict. Reproduced by execution; see the review's appendix.
 
 ## Target behaviour
 
+> **Superseded by [decisions/0048](../../../design/decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md).**
+> The B1/B2 predicate below (and step 4's instructions to implement it) is
+> the round-1 rule decision 0048 found insufficient and replaced with a
+> represented-prefix walk (case 1/case 2) after two more rejected rounds.
+> Implement decision 0048's model, not this section — kept here only as the
+> plan's original record of the problem and its first (wrong) target
+> behaviour.
+
 The dest→source boundary for branch `B` is the **newest commit on dest `B`'s
 first-parent line** that is either:
 
