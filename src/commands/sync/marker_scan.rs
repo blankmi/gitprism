@@ -86,11 +86,14 @@ pub(super) fn scan_for_dest_marker(
 }
 
 /// [`scan_for_dest_marker`], bailing when nothing is found — used by
-/// [`super::anchor::dest_tip_accounted_for`] and by [`dest_to_source_boundary`]
-/// below (which [`super::pending_dest_commits`] calls for B1), whose branch
-/// always comes from `config.branches`, where `setup` (decisions/0006,
-/// decisions/0023) guarantees the trailer exists. Finding none really does
-/// mean "has `gitprism setup` been run for this pair?"
+/// [`super::anchor::dest_tip_accounted_for`],
+/// [`super::anchor::dest_tip_represented_in_source`] (decisions/0048's
+/// source→dest safety widening, CODE-001 step 5), and by
+/// [`dest_to_source_boundary`] below (which [`super::pending_dest_commits`]
+/// calls for B1), whose branch always comes from `config.branches`, where
+/// `setup` (decisions/0006, decisions/0023) guarantees the trailer exists.
+/// Finding none really does mean "has `gitprism setup` been run for this
+/// pair?"
 pub(super) fn newest_dest_marker(
     repo: &Repository,
     source_tip: Oid,
@@ -182,6 +185,17 @@ pub(super) fn newest_source_marker(
 /// *source's* history), for which every commit is **represented** in
 /// `source_tip`. If every commit up to `dest_tip` is represented, the
 /// boundary is `dest_tip` itself.
+///
+/// [`super::pending_dest_commits`] calls this for dest→source's own resume
+/// point; [`super::anchor::dest_tip_represented_in_source`] (CODE-001 step
+/// 5) reuses it verbatim to widen source→dest's own safety check for the
+/// same shape — see that function's doc for why it additionally requires
+/// the newest self-verified `SourceToDest` marker anywhere on the whole of
+/// dest's first-parent line (not merely the B1-bounded range this boundary
+/// walk itself uses — a follow-up CODE-001 fix found the narrower range
+/// unsafe for that particular check) to be branded for the branch being
+/// processed (or none at all), not merely that [`newest_source_marker`]
+/// finds *something* branch-scoped on the line.
 ///
 /// B1 is a precondition, checked first and unconditionally, exactly as
 /// [`super::pending_dest_commits`] enforced it before this function existed:

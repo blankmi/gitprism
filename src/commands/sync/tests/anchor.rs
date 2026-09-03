@@ -57,6 +57,210 @@ fn dest_resume_point_resumes_from_the_newest_gitprism_commit_in_dests_history() 
     );
 }
 
+/// decisions/0048, CODE-001 step 5: case 3's extension must reuse the whole
+/// represented-*prefix* walk, not just ask whether `dest_tip` itself is a
+/// case-1/case-2 match. `dest_tip` here is a genuine decisions/0048 case-1
+/// match — a self-verified `SourceToDest` marker whose own counterpart is
+/// exactly `source_tip` — but branded "sibling", not "main" (the branch
+/// under test), so it fails `dest_tip_accounted_for`'s own pre-existing,
+/// branch-scoped case 1 and actually reaches case 3 (branding it "main"
+/// would let that unrelated, untouched case absorb it before case 3 ever
+/// ran — the same reason `marker_scan`'s own case-2 tests brand their import
+/// markers "sibling"). An unimported dest-native commit (`native`, no marker
+/// at all, and nothing reachable from `source_tip` names it) sits directly
+/// beneath it. `dest_resume_point` must still refuse (`None`), exactly as
+/// `marker_scan::tests::case_one_alone_does_not_represent_a_dest_native_commit_beneath_it`
+/// already established for the boundary walk itself — case 3 must agree
+/// with that walk, not merely approximate it with a single-commit check.
+#[test]
+fn dest_resume_point_refuses_a_case_one_marker_sitting_on_an_unimported_native_commit() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let x1 = add_commit(&source_repo, "main", &[("notes.txt", "line1\n")]);
+
+    // A dest-native commit, no marker at all, never imported.
+    let native = add_independent_dest_commit(
+        &dest_repo,
+        d0,
+        ("customer.txt", "customer\n"),
+        "a customer commit, never imported",
+    );
+
+    // A case-1-qualifying SourceToDest marker directly above it, whose own
+    // counterpart is exactly source's current tip — committed onto dest's
+    // own "main" ref, but branded "sibling", not "main" (see doc comment
+    // above); `add_source_marker_commit_on_dest` ties the ref and the
+    // branding together, so this is built by hand instead.
+    let native_commit = dest_repo.find_commit(native).unwrap();
+    let mut builder = dest_repo
+        .treebuilder(Some(&native_commit.tree().unwrap()))
+        .unwrap();
+    let blob = dest_repo.blob(b"dest\n").unwrap();
+    builder
+        .insert("dest.txt", blob, git2::FileMode::Blob.into())
+        .unwrap();
+    let tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+    let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+    let message = marker::build_message(
+        "gitprism sync: source -> dest",
+        MarkerDirection::SourceToDest,
+        "sibling",
+        x1,
+        "Gitprism-Source-Commit",
+        &[native],
+        tree.id(),
+        &signature,
+        &signature,
+        &marker::load_key().unwrap(),
+    );
+    let case_one_marker = dest_repo
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            &message,
+            &tree,
+            &[&native_commit],
+        )
+        .unwrap();
+
+    git::fetch(
+        source_dir.path(),
+        &dest_repo.path().to_string_lossy(),
+        "main",
+    )
+    .unwrap();
+
+    let source_tip = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(source_tip, x1);
+
+    assert_eq!(
+        dest_resume_point(&source_repo, source_tip, case_one_marker).unwrap(),
+        None,
+        "a case-1-qualifying marker with an unimported dest-native commit beneath it must not \
+         be accepted, even though its own counterpart is source's current tip"
+    );
+}
+
+/// CODE-002 (found by review of CODE-001 step 5's own widening, before it
+/// was ever committed): decisions/0019's first-parent limitation tripping
+/// *inside* `dest_tip_represented_in_source` (B1 reachable from `dest_tip`
+/// only via a non-first-parent merge, even though the precondition's own
+/// full-ancestry `graph_descendant_of` check already passed) used to
+/// `bail!` all the way out of `dest_resume_point_for_branch` as an `Err`,
+/// instead of resolving to the ordinary per-branch `Ok(None)` every other
+/// "not accounted for" shape this function already returns. For a
+/// discovered branch that `Err` aborted the *entire* run instead of a
+/// per-branch halt (decisions/0046 Addendum 2: "every new bound is a
+/// horizon or a per-branch halt, never a whole-run abort"); for a
+/// *configured* branch it made no practical difference, since
+/// `sync_pair_to_dest_with_key` already bails the identical way on its own
+/// `?`. `Ok(None)` is the only value either caller's own per-branch
+/// handling can act on, so asserting it here — rather than exercising a
+/// whole `run()` with a discovered branch — already discriminates both
+/// cases: an `Err` from this function is always wrong, regardless of which
+/// caller sees it. Same topology as `marker_scan::tests::
+/// refuses_clearly_when_b1_is_reachable_only_via_a_non_first_parent_merge`,
+/// exercised here through `dest_resume_point` instead.
+#[test]
+fn dest_resume_point_returns_none_instead_of_erroring_when_b1_is_off_the_first_parent_line() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // B1: a dest-space commit source's own history names via a
+    // DestToSource marker, built on a throwaway ref so it never becomes
+    // part of dest main's own first-parent line.
+    let b1 = add_independent_dest_commit_on(
+        &dest_repo,
+        "b1-standin",
+        d0,
+        ("b1.txt", "b1\n"),
+        "the boundary commit",
+    );
+
+    add_dest_marker_commit(&source_repo, "main", graft, b1);
+    let source_tip = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // dest's real "main" line never reaches b1 via first-parent: a plain
+    // commit off d0, then a merge that carries b1 only as its second
+    // parent.
+    let plain = add_independent_dest_commit_on(
+        &dest_repo,
+        "main",
+        d0,
+        ("plain.txt", "plain\n"),
+        "a plain dest commit",
+    );
+    let plain_commit = dest_repo.find_commit(plain).unwrap();
+    let b1_commit = dest_repo.find_commit(b1).unwrap();
+    let mut builder = dest_repo
+        .treebuilder(Some(&plain_commit.tree().unwrap()))
+        .unwrap();
+    let b1_entry = b1_commit.tree().unwrap().get_name("b1.txt").unwrap().id();
+    builder
+        .insert("b1.txt", b1_entry, git2::FileMode::Blob.into())
+        .unwrap();
+    let merge_tree = dest_repo.find_tree(builder.write().unwrap()).unwrap();
+    let signature = Signature::now("Dest Maintainer", "maintainer@example.com").unwrap();
+    let merge = dest_repo
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "a merge that carries b1 as its second parent",
+            &merge_tree,
+            &[&plain_commit, &b1_commit],
+        )
+        .unwrap();
+
+    git::fetch(
+        source_dir.path(),
+        &dest_repo.path().to_string_lossy(),
+        "main",
+    )
+    .unwrap();
+
+    let result = dest_resume_point(&source_repo, source_tip, merge);
+    assert!(
+        result.is_ok(),
+        "B1 off dest's first-parent line must resolve to a clean per-branch `None`, not \
+         propagate decisions/0019's limitation as a whole-run-aborting `Err`: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap(),
+        None,
+        "dest_tip must not be treated as safe to build on when B1 is only reachable via a \
+         non-first-parent merge"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn mirror_only_rewrite_detected_propagates_a_real_lookup_failure_instead_of_guessing() {
