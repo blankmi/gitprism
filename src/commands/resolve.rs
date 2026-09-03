@@ -1164,6 +1164,10 @@ fn resolve_start(
         .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
         .id();
 
+    // ARCH-001: checked. Sync's dest→source path does build a prefix chain
+    // (build_pending_source_tip); resolve deliberately takes only
+    // pending.first() per invocation (decisions/0015), so there's nothing
+    // to unify here.
     let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
         .with_context(|| {
             format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
@@ -1249,6 +1253,8 @@ fn resolve_continue(
         .peel_to_commit()
         .context("resolving fetched dest branch to a commit")?
         .id();
+    // ARCH-001: same as resolve_start — resolve deliberately takes only
+    // pending.first(), so nothing here duplicates sync's prefix-replay loop.
     let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
         .with_context(|| {
             format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
