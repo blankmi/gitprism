@@ -1014,25 +1014,6 @@ pub(crate) struct PendingDestBuild {
     pub(crate) conflict: Option<Conflict>,
 }
 
-/// Builds, in `repo`'s object database, a chain of new commits reflecting
-/// every source commit between `boundary` and `source_tip`, each merged onto
-/// dest's current chain tip via a real `git merge-tree` subprocess
-/// (decisions/0016) — not a full-tree snapshot replace, which would silently
-/// regress any independent dest content a not-yet-processed dest→source
-/// cherry-pick already landed further up source's history.
-///
-/// The merge base is always `source_commit.parent(0)`'s tree — the mainline
-/// parent for a merge commit — filtered the same way `theirs` is, per
-/// decisions/0016's table; no `parent_count` special-casing is needed at all,
-/// so octopus merges fall out of the same rule for free. This replaces
-/// decisions/0014's source-space cursor entirely: that cursor existed only to
-/// work around `apply_to_tree` patch application not being idempotent (a
-/// repeated add duplicated instead of no-op'ing), which is exactly what
-/// solving the problem with a real 3-way merge makes unnecessary — one
-/// mechanism per property, instead of two mechanisms for the same one, is how
-/// the duplication and mid-chain-stranding bugs that motivated decisions/0016
-/// stop being possible. Stops at the first commit that doesn't merge cleanly
-/// (decisions/0007). `dest_tip` seeds the chain's first parent.
 /// Loop prevention (decisions/0003): whether `commit` already exists on
 /// dest, so replaying it would loop — a `Setup` graft (exempt from the
 /// branch check by construction) or any `DestToSource` marker, verified
@@ -1062,6 +1043,32 @@ pub(super) fn loop_prevented(commit: &git2::Commit, key: &marker::StateKey) -> b
     .is_some()
 }
 
+/// Builds, in `repo`'s object database, a chain of new commits reflecting
+/// every source commit between `boundary` and `source_tip`, each merged onto
+/// dest's current chain tip via a real `git merge-tree` subprocess
+/// (decisions/0016) — not a full-tree snapshot replace, which would silently
+/// regress any independent dest content a not-yet-processed dest→source
+/// cherry-pick already landed further up source's history.
+///
+/// The merge base is always `source_commit.parent(0)`'s tree — the mainline
+/// parent for a merge commit — filtered the same way `theirs` is, per
+/// decisions/0016's table; no `parent_count` special-casing is needed at all,
+/// so octopus merges fall out of the same rule for free. This replaces
+/// decisions/0014's source-space cursor entirely: that cursor existed only to
+/// work around `apply_to_tree` patch application not being idempotent (a
+/// repeated add duplicated instead of no-op'ing), which is exactly what
+/// solving the problem with a real 3-way merge makes unnecessary — one
+/// mechanism per property, instead of two mechanisms for the same one, is how
+/// the duplication and mid-chain-stranding bugs that motivated decisions/0016
+/// stop being possible. Stops at the first commit that doesn't merge cleanly
+/// (decisions/0007). `dest_tip` seeds the chain's first parent.
+///
+/// `resolve` is also a caller of this function now, not a hand-copy of it, so
+/// it inherits every property above without its own maintenance burden — one
+/// mechanism per property (decisions/0016). Any new pre- or post-condition
+/// this function needs belongs inside the function itself, never duplicated
+/// at a call site: a second copy is exactly how sync and resolve drift apart
+/// again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pending_dest_tip(
     repo: &Repository,
