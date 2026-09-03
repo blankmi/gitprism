@@ -328,6 +328,16 @@ directory, say). That file lands in source exactly as dest committed it and
 may run in source's own CI. Treat dest as capable of adding, not just
 reflecting, content in source.
 
+**Current limitation:** `branches` must be complete before `setup` runs.
+`setup` is not a way to add one later: it refuses only when the branch's tip
+is still gitprism's own marker commit, and otherwise re-grafts — creating a
+second `setup` merge on that branch and on `main`. Neither is supported;
+`sync` also mis-syncs a branch added this way — dest→source picks the wrong
+resume boundary and can hard-stop on a phantom conflict. See
+[`docs/2026-09-02_REPOSITORY_REVIEW.md`](docs/2026-09-02_REPOSITORY_REVIEW.md),
+section 3, CODE-001, and the fix plan,
+[`docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`](docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md).
+
 ## Excluding paths: `.gitprismignore`
 
 Files and folders that must stay in source and never reach dest go in
