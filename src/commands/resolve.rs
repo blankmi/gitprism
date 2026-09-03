@@ -39,7 +39,8 @@ use crate::commands::sync::policy_check::{
     find_control_file_policy_mismatch, policy_mismatch_message,
 };
 use crate::commands::sync::{
-    build_dest_commit, build_source_commit, pending_commits, pending_dest_commits,
+    build_dest_commit, build_pending_dest_tip, build_source_commit, pending_commits,
+    pending_dest_commits,
 };
 use crate::config::Config;
 use crate::exclude;
@@ -322,51 +323,24 @@ fn start_source_to_dest(
         );
     }
 
-    let mut parent = dest_tip;
-    let mut selected = None;
-    for source_oid in pending {
-        let source_commit = repo.find_commit(source_oid)?;
-        if marker::verify(
-            &source_commit,
-            branch,
-            &[marker::Direction::Setup, marker::Direction::DestToSource],
-            None,
-            state_key,
-        )
-        .is_some()
-        {
-            continue;
-        }
-        let parent_commit = repo.find_commit(parent)?;
-        let base_tree = match source_commit.parent(0) {
-            Ok(base) => filter_tree(repo, &base.tree()?, Path::new(""), exclude_list)?,
-            Err(_) => repo.treebuilder(None)?.write()?,
-        };
-        let theirs_tree = filter_tree(repo, &source_commit.tree()?, Path::new(""), exclude_list)?;
-        match git::merge_tree(source_root, base_tree, parent_commit.tree_id(), theirs_tree)? {
-            git::MergeTreeOutcome::Clean(tree) if tree == parent_commit.tree_id() => continue,
-            git::MergeTreeOutcome::Clean(tree) => {
-                parent = build_dest_commit(
-                    repo,
-                    config,
-                    parent,
-                    &source_commit,
-                    tree,
-                    branch,
-                    state_key,
-                )?;
-            }
-            git::MergeTreeOutcome::Conflict { paths } => {
-                selected = Some((source_oid, parent, paths));
-                break;
-            }
-        }
-    }
-    let Some((source_oid, dest_base, paths)) = selected else {
+    let build = build_pending_dest_tip(
+        repo,
+        config,
+        exclude_list,
+        boundary,
+        dest_tip,
+        source_tip,
+        source_root,
+        branch,
+        state_key,
+    )?;
+    let Some(conflict) = build.conflict else {
         anyhow::bail!(
             "gitprism resolve: {branch:?} <- {branch:?} has no source-to-dest conflict to resolve"
         )
     };
+    let dest_base = build.new_tip.unwrap_or(dest_tip);
+    let (source_oid, paths) = (conflict.commit, conflict.paths);
     if dest_base != dest_tip {
         // decisions/0039 narrows 0038's resolve.rs guidance: force here
         // would require positively detecting a source-side rewrite, which
