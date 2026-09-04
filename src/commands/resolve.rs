@@ -69,12 +69,26 @@ fn read_state_file(path: &Path, description: &str) -> Result<String> {
 /// hashes the same file `run_with_direction` actually reads.
 #[cfg(test)]
 fn fixture_secrets(cwd: &Path, config_path: &Path) -> crate::commands::FixedSecrets {
+    // Resolved the same way `run_with_direction` resolves it below:
+    // against the discovered repo's `workdir()`, not raw `cwd` — these
+    // differ once `cwd` is a subdirectory of the repository rather than
+    // its root (TEST-001 review fix). Falls back to `cwd` itself when
+    // discovery fails (no repo there, or a bare one), so a genuinely
+    // broken `cwd` still reaches `run_with_direction`'s own error instead
+    // of a different one raised here.
+    let source_root = Repository::discover(cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
     let resolved_config_path = if config_path.is_absolute() {
         config_path.to_path_buf()
     } else {
-        cwd.join(config_path)
+        source_root.join(config_path)
     };
-    crate::commands::FixedSecrets::for_fixture(&resolved_config_path, &cwd.join(exclude::FILENAME))
+    crate::commands::FixedSecrets::for_fixture(
+        &resolved_config_path,
+        &source_root.join(exclude::FILENAME),
+    )
 }
 
 /// Test-only convenience: dest-to-source with this fixture's own secrets,

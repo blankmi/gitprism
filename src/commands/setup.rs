@@ -56,16 +56,25 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
 /// config_path)` unchanged (see `commands::FixedSecrets`).
 #[cfg(test)]
 pub(crate) fn run(cwd: &Path, config_path: &Path) -> Result<()> {
-    // Resolved the same way `run_with` resolves it below, so a relative
-    // `--config` fixture hashes the same file `run_with` actually reads.
+    // Resolved the same way `run_with` resolves it below: against the
+    // discovered repo's `workdir()`, not raw `cwd` — these differ once
+    // `cwd` is a subdirectory of the repository rather than its root
+    // (TEST-001 review fix). Falls back to `cwd` itself when discovery
+    // fails (no repo there, or a bare one), so a genuinely broken `cwd`
+    // still reaches `run_with`'s own error instead of a different one
+    // raised here.
+    let source_root = Repository::discover(cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
     let resolved_config_path = if config_path.is_absolute() {
         config_path.to_path_buf()
     } else {
-        cwd.join(config_path)
+        source_root.join(config_path)
     };
     let secrets = crate::commands::FixedSecrets::for_fixture(
         &resolved_config_path,
-        &cwd.join(exclude::FILENAME),
+        &source_root.join(exclude::FILENAME),
     );
     run_with(cwd, config_path, &secrets)
 }
