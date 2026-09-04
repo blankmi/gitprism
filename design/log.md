@@ -3041,3 +3041,34 @@ Regression test:
 Full suite: 370 passed (369 plus the new regression test); `cargo fmt --all
 -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D
 warnings` clean; `cargo build --release --locked` succeeds.
+
+## 2026-09-04 — DOC-001 closed: decisions/0046 Addendum 3 records Findings Q-S
+
+`docs/plans/2026-09-02/DOC-001-record-f-a-f-b-f-c.md` is fully implemented.
+Original finding: three behaviours of decisions/0046's implementation were
+cited in code only by an ad hoc "F", hyphen, letter shorthand
+(`mapping_index.rs`, `anchor.rs`, `mod.rs`, `git.rs`, and their tests), with
+no matching entry in `design/` — and the shorthand collided with this
+decision's own Addendum 1/2 finding letters, since those already number
+their findings A–P.
+
+[Decisions/0046](decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md)'s
+new Addendum 3 gives the three behaviours their own names: provenance
+surviving source-branch deletion (Finding Q — reconstruction lists dest's
+branches directly and self-verifies an inherited marker against its own
+recorded branch); a mapping whose canonical dest object is absent locally
+halting that branch rather than being walked past to an older mapping
+(Finding R); and self-exclusion of a branch's own sole projection during
+canonicalization for its own rebuild, keeping it only when nothing else maps
+the same source commit (Finding S) — under which CODE-004's accepted
+trade-off (an own projection comparable with a sibling's is dropped even
+when it would have been the common ancestor, safe under decisions/0038) is
+now recorded. Every citing code comment across `src/git.rs`,
+`src/commands/sync/{mapping_index,anchor,mod}.rs` and their tests is
+updated from the old shorthand to `decisions/0046 Addendum 3, Finding
+Q`/`Finding R`/`Finding S`; comment-only, no behaviour change.
+`design/decisions/index.md`'s 0046 entry notes the addendum.
+
+Full suite: 370 passed (unchanged — this work is doc/comment-only); `cargo
+fmt --all -- --check` and `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean.
