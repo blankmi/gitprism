@@ -2086,6 +2086,193 @@ mod tests {
         );
     }
 
+    // TEST-001: `resolve`'s own env-reading entry point must actually
+    // enforce `GITPRISM_STATE_KEY`/`GITPRISM_POLICY_SHA256`, refusing before
+    // any fetch or ref mutation, in that order (resolve reads the key
+    // before loading and verifying policy). `marker::load_key`/
+    // `policy::verify_expected_digest` are cfg(test)-forked to always
+    // succeed today, so these three fail until TEST-001 step 2 removes
+    // those forks.
+
+    #[test]
+    #[ignore = "TEST-001 step 2: marker::load_key is cfg(test)-forked to always succeed until the fork is removed"]
+    fn run_refuses_without_a_state_key_env_var_and_leaves_no_side_effects() {
+        let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("GITPRISM_STATE_KEY");
+        }
+
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "1")]);
+
+        let source_dir = tempdir().unwrap();
+        source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        let expected_digest = crate::policy::hash_files(
+            config.path(),
+            &source_dir.path().join(exclude::FILENAME),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
+        }
+
+        let error = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "main",
+            false,
+            Direction::DestToSource,
+        )
+        .expect_err("an unset state key must refuse before any fetch or mutation");
+        assert!(
+            error.to_string().contains("GITPRISM_STATE_KEY"),
+            "error must name the missing variable: {error}"
+        );
+
+        let dest_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(dest_tip_after, dest_tip, "dest's refs must be unchanged");
+        assert!(
+            !source_dir.path().join(".git/FETCH_HEAD").exists(),
+            "no fetch must have happened before the key check"
+        );
+        assert!(
+            !source_dir.path().join(".git/gitprism.lock").exists(),
+            "no operation lock must have been created before the key check"
+        );
+
+        unsafe {
+            std::env::remove_var("GITPRISM_POLICY_SHA256");
+        }
+    }
+
+    #[test]
+    #[ignore = "TEST-001 step 2: policy::verify_expected_digest is cfg(test)-forked to always succeed until the fork is removed"]
+    fn run_refuses_with_a_wrong_policy_digest_and_leaves_no_side_effects() {
+        let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "1")]);
+
+        let source_dir = tempdir().unwrap();
+        source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        unsafe {
+            std::env::set_var(
+                "GITPRISM_STATE_KEY",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            );
+            // Valid-looking (64 hex characters) but wrong.
+            std::env::set_var("GITPRISM_POLICY_SHA256", "a".repeat(64));
+        }
+
+        let error = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "main",
+            false,
+            Direction::DestToSource,
+        )
+        .expect_err("a wrong policy digest must refuse before any fetch or mutation");
+        assert!(
+            error.to_string().contains("does not match"),
+            "error must say the pin does not match: {error}"
+        );
+
+        let dest_tip_after = dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(dest_tip_after, dest_tip, "dest's refs must be unchanged");
+        assert!(
+            !source_dir.path().join(".git/FETCH_HEAD").exists(),
+            "no fetch must have happened before the policy check"
+        );
+        assert!(
+            !source_dir.path().join(".git/gitprism.lock").exists(),
+            "no operation lock must have been created before the policy check"
+        );
+
+        unsafe {
+            std::env::remove_var("GITPRISM_STATE_KEY");
+            std::env::remove_var("GITPRISM_POLICY_SHA256");
+        }
+    }
+
+    #[test]
+    #[ignore = "TEST-001 step 2: policy::verify_expected_digest/marker::load_key are cfg(test)-forked to always succeed until the forks are removed"]
+    fn run_succeeds_with_correct_state_key_and_policy_digest_env_vars() {
+        let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "1")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        // Source touches an unrelated file, so dest's independent commit
+        // below cherry-picks cleanly, matching
+        // `run_resolves_a_clean_pick_without_needing_a_human`'s fixture —
+        // proving the env-reading path runs a resolution to completion, not
+        // just past the secrets checks.
+        add_commit(&source_repo, "main", &[("only-in-source.txt", "v1")]);
+        let source_remote = bare_source_remote_seeded_at(
+            &source_repo,
+            "main",
+            source_repo
+                .find_branch("main", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+        );
+        add_independent_dest_commit(&dest_repo, dest_tip, ("g.txt", "from dest"));
+
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+        let expected_digest = crate::policy::hash_files(
+            config.path(),
+            &source_dir.path().join(exclude::FILENAME),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var(
+                "GITPRISM_STATE_KEY",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            );
+            std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
+        }
+
+        run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "main",
+            false,
+            Direction::DestToSource,
+        )
+        .expect("correct env vars must let the real env-reading path run to completion");
+
+        unsafe {
+            std::env::remove_var("GITPRISM_STATE_KEY");
+            std::env::remove_var("GITPRISM_POLICY_SHA256");
+        }
+    }
+
     #[test]
     fn run_fails_loudly_for_an_unconfigured_branch() {
         let dest_dir = tempdir().unwrap();
