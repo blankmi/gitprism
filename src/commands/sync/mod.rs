@@ -306,6 +306,15 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
         );
     }
 
+    // decisions/0049: every dest branch this run could need a tip for is
+    // listed and fetched into a transient namespace exactly once, before
+    // either sync phase — dest→source's own existence/tip lookups just below
+    // and reconstruction's mapping index further down both read this same
+    // listing/namespace pair instead of each doing their own.
+    let dest_url = config.dest_url()?;
+    let dest_listing = git::remote_branch_names(&source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(&source_root, &dest_url, &dest_listing.names)?;
+
     // dest→source first, for every explicitly configured branch: any content
     // dest carries that gitprism didn't itself put there (e.g. a merged PR)
     // must be reflected into source before source→dest's own refusal check
@@ -317,8 +326,16 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
     // (decisions/0017, decisions/0020).
     let mut run_cache = RunCache::default();
     for branch in &config.branches {
-        sync_pair_from_dest_with_key(&repo, &source_root, &config, branch, &reporter, &state_key)
-            .with_context(|| format!("syncing {branch:?} dest -> source"))?;
+        sync_pair_from_dest_with_key(
+            &repo,
+            &source_root,
+            &config,
+            branch,
+            &reporter,
+            &state_key,
+            &dest_listing,
+        )
+        .with_context(|| format!("syncing {branch:?} dest -> source"))?;
     }
 
     // source→dest discovers every branch that exists on source at run time
@@ -337,13 +354,13 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
     // branch for a clean run.
     let mut any_branch_halted = false;
     // decisions/0046: reconstruct exact authenticated mappings after
-    // dest→source has advanced local source histories. Destination heads are
-    // fetched once and retained in the same per-run cache used below.
-    let dest_url = config.dest_url()?;
+    // dest→source has advanced local source histories, from the same
+    // listing/namespace decisions/0049 already fetched above.
     let mapping_index = anchor::reconstruct_mapping_index(
         &repo,
         &source_root,
         &dest_url,
+        &dest_listing,
         &source_branches,
         &state_key,
         &mut run_cache,
@@ -1466,6 +1483,7 @@ fn sync_pair_from_dest_with_key(
     branch: &str,
     reporter: &Reporter,
     state_key: &marker::StateKey,
+    dest_listing: &git::RemoteBranchListing,
 ) -> Result<()> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating configured branch {branch:?}"))?;
@@ -1478,10 +1496,21 @@ fn sync_pair_from_dest_with_key(
         // `sync_pair_to_dest`'s own `remote_ref_exists` check), there is no
         // legitimate reason for it to have no ref on dest at all — `gitprism
         // setup` (decisions/0006) always grafts every round-tripped branch.
-        // Checked before fetching so a deleted dest ref fails with a clear,
-        // gitprism-authored message (decisions/0018) instead of git's own raw
-        // "couldn't find remote ref" subprocess error aborting the run.
-        if !git::remote_ref_exists(source_root, &dest_url, branch)? {
+        // Checked so a deleted dest ref fails with a clear, gitprism-authored
+        // message (decisions/0018) instead of git's own raw "couldn't find
+        // remote ref" subprocess error aborting the run. decisions/0049:
+        // existence comes from `run`'s own upfront listing whenever it can
+        // establish absence; only when the branch-limit horizon blocks that
+        // claim (decisions/0047) is a live `remote_ref_exists` check made.
+        let listed = dest_listing.names.iter().any(|name| name == branch);
+        let dest_ref_exists = if listed {
+            true
+        } else if dest_listing.completeness.can_establish_absence() {
+            false
+        } else {
+            git::remote_ref_exists(source_root, &dest_url, branch)?
+        };
+        if !dest_ref_exists {
             anyhow::bail!(
                 "gitprism sync: round-tripped branch {branch:?} has no ref on dest anymore — source and dest are out of sync (a round-tripped branch's dest ref should never be deleted); investigate before syncing again"
             );
@@ -1490,16 +1519,32 @@ fn sync_pair_from_dest_with_key(
         reporter.step(
             branch,
             Direction::DestToSource,
-            "fetching dest (checking for independent content to reflect into source)",
+            "checking dest (independent content to reflect into source)",
         );
-        git::fetch(source_root, &dest_url, branch)
-            .with_context(|| format!("fetching dest branch {branch:?} from configured remote"))?;
-        let dest_tip = repo
-            .find_reference("FETCH_HEAD")
-            .context("reading FETCH_HEAD after fetch")?
-            .peel_to_commit()
-            .context("resolving fetched dest branch to a commit")?
-            .id();
+        // decisions/0049: `branch` was part of `run`'s own upfront bulk
+        // fetch whenever it's listed above, so its tip is read from the
+        // transient dest namespace instead of being fetched again here. Only
+        // a branch beyond the branch-limit horizon — confirmed to exist by
+        // the live check just above, but never part of that bulk fetch
+        // either — still needs its own fetch, same as before decisions/0049.
+        let dest_tip = if listed {
+            repo.find_reference(&git::dest_head_namespace_ref(branch))
+                .with_context(|| {
+                    format!("reading destination branch {branch:?}'s fetched head from the dest namespace")
+                })?
+                .peel_to_commit()
+                .with_context(|| format!("resolving destination branch {branch:?}'s fetched head"))?
+                .id()
+        } else {
+            git::fetch(source_root, &dest_url, branch).with_context(|| {
+                format!("fetching dest branch {branch:?} from configured remote")
+            })?;
+            repo.find_reference("FETCH_HEAD")
+                .context("reading FETCH_HEAD after fetch")?
+                .peel_to_commit()
+                .context("resolving fetched dest branch to a commit")?
+                .id()
+        };
 
         // On the first attempt, source's own tip is normally just this
         // checkout's local branch — no fetch needed. But `branch` is a

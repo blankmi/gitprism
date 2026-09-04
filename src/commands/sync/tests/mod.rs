@@ -447,10 +447,16 @@ fn sync_pair_to_dest(
     // `run` directly instead (see `tests::anchor`'s scheduling tests).
     let dest_url = config.dest_url()?;
     let (source_branches, _skipped) = list_source_branches(repo)?;
+    // decisions/0049: `run` builds this listing/namespace pair once up
+    // front too; rebuilt fresh here for the same reason the mapping index
+    // above is.
+    let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(source_root, &dest_url, &dest_listing.names)?;
     run_cache.mapping_index = reconstruct_mapping_index(
         repo,
         source_root,
         &dest_url,
+        &dest_listing,
         &source_branches,
         &key,
         run_cache,
@@ -468,8 +474,11 @@ fn sync_pair_to_dest(
     )
 }
 
-/// [`sync_pair_from_dest_with_key`], deriving the state key — a test-only
-/// convenience the same way [`sync_pair_to_dest`] is.
+/// [`sync_pair_from_dest_with_key`], deriving the state key and the
+/// decisions/0049 listing/namespace pair `run` would otherwise already have
+/// built once up front — a test-only convenience the same way
+/// [`sync_pair_to_dest`] is, rebuilding both fresh from the current state on
+/// every call rather than sharing them across a whole test's several calls.
 fn sync_pair_from_dest(
     repo: &Repository,
     source_root: &Path,
@@ -478,7 +487,18 @@ fn sync_pair_from_dest(
     reporter: &Reporter,
 ) -> Result<()> {
     let key = marker::test_key();
-    sync_pair_from_dest_with_key(repo, source_root, config, branch, reporter, &key)
+    let dest_url = config.dest_url()?;
+    let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(source_root, &dest_url, &dest_listing.names)?;
+    sync_pair_from_dest_with_key(
+        repo,
+        source_root,
+        config,
+        branch,
+        reporter,
+        &key,
+        &dest_listing,
+    )
 }
 
 /// Loads the exclude-list *current* as of `source_tip` — the version this

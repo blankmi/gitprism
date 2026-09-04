@@ -2097,11 +2097,14 @@ fn reconstruct_mapping_index_caches_a_source_branchs_missing_dest_ref_as_nonexis
     let dest_url = dest_dir.path().display().to_string();
     let key = marker::test_key();
     let mut run_cache = RunCache::default();
+    let dest_listing = git::remote_branch_names(source_dir.path(), &dest_url).unwrap();
+    git::fetch_heads_into_namespace(source_dir.path(), &dest_url, &dest_listing.names).unwrap();
 
     reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
+        &dest_listing,
         &["main".to_string(), "feature".to_string()],
         &key,
         &mut run_cache,
@@ -2154,11 +2157,14 @@ fn reconstruct_mapping_index_degrades_to_a_per_branch_refusal_instead_of_abortin
     let dest_url = dest_dir.path().display().to_string();
     let key = marker::test_key();
     let mut run_cache = RunCache::default();
+    let dest_listing = git::remote_branch_names(source_dir.path(), &dest_url).unwrap();
+    git::fetch_heads_into_namespace(source_dir.path(), &dest_url, &dest_listing.names).unwrap();
 
     let index = reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
+        &dest_listing,
         &["main".to_string()],
         &key,
         &mut run_cache,
@@ -2182,42 +2188,23 @@ fn reconstruct_mapping_index_degrades_to_a_per_branch_refusal_instead_of_abortin
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_instead_of_recovering_a_missing_dest_ref()
- {
-    use std::os::unix::fs::PermissionsExt;
-
-    // decisions/0049 retires the per-branch fetch-and-refresh recovery
-    // decisions/0046 Addendum 2, Finding G established (a dest ref genuinely
-    // deleted between the listing and its own fetch was recovered as
-    // "absent"): reconstruction now fetches every listed dest head in one
-    // all-or-nothing transport, so a name whose fetch fails for any reason —
-    // deleted between listing and fetch, auth, network, transport, a corrupt
-    // remote — aborts reconstruction outright rather than being
-    // individually distinguished and recovered. `target` here is made
-    // unreadable rather than deleted (`ls-remote` never touches objects, so
-    // a genuine deletion wouldn't even reach the bulk fetch's own name
-    // list — see `git::fetch_heads_into_namespace`'s own tests in
-    // `src/git.rs` for that race at the layer it's actually reproducible),
-    // but the observable behavior pinned here — propagate, don't recover —
-    // is the same one Finding G's now-removed recovery used to special-case.
+fn reconstruct_mapping_index_fails_loudly_when_a_listed_branch_has_no_namespace_ref() {
+    // PERF-001 step 6 moved the listing and its bulk fetch out of
+    // `reconstruct_mapping_index` and into the caller (`run`), so
+    // reconstruction can no longer itself produce or propagate a bulk
+    // fetch failure — it only reads whatever namespace the caller already
+    // populated. What it must still do, in the same spirit as the
+    // now-removed decisions/0046 Addendum 2, Finding G propagation this
+    // test replaces, is refuse to silently treat an inconsistency between
+    // the listing it's handed and what's actually in the namespace as
+    // ordinary absence: a listed name with no namespace ref (the shape a
+    // caller bug, or the old recoverable list/fetch race, would produce)
+    // fails loudly instead.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
-    let target_tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
-
-    let hex = target_tip.to_string();
-    let object_path = dest_dir
-        .path()
-        .join("objects")
-        .join(&hex[..2])
-        .join(&hex[2..]);
-    assert!(
-        object_path.exists(),
-        "the tip commit must be a real loose object"
-    );
-    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o000)).unwrap();
+    bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
 
     let source_dir = tempdir().unwrap();
     let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
@@ -2237,40 +2224,44 @@ fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_instead_of_recoveri
     let key = marker::test_key();
     let mut run_cache = RunCache::default();
 
+    // Only "main" is actually fetched into the namespace; "target" is
+    // deliberately left out despite being claimed as listed below.
+    git::fetch_heads_into_namespace(source_dir.path(), &dest_url, &["main".to_string()]).unwrap();
+    let dest_listing = git::RemoteBranchListing {
+        names: vec!["main".to_string(), "target".to_string()],
+        completeness: Default::default(),
+    };
+
     let error = reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
+        &dest_listing,
         &["main".to_string(), "target".to_string()],
         &key,
         &mut run_cache,
     )
     .expect_err(
-        "a still-advertised branch whose fetch fails must abort reconstruction, not be \
-         silently recovered as absent",
+        "a branch the listing claims is present but the namespace has no ref for must fail \
+         loudly, not be silently treated as absent",
     );
-
-    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o644)).unwrap();
 
     let message = format!("{error:#}");
     assert!(
-        message.contains("fetch"),
-        "expected the propagated bulk fetch failure, got: {message}"
+        message.contains("fetched into the dest namespace but its ref is missing"),
+        "unexpected error: {message}"
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_even_alongside_an_unrelated_undecodable_ref()
+fn reconstruct_mapping_index_fails_loudly_when_a_listed_branch_has_no_namespace_ref_even_alongside_an_unrelated_undecodable_ref()
  {
-    use std::os::unix::fs::PermissionsExt;
-
     // decisions/0047's addendum established that an unrelated undecodable
     // ref must not disable the (now-removed) deleted-ref recovery for a
-    // distinct, valid-UTF-8 branch. This pins the same non-interference the
-    // other direction under decisions/0049's new all-or-nothing bulk fetch:
-    // an unrelated undecodable ref elsewhere must not open some new path
-    // back to recovering a real fetch failure either — it still propagates.
+    // distinct, valid-UTF-8 branch. This pins the same non-interference for
+    // the sibling test above's internal-inconsistency check: an unrelated
+    // undecodable ref elsewhere in the same listing must not disable it for
+    // a distinct, valid-UTF-8 branch either.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
@@ -2287,14 +2278,6 @@ fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_even_alongside_an_u
     packed_refs.push(b'\n');
     std::fs::write(dest_repo.path().join("packed-refs"), packed_refs).unwrap();
 
-    let hex = target_tip.to_string();
-    let object_path = dest_dir
-        .path()
-        .join("objects")
-        .join(&hex[..2])
-        .join(&hex[2..]);
-    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o000)).unwrap();
-
     let source_dir = tempdir().unwrap();
     let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
     let graft = source_repo
@@ -2313,25 +2296,35 @@ fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_even_alongside_an_u
     let key = marker::test_key();
     let mut run_cache = RunCache::default();
 
+    // A real listing, so its completeness genuinely carries the
+    // undecodable-ref cause — but only "main" is actually fetched into the
+    // namespace, leaving "target" inconsistent with what the listing
+    // claims.
+    let dest_listing = git::remote_branch_names(source_dir.path(), &dest_url).unwrap();
+    assert!(
+        dest_listing.names.contains(&"target".to_string()),
+        "target must be a real, decodable listed branch for this test to mean anything"
+    );
+    git::fetch_heads_into_namespace(source_dir.path(), &dest_url, &["main".to_string()]).unwrap();
+
     let error = reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
+        &dest_listing,
         &["main".to_string(), "target".to_string()],
         &key,
         &mut run_cache,
     )
     .expect_err(
-        "an unrelated undecodable ref must not open a path back to recovering a fetch \
-         failure for a distinct, valid-UTF-8 branch",
+        "an unrelated undecodable ref must not disable the internal-inconsistency check for a \
+         distinct, valid-UTF-8 branch",
     );
-
-    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o644)).unwrap();
 
     let message = format!("{error:#}");
     assert!(
-        message.contains("fetch"),
-        "expected the propagated bulk fetch failure, got: {message}"
+        message.contains("fetched into the dest namespace but its ref is missing"),
+        "unexpected error: {message}"
     );
 }
 
@@ -2376,11 +2369,14 @@ fn reconstruct_mapping_index_recovers_a_deleted_branch_alongside_an_unrelated_un
     let dest_url = dest_dir.path().display().to_string();
     let key = marker::test_key();
     let mut run_cache = RunCache::default();
+    let dest_listing = git::remote_branch_names(source_dir.path(), &dest_url).unwrap();
+    git::fetch_heads_into_namespace(source_dir.path(), &dest_url, &dest_listing.names).unwrap();
 
     let index = reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
+        &dest_listing,
         &["main".to_string(), "target".to_string()],
         &key,
         &mut run_cache,
@@ -3443,10 +3439,12 @@ fn add_bare_branch(repo: &Repository, branch: &str, files: &[(&str, &str)]) -> O
 /// as later steps land, instead of going red until step 7: originally 20
 /// (one fetch per advertised dest head in reconstruction, plus the
 /// unchanged per-branch dest→source and source→dest fetches); step 5
-/// (reconstruction reads the namespace) drops it to 9, independent of dest's
-/// branch count already for reconstruction's own share. Step 7 tightens this
-/// further to the run's final, fully dest-branch-count-independent constant
-/// and adds a second test proving the count no longer scales at all.
+/// (reconstruction reads the namespace) dropped it to 9; step 6 (dest→source
+/// reads the namespace too, and the listing/bulk fetch move to `run`) drops
+/// it to 5 — one listing, one bulk fetch, one git-version check, and one
+/// lease fetch per source branch (decisions/0040, unchanged) — already fully
+/// independent of dest's branch count. Step 7 adds a second test proving
+/// that directly (300 dest branches, same count).
 #[test]
 fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count() {
     let dest_dir = tempdir().unwrap();
@@ -3474,10 +3472,11 @@ fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count
     let count = git::subprocess_spawn_count();
 
     assert_eq!(
-        count, 9,
-        "PERF-001 step 5: a no-op sync with dest carrying 12 branches (2 configured on source) \
-         spawned {count} git subprocesses after reconstruction started reading the dest \
-         namespace instead of fetching per branch (was 20 before step 5); step 7 tightens this \
-         further to the run's final constant"
+        count, 5,
+        "PERF-001 step 6: a no-op sync with dest carrying 12 branches (2 configured on source) \
+         spawned {count} git subprocesses now that dest→source also reads the dest namespace \
+         instead of an ls-remote+fetch pair per branch (was 9 after step 5, 20 before step 5); \
+         step 7 adds a 300-branch test proving this count no longer scales with dest's branch \
+         count at all"
     );
 }

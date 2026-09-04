@@ -606,6 +606,7 @@ pub(super) fn reconstruct_mapping_index(
     repo: &Repository,
     source_root: &Path,
     dest_url: &str,
+    dest_listing: &git::RemoteBranchListing,
     source_branches: &[String],
     key: &marker::StateKey,
     run_cache: &mut RunCache,
@@ -630,11 +631,9 @@ pub(super) fn reconstruct_mapping_index(
     // branches are asked for directly rather than inferred from what source
     // still has.
     let mut dest_branch_names = source_branches.to_vec();
-    let dest_listing = git::remote_branch_names(source_root, dest_url)?;
-    // decisions/0049: every listed name is fetched in one transport, landing
-    // under the transient dest namespace this function reads from below
-    // instead of fetching each dest head individually.
-    git::fetch_heads_into_namespace(source_root, dest_url, &dest_listing.names)?;
+    // decisions/0049: the listing and its bulk fetch into the transient dest
+    // namespace both happen once in `run`, before either sync phase, and are
+    // shared with dest→source — not repeated here.
     // Existence for every listed name — and, when the listing can establish
     // absence, non-existence for every source branch it didn't list — is now
     // known from this one subprocess, recorded into the same cache
