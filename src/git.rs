@@ -704,7 +704,8 @@ fn clear_dest_head_namespace(repo: &git2::Repository) -> Result<()> {
             if existing.len() > crate::limits::MAX_SOURCE_BRANCHES {
                 anyhow::bail!(
                     "more than {} refs already exist under {FETCHED_DEST_NAMESPACE} — something \
-                     other than gitprism put them there",
+                     other than gitprism put them there; delete the refs under \
+                     {FETCHED_DEST_NAMESPACE} after investigating why they exist",
                     crate::limits::MAX_SOURCE_BRANCHES
                 );
             }
@@ -1983,6 +1984,54 @@ mod tests {
     }
 
     #[test]
+    fn fetch_heads_into_namespace_leaves_no_ref_for_any_listed_name_when_one_of_several_is_deleted_before_the_fetch()
+     {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+        repo_with_a_commit_on(dest_dir.path(), "other");
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        // HEAD must point elsewhere before "main" can be deleted.
+        repo_with_a_commit_on(dest_dir.path(), "unused");
+        dest_repo.set_head("refs/heads/unused").unwrap();
+        dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        let error = fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string(), "other".to_string()],
+        )
+        .expect_err(
+            "one of several listed branches deleted before the fetch must fail the whole fetch",
+        );
+
+        assert!(
+            error.to_string().contains("couldn't find remote ref")
+                || format!("{error:#}").contains("couldn't find remote ref"),
+            "expected git's own missing-ref message, got: {error:#}"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("main"))
+                .is_err(),
+            "a bulk fetch failure must leave no namespace ref behind for the deleted name"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("other"))
+                .is_err(),
+            "a bulk fetch failure must leave no namespace ref behind for any other listed name, \
+             not just the one that was actually deleted"
+        );
+    }
+
+    #[test]
     fn fetch_heads_into_namespace_round_trips_an_unusual_but_valid_branch_name() {
         let dest_dir = tempdir().unwrap();
         let tip = repo_with_a_commit_on(dest_dir.path(), "a/b.c-d");
@@ -2009,6 +2058,46 @@ mod tests {
     }
 
     #[test]
+    fn fetch_heads_into_namespace_bails_before_any_fetch_when_more_than_the_branch_limit_of_namespace_refs_already_exist()
+     {
+        let source_dir = tempdir().unwrap();
+        let tip = repo_with_a_commit_on(source_dir.path(), "carrier");
+        let source_repo = Repository::open(source_dir.path()).unwrap();
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES + 1 {
+            source_repo
+                .reference(
+                    &dest_head_namespace_ref(&format!("stale{index:05}")),
+                    tip,
+                    false,
+                    "stand-in for refs left by something other than gitprism",
+                )
+                .unwrap();
+        }
+
+        let error = fetch_heads_into_namespace(
+            source_dir.path(),
+            "/nonexistent/not-a-remote",
+            &["main".to_string()],
+        )
+        .expect_err("more than MAX_SOURCE_BRANCHES pre-existing namespace refs must bail");
+
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::limits::MAX_SOURCE_BRANCHES.to_string()),
+            "expected the overflow bail to name the limit, got: {error:#}"
+        );
+        assert_eq!(
+            source_repo
+                .references_glob(&format!("{FETCHED_DEST_NAMESPACE}*"))
+                .unwrap()
+                .count(),
+            crate::limits::MAX_SOURCE_BRANCHES + 1,
+            "a bail before any deletion or fetch must leave every pre-existing ref untouched"
+        );
+    }
+
+    #[test]
     fn fetch_heads_into_namespace_removes_a_stale_ref_from_a_previous_runs_namespace() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main");
@@ -2024,6 +2113,18 @@ mod tests {
                 "stand-in for a previous run's namespace entry",
             )
             .unwrap();
+        // A nested name (as `a/b.c-d` round-trips as a namespace ref) must be
+        // cleared by the glob just as readily as a flat one — the glob walks
+        // `refs/gitprism/fetched/dest/*` and a naive non-recursive match
+        // could miss a nested leaf.
+        source_repo
+            .reference(
+                &dest_head_namespace_ref("a/b"),
+                stale_tip,
+                false,
+                "stand-in for a previous run's nested namespace entry",
+            )
+            .unwrap();
 
         fetch_heads_into_namespace(
             source_dir.path(),
@@ -2037,6 +2138,13 @@ mod tests {
                 .find_reference(&dest_head_namespace_ref("deleted-on-dest"))
                 .is_err(),
             "a stale ref from a previous run's namespace must be cleared before this run's fetch"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("a/b"))
+                .is_err(),
+            "a nested stale ref from a previous run's namespace must be cleared too, not just a \
+             flat name"
         );
     }
 
