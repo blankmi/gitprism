@@ -2182,110 +2182,156 @@ fn reconstruct_mapping_index_degrades_to_a_per_branch_refusal_instead_of_abortin
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn fetch_dest_head_for_reconstruction_recovers_a_dest_branch_deleted_between_the_listing_and_its_fetch()
+fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_instead_of_recovering_a_missing_dest_ref()
  {
-    // decisions/0046 Addendum 2, Finding G: stands in for the listing
-    // having advertised `target` and another writer deleting it before
-    // this branch's own fetch runs. `run_cache` starts out believing
-    // exactly what a real listing would have reported (`true`); the ref is
-    // really gone by the time this call fetches it.
+    use std::os::unix::fs::PermissionsExt;
+
+    // decisions/0049 retires the per-branch fetch-and-refresh recovery
+    // decisions/0046 Addendum 2, Finding G established (a dest ref genuinely
+    // deleted between the listing and its own fetch was recovered as
+    // "absent"): reconstruction now fetches every listed dest head in one
+    // all-or-nothing transport, so a name whose fetch fails for any reason —
+    // deleted between listing and fetch, auth, network, transport, a corrupt
+    // remote — aborts reconstruction outright rather than being
+    // individually distinguished and recovered. `target` here is made
+    // unreadable rather than deleted (`ls-remote` never touches objects, so
+    // a genuine deletion wouldn't even reach the bulk fetch's own name
+    // list — see `git::fetch_heads_into_namespace`'s own tests in
+    // `src/git.rs` for that race at the layer it's actually reproducible),
+    // but the observable behavior pinned here — propagate, don't recover —
+    // is the same one Finding G's now-removed recovery used to special-case.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
-    // HEAD must point elsewhere before `target` can be deleted.
-    dest_repo.set_head("refs/heads/unused").unwrap();
-    dest_repo
-        .find_branch("target", git2::BranchType::Local)
-        .unwrap()
-        .delete()
-        .unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+    let target_tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
+
+    let hex = target_tip.to_string();
+    let object_path = dest_dir
+        .path()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        object_path.exists(),
+        "the tip commit must be a real loose object"
+    );
+    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o000)).unwrap();
 
     let source_dir = tempdir().unwrap();
-    Repository::init(source_dir.path()).unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    source_repo
+        .branch("target", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+
     let repo = Repository::open(source_dir.path()).unwrap();
     let dest_url = dest_dir.path().display().to_string();
+    let key = marker::test_key();
     let mut run_cache = RunCache::default();
-    run_cache.dest_ref_exists.insert("target".to_string(), true);
-    let mut refreshed_listing = None;
 
-    let head = fetch_dest_head_for_reconstruction(
+    let error = reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
-        "target",
+        &["main".to_string(), "target".to_string()],
+        &key,
         &mut run_cache,
-        &mut refreshed_listing,
     )
-    .expect("a genuinely deleted dest ref must be recovered, not fail the run");
-
-    assert_eq!(
-        head, None,
-        "a deleted dest ref contributes no dest head to reconstruction"
+    .expect_err(
+        "a still-advertised branch whose fetch fails must abort reconstruction, not be \
+         silently recovered as absent",
     );
-    assert_eq!(
-        run_cache.dest_ref_exists.get("target"),
-        Some(&false),
-        "the branch must be recorded as no longer having a dest ref"
+
+    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("fetch"),
+        "expected the propagated bulk fetch failure, got: {message}"
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn fetch_dest_head_for_reconstruction_recovers_a_deleted_branch_alongside_an_unrelated_undecodable_ref()
+fn reconstruct_mapping_index_propagates_a_bulk_fetch_failure_even_alongside_an_unrelated_undecodable_ref()
  {
-    // decisions/0047's addendum: an unrelated undecodable ref in the
-    // refreshed listing must not disable the line ~364 `can_establish_absence()`
-    // gate for a distinct, valid-UTF-8 branch — only the branch-limit
-    // horizon may. Otherwise identical to
-    // `fetch_dest_head_for_reconstruction_recovers_a_dest_branch_deleted_between_the_listing_and_its_fetch`.
+    use std::os::unix::fs::PermissionsExt;
+
+    // decisions/0047's addendum established that an unrelated undecodable
+    // ref must not disable the (now-removed) deleted-ref recovery for a
+    // distinct, valid-UTF-8 branch. This pins the same non-interference the
+    // other direction under decisions/0049's new all-or-nothing bulk fetch:
+    // an unrelated undecodable ref elsewhere must not open some new path
+    // back to recovering a real fetch failure either — it still propagates.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
-    // HEAD must point elsewhere before `target` can be deleted.
-    dest_repo.set_head("refs/heads/unused").unwrap();
-    dest_repo
-        .find_branch("target", git2::BranchType::Local)
-        .unwrap()
-        .delete()
-        .unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+    let target_tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
 
     // See `git::remote_branch_names_skips_an_undecodable_ref_and_marks_the_listing_incomplete`
     // for why this needs raw invalid UTF-8 bytes, not a literal U+FFFD.
     let mut packed_refs = Vec::new();
     packed_refs.extend_from_slice(b"# pack-refs with: peeled fully-peeled sorted\n");
-    packed_refs.extend_from_slice(tip.to_string().as_bytes());
+    packed_refs.extend_from_slice(target_tip.to_string().as_bytes());
     packed_refs.push(b' ');
     packed_refs.extend_from_slice(b"refs/heads/bad-");
     packed_refs.extend_from_slice(&[0xFF, 0xFE]);
     packed_refs.push(b'\n');
     std::fs::write(dest_repo.path().join("packed-refs"), packed_refs).unwrap();
 
+    let hex = target_tip.to_string();
+    let object_path = dest_dir
+        .path()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o000)).unwrap();
+
     let source_dir = tempdir().unwrap();
-    Repository::init(source_dir.path()).unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    source_repo
+        .branch("target", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+
     let repo = Repository::open(source_dir.path()).unwrap();
     let dest_url = dest_dir.path().display().to_string();
+    let key = marker::test_key();
     let mut run_cache = RunCache::default();
-    run_cache.dest_ref_exists.insert("target".to_string(), true);
-    let mut refreshed_listing = None;
 
-    let head = fetch_dest_head_for_reconstruction(
+    let error = reconstruct_mapping_index(
         &repo,
         source_dir.path(),
         &dest_url,
-        "target",
+        &["main".to_string(), "target".to_string()],
+        &key,
         &mut run_cache,
-        &mut refreshed_listing,
     )
-    .expect("an unrelated undecodable ref must not disable the deleted-ref recovery");
-
-    assert_eq!(
-        head, None,
-        "a deleted dest ref contributes no dest head to reconstruction"
+    .expect_err(
+        "an unrelated undecodable ref must not open a path back to recovering a fetch \
+         failure for a distinct, valid-UTF-8 branch",
     );
-    assert_eq!(
-        run_cache.dest_ref_exists.get("target"),
-        Some(&false),
-        "the branch must be recorded as no longer having a dest ref"
+
+    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("fetch"),
+        "expected the propagated bulk fetch failure, got: {message}"
     );
 }
 
@@ -2357,67 +2403,6 @@ fn reconstruct_mapping_index_recovers_a_deleted_branch_alongside_an_unrelated_un
     assert!(
         message.contains("not valid UTF-8"),
         "the refusal must name the real cause: {message}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn fetch_dest_head_for_reconstruction_propagates_a_fetch_failure_for_a_ref_still_advertised() {
-    use std::os::unix::fs::PermissionsExt;
-
-    // decisions/0046 Addendum 2, Finding G: `target` is still advertised
-    // by a refreshed listing (its ref is untouched), but its own object is
-    // made unreadable — `ls-remote` never touches objects so the listing
-    // still sees it, but the real `git fetch` fails, standing in for
-    // authentication/network/transport/corrupt-remote failures that must
-    // not be silently downgraded to "branch doesn't exist".
-    let dest_dir = tempdir().unwrap();
-    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
-    let tip = bare_repo_with_a_commit_on(dest_dir.path(), "target", &[("f.txt", "v1\n")]);
-    drop(dest_repo);
-
-    let hex = tip.to_string();
-    let object_path = dest_dir
-        .path()
-        .join("objects")
-        .join(&hex[..2])
-        .join(&hex[2..]);
-    assert!(
-        object_path.exists(),
-        "the tip commit must be a real loose object"
-    );
-    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o000)).unwrap();
-
-    let source_dir = tempdir().unwrap();
-    Repository::init(source_dir.path()).unwrap();
-    let repo = Repository::open(source_dir.path()).unwrap();
-    let dest_url = dest_dir.path().display().to_string();
-    let mut run_cache = RunCache::default();
-    run_cache.dest_ref_exists.insert("target".to_string(), true);
-    let mut refreshed_listing = None;
-
-    let error = fetch_dest_head_for_reconstruction(
-        &repo,
-        source_dir.path(),
-        &dest_url,
-        "target",
-        &mut run_cache,
-        &mut refreshed_listing,
-    )
-    .expect_err("a fetch failure for a still-advertised ref must propagate, not be recovered");
-
-    fs::set_permissions(&object_path, fs::Permissions::from_mode(0o644)).unwrap();
-
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("fetching destination branch"),
-        "unexpected error: {message}"
-    );
-    assert_eq!(
-        run_cache.dest_ref_exists.get("target"),
-        Some(&true),
-        "a still-advertised ref's cached existence must not be downgraded on an unrelated \
-         fetch failure"
     );
 }
 
@@ -3448,12 +3433,20 @@ fn add_bare_branch(repo: &Repository, branch: &str, files: &[(&str, &str)]) -> O
 }
 
 /// PERF-001 step 1 (docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md):
-/// a no-op run's subprocess count today scales with dest's branch count, not
-/// just with the branches gitprism actually needs to touch — reconstruction
-/// (decisions/0046) fetches dest's advertised heads one subprocess at a time.
-/// Dest has 12 branches; only 2 are configured (round-tripped) on source. The
-/// exact number asserted below is today's real baseline, not a guess — it is
-/// tightened to a dest-branch-count-independent constant in step 7.
+/// a no-op run's subprocess count originally scaled with dest's branch
+/// count, not just with the branches gitprism actually needs to touch —
+/// reconstruction (decisions/0046) fetched dest's advertised heads one
+/// subprocess at a time. Dest has 12 branches; only 2 are configured
+/// (round-tripped) on source. The count asserted below tracks the real
+/// number at each PERF-001 step rather than staying pinned to the original
+/// pre-change baseline, so this test keeps passing (with a shrinking count)
+/// as later steps land, instead of going red until step 7: originally 20
+/// (one fetch per advertised dest head in reconstruction, plus the
+/// unchanged per-branch dest→source and source→dest fetches); step 5
+/// (reconstruction reads the namespace) drops it to 9, independent of dest's
+/// branch count already for reconstruction's own share. Step 7 tightens this
+/// further to the run's final, fully dest-branch-count-independent constant
+/// and adds a second test proving the count no longer scales at all.
 #[test]
 fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count() {
     let dest_dir = tempdir().unwrap();
@@ -3481,10 +3474,10 @@ fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count
     let count = git::subprocess_spawn_count();
 
     assert_eq!(
-        count, 20,
-        "PERF-001 baseline: a no-op sync with dest carrying 12 branches (2 configured on \
-         source) spawned {count} git subprocesses before the fetch-once change (recorded here \
-         as today's actual number); step 7 tightens this assertion to a constant independent \
-         of dest's branch count"
+        count, 9,
+        "PERF-001 step 5: a no-op sync with dest carrying 12 branches (2 configured on source) \
+         spawned {count} git subprocesses after reconstruction started reading the dest \
+         namespace instead of fetching per branch (was 20 before step 5); step 7 tightens this \
+         further to the run's final constant"
     );
 }

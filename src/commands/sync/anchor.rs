@@ -580,61 +580,26 @@ pub(super) fn dest_ref_exists_cached(
     Ok(exists)
 }
 
-/// Fetches `branch`'s dest head for [`reconstruct_mapping_index`], resolving
-/// the decisions/0046 Addendum 2, Finding G list/fetch race: `branch` was
-/// advertised by reconstruction's own initial listing, but another writer
-/// may have deleted it before this call runs. On a fetch failure, the dest
-/// listing is refreshed at most once per run (via `refreshed_listing`,
-/// shared across every branch this run reconstructs) and the two outcomes
-/// are handled differently on purpose. A branch absent from the refreshed
-/// listing is fully recovered — *if* that listing can actually support "dest
-/// has no branch by this name" (decisions/0047 addendum:
-/// `can_establish_absence()`, true unless the branch-limit horizon was hit —
-/// an unrelated undecodable ref elsewhere never blocks this, since it
-/// doesn't stop the scan and can't be `branch` itself). Any other fetch
-/// failure — auth, network, transport, a corrupt remote, the branch still
-/// being advertised, or the listing unable to establish absence — propagates
-/// instead: silently skipping it would leave the mapping index incomplete
-/// while every other branch's lookup still believed it complete, the exact
-/// "a visible mapping hides an unscanned contradiction" hole Addendum 1
-/// closed. A per-branch halt is the right shape for a per-branch fact;
-/// reconstruction's completeness is a whole-run fact.
-pub(super) fn fetch_dest_head_for_reconstruction(
-    repo: &Repository,
-    source_root: &Path,
-    dest_url: &str,
-    branch: &str,
-    run_cache: &mut RunCache,
-    refreshed_listing: &mut Option<git::RemoteBranchListing>,
-) -> Result<Option<Oid>> {
-    let fetch_err = match git::fetch(source_root, dest_url, branch) {
-        Ok(()) => {
-            let tip = repo
-                .find_reference("FETCH_HEAD")
-                .context("reading FETCH_HEAD after fetching a destination branch")?
+/// Reads `branch`'s dest head back from decisions/0049's transient fetch
+/// namespace (`refs/gitprism/fetched/dest/<branch>`), populated by
+/// [`git::fetch_heads_into_namespace`] just before this is called. `Ok(None)`
+/// means no ref exists there for `branch` — expected only for a branch that
+/// was never part of the bulk fetch's own name list in the first place (see
+/// [`reconstruct_mapping_index`]'s caller of this function for when that's
+/// legitimate); any other read failure propagates.
+fn dest_head_from_namespace(repo: &Repository, branch: &str) -> Result<Option<Oid>> {
+    match repo.find_reference(&git::dest_head_namespace_ref(branch)) {
+        Ok(reference) => Ok(Some(
+            reference
                 .peel_to_commit()
-                .context("resolving a fetched destination branch to a commit")?
-                .id();
-            return Ok(Some(tip));
-        }
-        Err(err) => err,
-    };
-    if refreshed_listing.is_none() {
-        *refreshed_listing = Some(
-            git::remote_branch_names(source_root, dest_url)
-                .context("refreshing the dest branch listing after a fetch failure")?,
-        );
+                .with_context(|| format!("resolving destination branch {branch:?}'s fetched head"))?
+                .id(),
+        )),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!("reading destination branch {branch:?}'s fetched head from the dest namespace")
+        }),
     }
-    let listing = refreshed_listing.as_ref().expect("just populated above");
-    if listing.completeness.can_establish_absence()
-        && !listing.names.iter().any(|name| name == branch)
-    {
-        run_cache.dest_ref_exists.insert(branch.to_string(), false);
-        return Ok(None);
-    }
-    Err(fetch_err.context(format!(
-        "fetching destination branch {branch:?} from configured remote"
-    )))
 }
 
 pub(super) fn reconstruct_mapping_index(
@@ -666,6 +631,10 @@ pub(super) fn reconstruct_mapping_index(
     // still has.
     let mut dest_branch_names = source_branches.to_vec();
     let dest_listing = git::remote_branch_names(source_root, dest_url)?;
+    // decisions/0049: every listed name is fetched in one transport, landing
+    // under the transient dest namespace this function reads from below
+    // instead of fetching each dest head individually.
+    git::fetch_heads_into_namespace(source_root, dest_url, &dest_listing.names)?;
     // Existence for every listed name — and, when the listing can establish
     // absence, non-existence for every source branch it didn't list — is now
     // known from this one subprocess, recorded into the same cache
@@ -694,20 +663,35 @@ pub(super) fn reconstruct_mapping_index(
     }
 
     let mut dest_heads = Vec::new();
-    let mut refreshed_listing = None;
     for branch in &dest_branch_names {
         if !dest_ref_exists_cached(source_root, dest_url, branch, run_cache)? {
             continue;
         }
-        if let Some(tip) = fetch_dest_head_for_reconstruction(
-            repo,
-            source_root,
-            dest_url,
-            branch,
-            run_cache,
-            &mut refreshed_listing,
-        )? {
-            dest_heads.push((branch.clone(), tip));
+        match dest_head_from_namespace(repo, branch)? {
+            Some(tip) => dest_heads.push((branch.clone(), tip)),
+            None if dest_listing.names.iter().any(|name| name == branch) => {
+                // The bulk fetch above is all-or-nothing over its whole name
+                // list (decisions/0049): if it succeeded at all, every name
+                // in `dest_listing.names` has a namespace ref. Reaching here
+                // for one of those names is an internal inconsistency, not a
+                // legitimate absence.
+                anyhow::bail!(
+                    "destination branch {branch:?} was fetched into the dest namespace but its \
+                     ref is missing there afterward"
+                );
+            }
+            None => {
+                // Not part of the bulk fetch's own name list at all: only
+                // reachable when the listing hit `MAX_SOURCE_BRANCHES` (so
+                // `dest_ref_exists_cached` above fell back to a live
+                // `remote_ref_exists` check for a source branch beyond the
+                // horizon) and that check found a dest ref anyway. The same
+                // horizon already makes this reconstruction incomplete
+                // (`note_incomplete_reconstruction` below), which taints
+                // every exact lookup regardless — fetching this one branch's
+                // head individually would not make any lookup usable, so it
+                // is skipped instead of reintroducing a per-branch fetch.
+            }
         }
     }
     let mut index = MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)?;
