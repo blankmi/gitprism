@@ -3088,10 +3088,15 @@ Both forks are removed. `marker::load_key_from_env`/
 and pin-comparison primitives, respectively. A new `SecretSource` trait
 (`src/commands/mod.rs`) is read on demand — `state_key()`/
 `expected_policy_digest()`, called at the exact point each command already
-read the key/verified policy — so introducing it changes no command's
-observable error precedence: `sync`/`resolve` still read the key before
-loading policy, `setup` still loads and verifies policy before reading the
-key. `main.rs` supplies `EnvSecrets`; tests supply `FixedSecrets`, built via
+read the key/verified policy — so introducing it leaves each command's
+observable error precedence unchanged: `sync`/`resolve` still read the key
+before loading policy, `setup` still loads and verifies policy before reading
+the key. One precedence detail did shift: the pin is now read from the
+environment immediately before `policy::load`, rather than inside policy
+verification after the control files are read, so with the pin unset *and*
+the control files missing/unreadable, the error is now "pin must be set"
+rather than the control-file error (see decisions/0026's addendum). `main.rs`
+supplies `EnvSecrets`; tests supply `FixedSecrets`, built via
 `FixedSecrets::for_fixture` in `src/testutil.rs`, which recomputes its
 digest from the fixture's own files on every call rather than gathering it
 once upfront. See [decisions/0026](decisions/0026-protected-versioned-policy.md)'s
