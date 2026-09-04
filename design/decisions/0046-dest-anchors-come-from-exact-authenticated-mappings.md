@@ -568,6 +568,10 @@ The two failure classes are resolved differently, and deliberately so:
 A per-branch halt is the right shape for a per-branch fact. Reconstruction's
 completeness is a whole-run fact, and it stays one.
 
+**[Amended by decisions/0049: this per-branch fetch and its list/fetch race
+recovery are removed — the bulk namespace fetch is all-or-nothing, so a ref
+deleted in that window now fails the whole fetch before any mutation.]**
+
 **Finding H — the post-push bookkeeping path is genuinely infallible.**
 Addendum 1 states that recording a mapping this run's own push authored
 "always succeeds," and restructured `run()`'s accepted-push arm specifically
@@ -615,6 +619,10 @@ per-branch fetch is deliberately *kept*: decisions/0040 requires a
 that attempt, and the race-retry loop must refetch after a
 `RejectedRefMoved` rejection. The duplicate fetch is the price of lease
 freshness, stated here rather than left looking like an oversight.
+
+**[Amended by decisions/0049: "the duplicate fetch" now names exactly one
+duplicate, the source→dest lease fetch — reconstruction's own fetch is
+replaced by the shared bulk-fetch namespace.]**
 
 **Finding L — `loop_prevented` parses once.** It calls
 `marker::verify(commit, branch, &[Setup, DestToSource], ...)`, then on

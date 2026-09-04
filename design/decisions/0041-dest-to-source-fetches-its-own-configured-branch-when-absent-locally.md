@@ -62,6 +62,9 @@ push-race retry. Concretely, on `git2::ErrorCode::NotFound` from `find_branch`:
 
 1. Fetch `branch` from `config.source_url()` (same call already used by the retry
    path and by dest→source's own dest fetch).
+   **[Amended by decisions/0049: dest→source no longer does its own per-branch
+   dest fetch — it reads the dest tip from the bulk-fetch namespace instead;
+   this fetch, for `branch` on source, is unaffected.]**
 2. Create `refs/heads/<branch>` at the fetched tip (`repo.reference(..., force:
    false)`), matching what `git fetch origin <branch>:<branch>` would leave behind.
    HEAD is left untouched — no working-tree checkout happens, same as a real `git
