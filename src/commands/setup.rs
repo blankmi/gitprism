@@ -2675,4 +2675,38 @@ mod tests {
             std::env::remove_var("GITPRISM_POLICY_SHA256");
         }
     }
+
+    // TEST-001 review fix (MEDIUM): the precedence tests above run through
+    // `run` (the `#[cfg(test)]` `FixedSecrets` shim), whose `state_key()`
+    // is infallible — repository-discovery-before-key ordering can't
+    // actually fail on the key there, so it proves nothing about
+    // production's `run_with` + `EnvSecrets` path. This exercises that
+    // path directly, with both env vars unset, against a directory that
+    // is not a git repository at all.
+    #[test]
+    fn run_with_reports_the_repository_error_for_a_wrong_cwd_not_the_key_or_pin_error() {
+        let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("GITPRISM_STATE_KEY");
+            std::env::remove_var("GITPRISM_POLICY_SHA256");
+        }
+
+        let dir = tempdir().unwrap();
+
+        let error = run_with(
+            dir.path(),
+            Path::new(".gitprism.toml"),
+            &crate::commands::EnvSecrets,
+        )
+        .expect_err("running outside any git repository must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be run inside an existing git repository"),
+            "expected the repository-discovery error, got: {message}"
+        );
+        assert!(
+            !message.contains("GITPRISM_STATE_KEY") && !message.contains("GITPRISM_POLICY_SHA256"),
+            "the repository error must not be shadowed by a key/pin complaint: {message}"
+        );
+    }
 }

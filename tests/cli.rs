@@ -46,9 +46,14 @@ fn sync_in_an_empty_directory_with_no_env_fails_and_names_the_requirement() {
         "sync in an empty directory with no env must not exit 0"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Repository discovery runs before state-key validation (F-14, see
+    // src/commands/sync/mod.rs's `run_with`), and the fixture directory is
+    // deliberately not a repository with both env vars absent, so this is
+    // deterministic: it must always be the repository error, never the
+    // state-key one.
     assert!(
-        stderr.contains("git repository") || stderr.contains("GITPRISM_STATE_KEY"),
-        "expected the repository or state-key requirement named in stderr, got: {stderr:?}"
+        stderr.contains("git repository"),
+        "expected the repository requirement named in stderr, got: {stderr:?}"
     );
 }
 
