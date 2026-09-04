@@ -78,3 +78,14 @@ fixture's own control files on every call, never gathered once upfront, so
 gitprism's own decision to authenticate this pin is now something a test can
 actually prove holds, rather than something only a real deployment ever
 exercised.
+
+One precedence case does shift: before this refactor,
+`GITPRISM_POLICY_SHA256` was read inside `verify_expected_digest`, i.e.
+*after* the control files (`.gitprism.toml`/`.gitprismignore`) had already
+been read. Now `expected_digest_from_env()` runs immediately before
+`policy::load`, so with the pin unset **and** a control file missing or
+unreadable, a real run reports "GITPRISM_POLICY_SHA256 must be set..."
+instead of the control-file-read error. Harmless — both are refusals before
+any fetch or mutation — and arguably better (it names the more fundamental
+problem first), but it is a real, if narrow, change to observable error
+precedence, not covered by "unchanged by this addendum" above.
