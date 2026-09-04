@@ -116,7 +116,7 @@ fn dest_tip_accounted_for(
     })
 }
 
-/// decisions/0048, CODE-001 step 5: a *safety-only* widening of
+/// decisions/0048 addendum: a *safety-only* widening of
 /// [`dest_tip_accounted_for`]'s case 3, consulted solely by
 /// [`dest_resume_point_for_branch`] — never by
 /// [`super::branch_scoped_dest_tip`] (decisions/0044's F-02 identity
@@ -156,100 +156,63 @@ fn dest_tip_accounted_for(
 /// `hotfix`'s dest tip as if it were new — a same-line conflict, or silent
 /// duplication for non-conflicting content.
 ///
-/// **CODE-001 (found by review, before this was ever committed):** the
-/// check this needs is not "does `newest_source_marker` find *something*
-/// branded for `branch`". An earlier draft used exactly that, as one half of
-/// an either/or with "or nothing on the line carries a `SourceToDest`
-/// marker at all" — and that either/or is unsafe. `newest_source_marker`
-/// stops at the first branch-scoped match it finds walking *down* from
-/// `dest_tip`; a *foreign*-branded marker sitting *above* the branch-scoped
-/// one it eventually finds makes that scan return a stale, older boundary,
-/// while this function's own representation walk above (case 1 doesn't care
-/// whose marker it is) still grants representation, because the foreign
-/// marker is itself represented via case 1/case 2. The either/or then
-/// granted safety on the stale boundary, and the branch replayed content the
-/// foreign marker had already mirrored as new commits — reproduced by
-/// execution (mirror `main` partway, mirror `release` further along the
-/// same source line so its own marker lands above `main`'s on dest, fast-
-/// forward dest `main` onto dest `release`'s tip, then sync `main` again)
-/// before being fixed.
-///
-/// The correct question is asked in one walk instead,
-/// [`newest_source_to_dest_marker_branch_between`]: whichever self-verified
-/// `SourceToDest` marker is *newest* anywhere on the **whole** of dest's
-/// first-parent line — regardless of whose own branch-scoped scan would or
-/// wouldn't find it, and regardless of where B1 itself sits on that line —
-/// must be branded for `branch` itself, or there must be no such marker at
-/// all on the line (genuinely nothing has ever been mirrored onto this line,
-/// so `newest_source_marker`'s own `None` and its graft fallback are
-/// correct, not a blind spot).
-///
-/// **CODE-001 (found by a second review, before this was ever committed):**
-/// an earlier version of this walk searched only `dest_tip` down to (and
-/// including) B1 — the same range [`dest_to_source_boundary`] itself is
-/// bounded to. That range is *not* what this check needs: B1 is advanced by
-/// dest→source imports, which never consult this safety gate at all, so the
-/// newest mirror marker actually on the line can sit *below* B1 once an
-/// import has moved past it. Bounding the walk at B1 then found nothing in
-/// range, granted safety on an empty search, and let
-/// [`newest_source_marker`]'s own unbounded scan (used next, by
-/// [`dest_resume_point_for_branch`], to compute the real push boundary)
-/// walk straight past that foreign-branded marker to a stale one further
-/// down — resuming from it and replaying already-mirrored content as a
-/// phantom conflict, reproduced by execution. Searching the whole line
-/// instead of stopping at B1 is safe by construction: representation
-/// (checked separately, above) can only ever *shrink* what a wider search
-/// here would refuse, never grant something the B1-bounded search wouldn't
-/// already have. A `dest_tip` represented only via a foreign-branded
-/// marker — whether above B1 (the original bug this function fixed) or
-/// below it (this one) — still refuses today's way, and the operator's
-/// existing recovery (delete the stray dest ref; the `!dest_ref_exists` arm
-/// then re-anchors it via decisions/0046 and `branch_scoped_dest_tip` writes
-/// it a marker of its own) stands.
+/// The check this needs is not "does `newest_source_marker` find
+/// *something* branded for `branch`, or does the line carry no
+/// `SourceToDest` marker at all" — that either/or is unsafe:
+/// `newest_source_marker` stops at the first branch-scoped match it finds
+/// walking down from `dest_tip`, so a *foreign*-branded marker sitting
+/// *above* it (itself represented via case 1/case 2) would grant safety on a
+/// stale, older boundary. See decisions/0048's addendum ("Corrected by a
+/// second review") for the failure case and repro. The correct question is
+/// asked in one walk instead, [`newest_source_to_dest_marker_branch_between`]:
+/// whichever self-verified `SourceToDest` marker is *newest* anywhere on the
+/// **whole** of dest's first-parent line — regardless of whose own
+/// branch-scoped scan would or wouldn't find it, and regardless of where B1
+/// itself sits on that line — must be branded for `branch` itself, or there
+/// must be no such marker at all on the line (genuinely nothing has ever
+/// been mirrored onto this line, so `newest_source_marker`'s own `None` and
+/// its graft fallback are correct, not a blind spot). That walk is
+/// deliberately unbounded by B1, not just by `dest_tip` down to it: B1 is
+/// advanced by dest→source imports, which never consult this safety gate,
+/// so the newest mirror marker on the line can legitimately sit below B1
+/// once an import has moved past it (see that function's own doc comment).
+/// A `dest_tip` represented only via a foreign-branded marker — above or
+/// below B1 — still refuses today's way, and the operator's existing
+/// recovery (delete the stray dest ref; the `!dest_ref_exists` arm then
+/// re-anchors it via decisions/0046 and `branch_scoped_dest_tip` writes it a
+/// marker of its own) stands.
 ///
 /// The walk's own B1-ancestor precondition is checked directly here first,
 /// rather than by catching [`dest_to_source_boundary`]'s `Err`: a `dest_tip`
 /// that simply isn't accounted for at all (nothing has synced yet, or a
 /// genuine, ordinary divergence) must stay a per-branch `false` — the shape
 /// every caller of this function already expects — not escalate into a
-/// whole-run abort. **CODE-002 (found by the same review):**
-/// [`b1_reachable_via_first_parent`] pre-checks, and converts to `false` the
-/// same way, the refusal [`dest_to_source_boundary`] would otherwise `bail!`
-/// on: decisions/0019's first-parent limitation tripping on a `dest_tip`
-/// already confirmed by full-ancestry `graph_descendant_of` to descend from
-/// B1, but whose first-parent line never actually reaches it. Left
-/// unchecked, that `bail!` propagated as `Err` through this function's own
-/// `?` all the way up — for a *configured* branch this makes no difference
-/// (`sync_pair_to_dest_with_key` already bails the identical way on its own
-/// `?`), but for a *discovered* branch it aborted the *entire* run instead
-/// of the per-branch halt decisions/0046 Addendum 2 requires ("every new
-/// bound is a horizon or a per-branch halt, never a whole-run abort").
-/// [`newest_source_to_dest_marker_branch_between`] no longer shares this
-/// exact precondition (CODE-001's fix above made it walk to the true end of
-/// dest's first-parent line unconditionally, with no B1 of its own to miss),
-/// but the pre-check still runs before it too, ahead of
-/// [`dest_to_source_boundary`], since both are called from here in sequence
-/// and the precondition is cheap. Only the scan-limit bail from either walk
-/// is still left to propagate as a genuine hard error, exactly as every
+/// whole-run abort. [`b1_reachable_via_first_parent`] pre-checks, and
+/// converts to `false` the same way, the refusal [`dest_to_source_boundary`]
+/// would otherwise `bail!` on: decisions/0019's first-parent limitation
+/// tripping on a `dest_tip` already confirmed by full-ancestry
+/// `graph_descendant_of` to descend from B1, but whose first-parent line
+/// never actually reaches it — left unchecked, that `Err` would abort the
+/// *entire* run for a *discovered* branch instead of the per-branch halt
+/// decisions/0046 Addendum 2 requires. Only the scan-limit bail from either
+/// walk is still left to propagate as a genuine hard error, exactly as every
 /// other bounded marker scan in this codebase already does (decisions/0032).
 /// `newest_dest_marker` ends up scanning source's first-parent line more
 /// than once across this function and its callees (here, again inside
 /// [`dest_to_source_boundary`]'s own B1 lookup) — the same "cheap,
 /// deliberate, no plumbing" tradeoff [`dest_resume_point_for_branch`]
-/// already accepts for recomputing the graft point, not an oversight; the
-/// B1-reachability pre-check adds one more such redundant walk for the same
-/// reason.
+/// already accepts for recomputing the graft point, not an oversight.
 ///
-/// **CODE-004 (undocumented precondition):** this function returns `Ok(false)`
-/// whenever `b1 == dest_tip`, since `graph_descendant_of` is non-reflexive
-/// (a commit is never its own descendant) and `b1_is_ancestor` above is
-/// `false` for that input. Harmless today only because this function's sole
-/// caller, [`dest_resume_point_for_branch`], never reaches it with
-/// `b1 == dest_tip`: [`dest_tip_is_accounted_for`]'s own case 3 already
-/// returns `ViaPriorGitprismSync` for exactly that oid and short-circuits
-/// the `||` before this function is called. A future caller invoking this
-/// function directly with `b1 == dest_tip`, expecting it to answer "yes,
-/// trivially represented", would get the wrong answer.
+/// **Undocumented precondition:** this function returns `Ok(false)` whenever
+/// `b1 == dest_tip`, since `graph_descendant_of` is non-reflexive (a commit
+/// is never its own descendant) and `b1_is_ancestor` above is `false` for
+/// that input. Harmless today only because this function's sole caller,
+/// [`dest_resume_point_for_branch`], never reaches it with `b1 == dest_tip`:
+/// [`dest_tip_is_accounted_for`]'s own case 3 already returns
+/// `ViaPriorGitprismSync` for exactly that oid and short-circuits the `||`
+/// before this function is called. A future caller invoking this function
+/// directly with `b1 == dest_tip`, expecting it to answer "yes, trivially
+/// represented", would get the wrong answer.
 fn dest_tip_represented_in_source(
     repo: &Repository,
     source_tip: Oid,
@@ -282,28 +245,25 @@ fn dest_tip_represented_in_source(
     )
 }
 
-/// CODE-002: whether `b1` is reachable from `dest_tip` via dest's
-/// first-parent line alone (decisions/0019) — checked before
-/// [`dest_to_source_boundary`] runs its own first-parent walk down to B1, so
-/// that walk's own `bail!` for this exact shape doesn't have to propagate as
-/// `Err` through [`dest_tip_represented_in_source`]'s `?` — see that
-/// function's own doc comment for why an `Err` here is unsafe for a
-/// discovered branch. [`newest_source_to_dest_marker_branch_between`] no
-/// longer shares this precondition (CODE-001: it now walks the whole of
-/// dest's first-parent line unconditionally, with no B1 of its own to miss),
-/// but this still runs ahead of it too, since both walks are called from the
-/// same place in sequence and the precondition is cheap. Bounded by
+/// Whether `b1` is reachable from `dest_tip` via dest's first-parent line
+/// alone (decisions/0019) — checked before [`dest_to_source_boundary`] runs
+/// its own first-parent walk down to B1, so that walk's own `bail!` for this
+/// exact shape doesn't have to propagate as `Err` through
+/// [`dest_tip_represented_in_source`]'s `?` — see that function's own doc
+/// comment for why an `Err` here is unsafe for a discovered branch.
+/// [`newest_source_to_dest_marker_branch_between`] doesn't share this
+/// precondition (it walks the whole of dest's first-parent line
+/// unconditionally, with no B1 of its own to miss), but this still runs
+/// ahead of it too, since both walks are called from the same place in
+/// sequence and the precondition is cheap. Bounded by
 /// [`limits::MAX_MARKER_SCAN_COMMITS`] the same way every other scan in this
 /// module is (decisions/0032); exceeding it is still a genuine hard error,
-/// not converted to `false`.
-///
-/// **CODE-003:** this function's own scan-limit `bail!` is, in practice, the
-/// one whole-run-abort path decisions/0048's addendum left standing for a
-/// discovered branch — reached only if dest's first-parent line exceeds
-/// `MAX_MARKER_SCAN_COMMITS` commits without ever reaching B1, which needs a
-/// first-parent line over 100,000 commits long. Practically unreachable, but
-/// the addendum's "never a whole-run abort" framing isn't unconditionally
-/// true because of it.
+/// not converted to `false` — in practice the one whole-run-abort path
+/// decisions/0048's addendum left standing for a discovered branch, reached
+/// only if dest's first-parent line exceeds `MAX_MARKER_SCAN_COMMITS`
+/// commits without ever reaching B1 (over 100,000 commits), so the
+/// addendum's "never a whole-run abort" framing isn't unconditionally true
+/// because of it.
 fn b1_reachable_via_first_parent(repo: &Repository, dest_tip: Oid, b1: Oid) -> Result<bool> {
     let mut current = dest_tip;
     for _ in 0..limits::MAX_MARKER_SCAN_COMMITS {
@@ -326,24 +286,23 @@ fn b1_reachable_via_first_parent(repo: &Repository, dest_tip: Oid, b1: Oid) -> R
     )
 }
 
-/// CODE-001: the recorded branch of the *newest* self-verified
-/// `SourceToDest` marker anywhere on the **whole** of dest's first-parent
-/// line from `dest_tip` (bounded only by
-/// [`limits::MAX_MARKER_SCAN_COMMITS`], the same static limit every other
-/// marker scan in this module uses — decisions/0032), regardless of that
-/// marker's own recorded branch — [`dest_tip_represented_in_source`]'s
-/// replacement for the unsafe either/or its doc comment describes. Walking
-/// newest-first from `dest_tip` means the first self-verified marker this
-/// finds *is* the newest one, so no separate "which one is newest"
-/// comparison is needed. `Ok(None)` means nothing has ever been mirrored
-/// onto this line at all — `newest_source_marker`'s own `None`/graft-fallback
-/// case is genuinely safe, not a blind spot.
+/// The recorded branch of the *newest* self-verified `SourceToDest` marker
+/// anywhere on the **whole** of dest's first-parent line from `dest_tip`
+/// (bounded only by [`limits::MAX_MARKER_SCAN_COMMITS`], the same static
+/// limit every other marker scan in this module uses — decisions/0032),
+/// regardless of that marker's own recorded branch —
+/// [`dest_tip_represented_in_source`]'s replacement for the unsafe either/or
+/// its doc comment describes. Walking newest-first from `dest_tip` means the
+/// first self-verified marker this finds *is* the newest one, so no separate
+/// "which one is newest" comparison is needed. `Ok(None)` means nothing has
+/// ever been mirrored onto this line at all — `newest_source_marker`'s own
+/// `None`/graft-fallback case is genuinely safe, not a blind spot.
 ///
 /// Deliberately **not** bounded to B1 (contrast [`dest_to_source_boundary`],
-/// which is): see [`dest_tip_represented_in_source`]'s own doc comment,
-/// CODE-001, for why a B1-bounded version of this exact walk is unsafe — B1
-/// is advanced by dest→source imports this check never consults, so the
-/// newest mirror marker on the line can legitimately sit below it. Walking
+/// which is): see [`dest_tip_represented_in_source`]'s own doc comment for
+/// why a B1-bounded version of this exact walk is unsafe — B1 is advanced by
+/// dest→source imports this check never consults, so the newest mirror
+/// marker on the line can legitimately sit below it. Walking
 /// the whole line instead makes this exactly the range
 /// [`newest_source_marker`] itself walks (unbounded, first-parent-only), so
 /// the two can no longer disagree about what the newest marker on the line

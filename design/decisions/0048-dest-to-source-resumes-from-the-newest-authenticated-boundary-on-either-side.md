@@ -312,6 +312,16 @@ of reflecting it back.
   directly (`resolve.rs:1171`, `:1258`), picks up the fix with no change of
   its own — resolve and sync must never disagree about which dest commit is
   next ([decisions/0008](0008-ship-resolve-helper.md)'s original invariant).
+* Even with the memoized case-2 set, each case-2 miss still bails at
+  `MAX_MARKER_SCAN_COMMITS` on source's first-parent history — and every
+  ordinary dest-native commit above B1 is a case-2 miss. Before this
+  decision, dest→source needed only B1 to be within
+  `MAX_MARKER_SCAN_COMMITS` of `dest_tip`; now it also needs source's
+  first-parent line, walked from `source_tip`, to be within that same bound
+  — a hard-failure envelope this decision introduces, not merely a cost
+  increase. Fails closed, as every other bounded scan in this codebase does,
+  but an implementer should not read the memoization mitigation above as
+  removing this ceiling.
 
 # Rejected alternatives
 
