@@ -3072,3 +3072,52 @@ Q`/`Finding R`/`Finding S`; comment-only, no behaviour change.
 Full suite: 370 passed (unchanged — this work is doc/comment-only); `cargo
 fmt --all -- --check` and `cargo clippy --workspace --all-targets
 --all-features -- -D warnings` clean.
+
+## 2026-09-04 — TEST-001 closed: the policy pin and pair key are enforced under test
+
+`docs/plans/2026-09-02/TEST-001-pin-and-key-enforcement.md` is fully
+implemented. Original finding: `marker::load_key` and
+`policy::verify_expected_digest` forked on `#[cfg(test)]` to always succeed,
+so `GITPRISM_STATE_KEY` and `GITPRISM_POLICY_SHA256`'s production branches
+were dead code in every test build, and nothing asserted that a wrong or
+missing value refuses before any fetch or ref mutation.
+
+Both forks are removed. `marker::load_key_from_env`/
+`policy::expected_digest_from_env` always read the real environment;
+`marker::test_key()` and policy's `verify_digest` are the explicit test-only
+and pin-comparison primitives, respectively. A new `SecretSource` trait
+(`src/commands/mod.rs`) is read on demand — `state_key()`/
+`expected_policy_digest()`, called at the exact point each command already
+read the key/verified policy — so introducing it changes no command's
+observable error precedence: `sync`/`resolve` still read the key before
+loading policy, `setup` still loads and verifies policy before reading the
+key. `main.rs` supplies `EnvSecrets`; tests supply `FixedSecrets`, built via
+`FixedSecrets::for_fixture` in `src/testutil.rs`, which recomputes its
+digest from the fixture's own files on every call rather than gathering it
+once upfront. See [decisions/0026](decisions/0026-protected-versioned-policy.md)'s
+new addendum.
+
+Nine new refusal tests (three per command) prove an unset
+`GITPRISM_STATE_KEY` or a wrong `GITPRISM_POLICY_SHA256` refuses before any
+fetch or ref/tree mutation — no dest ref movement, no `FETCH_HEAD`, no
+`OperationLock` file — and that correct values let the real env-reading path
+run to completion. Three more prove today's per-command precedence
+(`sync`/`resolve`: missing key reported before a missing config file;
+`setup`: missing config file reported before a missing key). A new
+`tests/cli.rs` exercises the actual compiled binary
+(`env!("CARGO_BIN_EXE_gitprism")`): `--version`, a `sync` refusal with no
+repository or env, and `policy-hash`'s output against a known-answer digest
+shared by value with a new unit test in `src/policy.rs` (the crate has no
+`[lib]` target, so the integration test can't call `digest_bytes` directly).
+
+Landed as five commits rather than six: steps 2 (remove the forks) and 3
+(introduce `SecretSource`) cannot each be independently green — step 2
+alone leaves every existing fixture test failing at runtime with no
+substitution mechanism yet, and step 3 alone breaks compilation of those
+same call sites again until step 4's fixture migration — so they're one
+commit together with step 4.
+
+Full suite: 386 passed (383 unit + 3 `tests/cli.rs`, up from the 370
+baseline plus these sixteen); `cargo fmt --all -- --check` and `cargo
+clippy --workspace --all-targets --all-features -- -D warnings` clean;
+`cargo build --release --locked` succeeds.

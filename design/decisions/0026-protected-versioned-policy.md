@@ -55,3 +55,26 @@ policy and store that value as the protected `GITPRISM_POLICY_SHA256` variable.
 Changing either versioned policy file requires an explicit digest update.
 Repository-controlled policy can no longer redirect a mutating run merely by
 changing a branch tip, and a failed verification leaves Git state untouched.
+
+# Addendum (2026-09-04): the pin is a parameter, read from the environment only at the CLI boundary
+
+`policy::load`/`policy::load_from_bytes` take the expected digest as a plain
+`&str` parameter; they never read `GITPRISM_POLICY_SHA256` themselves.
+`policy::expected_digest_from_env()` is the one place that variable is read,
+and `marker::load_key_from_env()` is the equivalent for `GITPRISM_STATE_KEY`.
+Both used to be reachable only through a `#[cfg(test)]` fork that made every
+test build's key/digest check trivially succeed regardless of either
+variable's real state (TEST-001) — dead code the test suite never exercised.
+
+Each command's entry point now takes a `secrets: &dyn SecretSource`
+(`src/commands/mod.rs`) and calls `secrets.state_key()`/
+`secrets.expected_policy_digest()` at the exact point it read
+`marker::load_key()`/verified the policy digest before, so today's
+per-command error precedence (decisions recorded elsewhere; unchanged by
+this addendum) is preserved. `main.rs` supplies `EnvSecrets`, which reads
+both variables from the real environment on every call. Tests supply
+`FixedSecrets` explicitly — a fixed key plus a digest recomputed from the
+fixture's own control files on every call, never gathered once upfront, so
+gitprism's own decision to authenticate this pin is now something a test can
+actually prove holds, rather than something only a real deployment ever
+exercised.
