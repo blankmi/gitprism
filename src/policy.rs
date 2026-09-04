@@ -472,6 +472,23 @@ mod tests {
         assert_ne!(digest, digest_bytes(b"a", b"bc"));
     }
 
+    // TEST-001 step 5: `tests/cli.rs` runs the real `policy-hash` binary over
+    // these same fixed bytes and asserts it prints this same digest. The
+    // crate has no `[lib]` target, so `tests/cli.rs` (an external
+    // integration test) can't call `digest_bytes` directly to compute the
+    // expected value itself — this constant is duplicated by value in both
+    // places, cross-referenced by comment, and this unit test is what
+    // guards it actually matches `digest_bytes`'s real output.
+    #[test]
+    fn digest_bytes_matches_the_known_answer_shared_with_tests_cli_rs() {
+        assert_eq!(
+            digest_bytes(b"config bytes\n", b"ignore bytes\n"),
+            "0dc03d353c0e6daa24478eb68ffeb59e6a65407a58dd2c8890ea18d6ac340255",
+            "if this fails because digest_bytes legitimately changed, update the \
+             same literal in tests/cli.rs's own known-answer test"
+        );
+    }
+
     #[test]
     fn missing_ignore_is_hashed_as_empty() {
         let dir = tempdir().unwrap();
