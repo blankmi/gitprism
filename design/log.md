@@ -3158,3 +3158,52 @@ transient per-run cache.
 Steps 4-7 (the `fetch_heads_into_namespace` implementation, reconstruction
 and dest→source reading the namespace, and tightening the measurement) are
 tracked in the same plan file.
+
+## 2026-09-04 — PERF-001 steps 4-7: fetch_heads_into_namespace, reconstruction and dest→source wired to the namespace, measurement tightened
+
+Step 4 adds `git::fetch_heads_into_namespace` next to `fetch`: every
+existing `refs/gitprism/fetched/dest/*` ref is cleared through git2 first
+(failing above `MAX_SOURCE_BRANCHES` pre-existing refs), then every listed
+branch is fetched from `url` in one `git fetch -q --stdin` transport onto
+`refs/gitprism/fetched/dest/<name>` using the step-2 runner variant. Tests
+(two bare/local repos) cover: every listed branch lands under the namespace
+and an unlisted one doesn't; a branch deleted on dest between the listing
+and the fetch fails the whole fetch with git's own "couldn't find remote
+ref" and leaves no namespace ref behind; an unusual-but-valid branch name
+(`a/b.c-d`) round-trips; a stale ref from a previous run's namespace is
+removed by the clear-before-fetch step.
+
+Step 5 switches `reconstruct_mapping_index` to call
+`fetch_heads_into_namespace` once for the whole dest listing instead of
+fetching each advertised dest head individually, reading tips back through
+the new `dest_head_from_namespace`; `fetch_dest_head_for_reconstruction` and
+its per-branch list/fetch race recovery (decisions/0046 Addendum 2 Finding
+G) are deleted. Because the bulk fetch is all-or-nothing, a name listed but
+deleted before the fetch now surfaces as a whole-fetch error before any
+mutation instead of being individually recovered as absent — decisions/0049's
+accepted trade-off. The Finding G tests are adapted accordingly; Finding J
+and 0047's own per-branch-refusal test are unaffected.
+
+Step 6 moves the dest branch listing and its bulk namespace fetch into
+`run`, once, before dest→source, sharing both with reconstruction and with
+`sync_pair_from_dest_with_key`. The latter replaces its `remote_ref_exists`
++ `fetch` pair with: existence from the listing when it
+`can_establish_absence()` (else one `remote_ref_exists` call), tip from the
+dest namespace ref, falling back to an individual fetch only for a branch
+beyond the branch-limit horizon that the bulk fetch never covered. The
+exact "has no ref on dest anymore" error message is unchanged, and the
+push-race retry loop (which refetches source, not dest) is untouched.
+
+Step 7 finalizes the step-1 counter test (tightened incrementally across
+steps 5-6: 20 → 9 → 5 git subprocesses for the 12-branch/2-configured
+no-op case: one listing, one bulk fetch, one git-version check, one lease
+fetch per source branch) and adds the plan's second counter test — the
+same shape with 300 dest branches (2 configured, 298 dest-only, cheap
+empty-tree commits) — asserting the identical constant 5, proving the
+subprocess count no longer scales with dest's branch count at all.
+
+Full suite: 398 passed (395 unit + 3 `tests/cli.rs`); `cargo fmt --all --
+--check` and `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo build --release --locked` succeeds. PERF-001 is
+implemented in full except step 8 (a run-wide deadline), which the plan
+scopes out as a separate, optional follow-up.
