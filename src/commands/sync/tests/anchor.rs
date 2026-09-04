@@ -3428,23 +3428,19 @@ fn add_bare_branch(repo: &Repository, branch: &str, files: &[(&str, &str)]) -> O
     .unwrap()
 }
 
-/// PERF-001 step 1 (docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md):
-/// a no-op run's subprocess count originally scaled with dest's branch
-/// count, not just with the branches gitprism actually needs to touch —
-/// reconstruction (decisions/0046) fetched dest's advertised heads one
-/// subprocess at a time. Dest has 12 branches; only 2 are configured
-/// (round-tripped) on source. The count asserted below tracks the real
-/// number at each PERF-001 step rather than staying pinned to the original
-/// pre-change baseline, so this test keeps passing (with a shrinking count)
-/// as later steps land, instead of going red until step 7: originally 20
-/// (one fetch per advertised dest head in reconstruction, plus the
-/// unchanged per-branch dest→source and source→dest fetches); step 5
-/// (reconstruction reads the namespace) dropped it to 9; step 6 (dest→source
-/// reads the namespace too, and the listing/bulk fetch move to `run`) drops
-/// it to 5 — one listing, one bulk fetch, one git-version check, and one
-/// lease fetch per source branch (decisions/0040, unchanged) — already fully
-/// independent of dest's branch count. Step 7 adds a second test proving
-/// that directly (300 dest branches, same count).
+/// PERF-001 (docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md): a
+/// no-op run's subprocess count used to scale with dest's branch count, not
+/// just with the branches gitprism actually needs to touch — reconstruction
+/// (decisions/0046) fetched dest's advertised heads one subprocess at a
+/// time, and dest→source did its own `ls-remote`+fetch pair per configured
+/// branch. Dest has 12 branches; only 2 are configured (round-tripped) on
+/// source. Originally 20 subprocesses; step 5 (reconstruction reads the
+/// dest namespace) dropped it to 9; step 6 (dest→source reads the namespace
+/// too, and the listing/bulk fetch move to `run`, decisions/0049) dropped it
+/// to 5 — one listing, one bulk fetch, one git-version check, and one lease
+/// fetch per source branch (decisions/0040, unchanged) — the plan's final,
+/// dest-branch-count-independent constant. The sibling test below proves
+/// that independence directly, with 300 dest branches instead of 12.
 #[test]
 fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count() {
     let dest_dir = tempdir().unwrap();
@@ -3473,10 +3469,52 @@ fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count
 
     assert_eq!(
         count, 5,
-        "PERF-001 step 6: a no-op sync with dest carrying 12 branches (2 configured on source) \
-         spawned {count} git subprocesses now that dest→source also reads the dest namespace \
-         instead of an ls-remote+fetch pair per branch (was 9 after step 5, 20 before step 5); \
-         step 7 adds a 300-branch test proving this count no longer scales with dest's branch \
-         count at all"
+        "PERF-001's final constant: a no-op sync with dest carrying 12 branches (2 configured \
+         on source) spawns {count} git subprocesses (one listing, one bulk fetch, one \
+         git-version check, one lease fetch per source branch) -- down from 20 before this \
+         plan (one fetch per advertised dest head in reconstruction, plus a per-branch \
+         ls-remote+fetch pair for dest→source). The sibling test below proves this count no \
+         longer scales with dest's branch count at all."
+    );
+}
+
+/// PERF-001 step 7: the same no-op shape as the sibling test above, but with
+/// 300 dest branches (2 configured, 298 dest-only) instead of 12 — cheap,
+/// since each extra branch is just one more empty-tree commit via
+/// [`add_bare_branch`], no subprocess involved. Asserts the *same* constant
+/// the 12-branch case does, proving the subprocess count no longer scales
+/// with dest's branch count at all, not merely that it scales more slowly.
+#[test]
+fn run_over_an_already_synced_pair_with_300_dest_branches_spawns_the_same_constant_subprocess_count()
+ {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip0 =
+        bare_repo_with_a_commit_on(dest_dir.path(), "main0", &[("shared0.txt", "v1\n")]);
+    let dest_tip1 = add_bare_branch(&dest_repo, "main1", &[("shared1.txt", "v1\n")]);
+    for index in 0..298 {
+        add_bare_branch(&dest_repo, &format!("extra{index}"), &[("f.txt", "v1\n")]);
+    }
+
+    let source_dir = tempdir().unwrap();
+    source_grafted_onto(source_dir.path(), "main0", dest_tip0, &dest_repo);
+    source_grafted_onto(source_dir.path(), "main1", dest_tip1, &dest_repo);
+
+    let config = write_config(
+        "unused",
+        &dest_dir.path().display().to_string(),
+        &["main0", "main1"],
+    );
+
+    git::reset_subprocess_spawn_count();
+    run(source_dir.path(), config.path())
+        .expect("a no-op run over an already-synced pair must succeed even with 300 dest branches");
+    let count = git::subprocess_spawn_count();
+
+    assert_eq!(
+        count, 5,
+        "300 dest branches (2 configured) spawned {count} git subprocesses -- must equal the \
+         same constant the 12-dest-branch case asserts, not merely stay below some \
+         linear-in-300 bound"
     );
 }
