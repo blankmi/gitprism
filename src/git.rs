@@ -282,6 +282,27 @@ fn run_git_output(command: Command, limits: OutputLimits) -> Result<std::process
     run_git_output_with_timeout(command, limits, configured_git_timeout()?)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of every `git` (or fake-runner-child) subprocess actually
+    /// spawned, for PERF-001's own measurement. Thread-local, not a
+    /// process-global atomic: `cargo test` runs tests on parallel threads,
+    /// and every subprocess this runner spawns is spawned from the calling
+    /// thread, so a thread-local count is exact for one test without
+    /// serializing the suite.
+    static SUBPROCESS_SPAWN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_subprocess_spawn_count() {
+    SUBPROCESS_SPAWN_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn subprocess_spawn_count() -> usize {
+    SUBPROCESS_SPAWN_COUNT.with(|count| count.get())
+}
+
 fn configured_git_timeout() -> Result<Duration> {
     let Some(raw) = env::var_os("GITPRISM_GIT_TIMEOUT_SECONDS") else {
         return Ok(Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS));
@@ -327,6 +348,8 @@ fn run_git_output_with_timeout(
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
     let mut child = command.spawn().context("starting git subprocess")?;
+    #[cfg(test)]
+    SUBPROCESS_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
     let stdout = child
         .stdout
         .take()

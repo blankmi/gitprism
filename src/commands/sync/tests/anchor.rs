@@ -3420,3 +3420,71 @@ fn sync_pair_to_dest_wrong_order_rewrite_of_task_picks_up_feature_as_the_anchor(
         .unwrap();
     assert_eq!(blob.content(), b"rewritten\n");
 }
+
+/// A dest-only branch, not grafted onto any source branch — for PERF-001's
+/// own measurement test, below, where dest carries more branches than source
+/// configures. Same shape as [`bare_repo_with_a_commit_on`] minus the
+/// `init_bare`/`set_head` calls, since `repo` here is already an open bare
+/// repository with a branch checked out as HEAD.
+fn add_bare_branch(repo: &Repository, branch: &str, files: &[(&str, &str)]) -> Oid {
+    let mut builder = repo.treebuilder(None).unwrap();
+    for (name, contents) in files {
+        let blob = repo.blob(contents.as_bytes()).unwrap();
+        builder
+            .insert(*name, blob, git2::FileMode::Blob.into())
+            .unwrap();
+    }
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let signature = Signature::now("Dest Author", "author@example.com").unwrap();
+    repo.commit(
+        Some(&format!("refs/heads/{branch}")),
+        &signature,
+        &signature,
+        "initial",
+        &tree,
+        &[],
+    )
+    .unwrap()
+}
+
+/// PERF-001 step 1 (docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md):
+/// a no-op run's subprocess count today scales with dest's branch count, not
+/// just with the branches gitprism actually needs to touch — reconstruction
+/// (decisions/0046) fetches dest's advertised heads one subprocess at a time.
+/// Dest has 12 branches; only 2 are configured (round-tripped) on source. The
+/// exact number asserted below is today's real baseline, not a guess — it is
+/// tightened to a dest-branch-count-independent constant in step 7.
+#[test]
+fn run_over_an_already_synced_pair_spawns_the_perf_001_baseline_subprocess_count() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip0 =
+        bare_repo_with_a_commit_on(dest_dir.path(), "main0", &[("shared0.txt", "v1\n")]);
+    let dest_tip1 = add_bare_branch(&dest_repo, "main1", &[("shared1.txt", "v1\n")]);
+    for index in 0..10 {
+        add_bare_branch(&dest_repo, &format!("extra{index}"), &[("f.txt", "v1\n")]);
+    }
+
+    let source_dir = tempdir().unwrap();
+    source_grafted_onto(source_dir.path(), "main0", dest_tip0, &dest_repo);
+    source_grafted_onto(source_dir.path(), "main1", dest_tip1, &dest_repo);
+
+    let config = write_config(
+        "unused",
+        &dest_dir.path().display().to_string(),
+        &["main0", "main1"],
+    );
+
+    git::reset_subprocess_spawn_count();
+    run(source_dir.path(), config.path())
+        .expect("a no-op run over an already-synced pair must succeed");
+    let count = git::subprocess_spawn_count();
+
+    assert_eq!(
+        count, 20,
+        "PERF-001 baseline: a no-op sync with dest carrying 12 branches (2 configured on \
+         source) spawned {count} git subprocesses before the fetch-once change (recorded here \
+         as today's actual number); step 7 tightens this assertion to a constant independent \
+         of dest's branch count"
+    );
+}
