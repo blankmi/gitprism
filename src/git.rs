@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fmt::Write as _;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
@@ -25,6 +25,12 @@ const MAX_DIAGNOSTIC_STDERR_BYTES: usize = 1024 * 1024;
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const CAPTURE_CHUNK_BYTES: usize = 16 * 1024;
 const CAPTURE_CHANNEL_CAPACITY: usize = 16;
+/// design/decisions/0031 Addendum 2026-09-04: ceiling for
+/// [`run_git_stdin_output`]'s caller-supplied stdin, independent of any
+/// caller's own bound. Sized for `MAX_SOURCE_BRANCHES` (decisions/0032)
+/// refspec lines at a generous per-line length.
+const MAX_STDIN_LINE_BYTES: usize = 4 * 1024;
+const MAX_STDIN_BYTES: usize = MAX_STDIN_LINE_BYTES * crate::limits::MAX_SOURCE_BRANCHES;
 
 #[derive(Clone, Copy)]
 struct OutputLimits {
@@ -342,14 +348,59 @@ fn run_git_output_with_timeout(
     limits: OutputLimits,
     timeout: Duration,
 ) -> Result<std::process::Output> {
+    command.stdin(Stdio::null());
+    run_spawned_git_output(command, None, limits, timeout)
+}
+
+/// Same runner as [`run_git_output_with_timeout`], for a caller that must
+/// supply its own bounded byte string on stdin instead of a null stdin
+/// (design/decisions/0031 Addendum 2026-09-04 — currently only PERF-001's
+/// `git fetch --stdin`, docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md).
+/// `input` is written to the child's stdin from a helper thread that then
+/// drops its end of the pipe, so the child observes a normal EOF; no
+/// inherited handle is ever connected. `input` longer than
+/// [`MAX_STDIN_BYTES`] is refused before anything is spawned — a caller's own
+/// bound is not trusted alone.
+fn run_git_stdin_output(
+    mut command: Command,
+    input: &[u8],
+    limits: OutputLimits,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    if input.len() > MAX_STDIN_BYTES {
+        anyhow::bail!(
+            "git subprocess stdin input of {} bytes exceeds its {MAX_STDIN_BYTES} byte limit",
+            input.len()
+        );
+    }
+    command.stdin(Stdio::piped());
+    run_spawned_git_output(command, Some(input), limits, timeout)
+}
+
+fn run_spawned_git_output(
+    mut command: Command,
+    stdin_input: Option<&[u8]>,
+    limits: OutputLimits,
+    timeout: Duration,
+) -> Result<std::process::Output> {
     command
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
     let mut child = command.spawn().context("starting git subprocess")?;
     #[cfg(test)]
     SUBPROCESS_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
+    if let Some(input) = stdin_input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("capturing git subprocess stdin")?;
+        let input = input.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+            // `stdin` drops here, closing the write end so the child sees EOF.
+        });
+    }
     let stdout = child
         .stdout
         .take()
@@ -1442,6 +1493,80 @@ mod tests {
                 .windows(b"stdin-bytes=0".len())
                 .any(|window| { window == b"stdin-bytes=0" })
         );
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_delivers_exact_bytes_and_the_child_sees_eof() {
+        // `runner_child("stdin")` blocks on `read_to_end` until it observes
+        // EOF, so this test hanging (rather than completing within its own
+        // timeout) would itself prove a missing EOF — no separate assertion
+        // needed for that half of design/decisions/0031's addendum.
+        let input = b"+refs/heads/a:refs/gitprism/fetched/dest/a\n";
+        let output = run_git_stdin_output(
+            runner_child("stdin"),
+            input,
+            SMALL_OUTPUT,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let expected = format!("stdin-bytes={}", input.len());
+        assert!(
+            output
+                .stdout
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "expected {expected:?} in stdout, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_refuses_oversized_input_before_spawning() {
+        let oversized = vec![b'x'; MAX_STDIN_BYTES + 1];
+        let error = run_git_stdin_output(
+            // A child that would prove a spawn happened by writing to a
+            // distinguishable file is unnecessary here: `runner_child("sleep")`
+            // would hang for 60s if actually spawned, so a fast `Err` return
+            // itself demonstrates nothing was started.
+            runner_child("sleep"),
+            &oversized,
+            SMALL_OUTPUT,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("byte") && error.to_string().contains("limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_still_times_out_and_reaps_direct_child() {
+        let error = run_git_stdin_output(
+            runner_child("sleep"),
+            b"",
+            SMALL_OUTPUT,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_still_rejects_stdout_overflow() {
+        let error = run_git_stdin_output(
+            runner_child("stdout"),
+            b"",
+            OutputLimits {
+                stdout: 1024,
+                stderr: 1024,
+                total: 2048,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stdout output limit"));
     }
 
     #[test]
