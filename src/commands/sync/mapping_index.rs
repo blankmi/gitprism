@@ -212,17 +212,18 @@ impl MappingIndex {
                 .push(record.clone());
         }
 
-        // decisions/0046 Addendum 3, Finding S: a destination whose only provenance is the
-        // branch currently being resolved is preferred against in favor of
-        // a comparable/incomparable alternative some OTHER branch already
-        // projected for the identical source commit — that alternative is
-        // the one the rewrite should build on, since `exclude_branch`'s own
-        // chain is exactly what the rewrite discards. But if every mapped
-        // destination for this source commit is `exclude_branch`'s own,
-        // there is no alternative to prefer: it's this branch's own
-        // untouched ancestor content (e.g. an earlier, still-valid part of
-        // its own chain an amend didn't touch), not something being
-        // discarded, and stays a normal, usable mapping.
+        // decisions/0046 Addendum 3, Finding S: a destination whose only
+        // provenance is the branch currently being resolved is preferred
+        // against in favor of a comparable/incomparable alternative some
+        // OTHER branch already projected for the identical source commit —
+        // that alternative is the one the rewrite should build on, since
+        // `exclude_branch`'s own chain is exactly what the rewrite
+        // discards. But if every mapped destination for this source commit
+        // is `exclude_branch`'s own, there is no alternative to prefer:
+        // it's this branch's own untouched ancestor content (e.g. an
+        // earlier, still-valid part of its own chain an amend didn't
+        // touch), not something being discarded, and stays a normal, usable
+        // mapping.
         if let Some(exclude_branch) = exclude_branch {
             let any_other_provenance = by_dest
                 .values()
@@ -237,12 +238,13 @@ impl MappingIndex {
         let mut destinations: Vec<Oid> = by_dest.keys().copied().collect();
         destinations.sort_by_key(ToString::to_string);
 
-        // Finding R: a mapped dest commit this clone never fetched (its dest ref
-        // deleted after merge, or discarded by a force rewind) can't be
-        // built on, and `graph_descendant_of` has no clean "not found" of
-        // its own to compare it against another destination — checked here,
-        // before any ancestry comparison touches it, the same way
-        // `dest_resume_point_for_branch` already guards this exact hazard.
+        // Finding R: a mapped dest commit this clone never fetched (its
+        // dest ref deleted after merge, or discarded by a force rewind)
+        // can't be built on, and `graph_descendant_of` has no clean "not
+        // found" of its own to compare it against another destination —
+        // checked here, before any ancestry comparison touches it, the same
+        // way `dest_resume_point_for_branch` already guards this exact
+        // hazard.
         let (present, missing): (Vec<Oid>, Vec<Oid>) = destinations
             .iter()
             .copied()
@@ -339,12 +341,13 @@ impl MappingIndex {
         }))
     }
 
-    /// `exclude_branch` (decisions/0046 Addendum 3, Finding S) is the branch whose own
-    /// rewrite this anchor is being resolved for: mappings whose only
-    /// provenance is that branch itself are excluded from canonicalization,
-    /// since that branch's own chain is exactly what the rewrite discards.
-    /// `None` for every other caller (scheduling's own distance metric,
-    /// which only affects processing order, never an actual anchor).
+    /// `exclude_branch` (decisions/0046 Addendum 3, Finding S) is the
+    /// branch whose own rewrite this anchor is being resolved for: mappings
+    /// whose only provenance is that branch itself are excluded from
+    /// canonicalization, since that branch's own chain is exactly what the
+    /// rewrite discards. `None` for every other caller (scheduling's own
+    /// distance metric, which only affects processing order, never an
+    /// actual anchor).
     pub(crate) fn nearest_first_parent_mapping(
         &self,
         repo: &Repository,
@@ -407,11 +410,12 @@ impl MappingIndex {
 
     /// `branch` names the head whose history is being scanned — used only
     /// for diagnostics. Verification is against the marker's own recorded
-    /// branch (decisions/0046 Addendum 3, Finding Q), the same self-verification
-    /// [`super::loop_prevented`] already applies: once a marker's owning
-    /// branch is deleted from source, a descendant's own first-parent scan
-    /// is the only remaining path to it, and the HMAC already authenticates
-    /// the recorded branch regardless of which head is doing the scanning.
+    /// branch (decisions/0046 Addendum 3, Finding Q), the same
+    /// self-verification [`super::loop_prevented`] already applies: once a
+    /// marker's owning branch is deleted from source, a descendant's own
+    /// first-parent scan is the only remaining path to it, and the HMAC
+    /// already authenticates the recorded branch regardless of which head
+    /// is doing the scanning.
     ///
     /// Returns whether the commit's mapping (if any) was actually recorded
     /// — `false` only when the aggregate mapping-entry bound was hit
@@ -584,13 +588,13 @@ impl MappingIndex {
 
     /// A `ForceMirrorOnly` push for `branch` just replaced its dest ref with
     /// `new_dest_tip`, built from a graft-derived rebuild base rather than
-    /// `branch`'s own prior chain — so anything that chain contributed to
-    /// this run's index that is no longer an ancestor of (or equal to)
+    /// `branch`'s own prior chain — so anything that chain contributed
+    /// to this run's index that is no longer an ancestor of (or equal to)
     /// `new_dest_tip` is now a mapping to a dest commit orphaned by that
-    /// rebuild (decisions/0046 Addendum 3, Finding Q). Only records provenanced to `branch`
-    /// itself are ever considered: a source commit also mapped through some
-    /// other branch's own markers keeps that mapping regardless of what just
-    /// happened to `branch`'s chain.
+    /// rebuild (decisions/0046 Addendum 3, Finding Q). Only records
+    /// provenanced to `branch` itself are ever considered: a source commit
+    /// also mapped through some other branch's own markers keeps that
+    /// mapping regardless of what just happened to `branch`'s chain.
     ///
     /// Called once per accepted rewrite-rebuild push, before that push's own
     /// newly built commits are recorded — a stale entry must not survive to
@@ -685,15 +689,16 @@ impl MappingIndex {
         Ok(())
     }
 
-    /// Records a `(source, dest)` mapping this run's own `build_dest_commit`
-    /// just authored for `branch` — trusted by construction (Finding S), so unlike
+    /// Records a `(source, dest)` mapping this run's own
+    /// `build_dest_commit` just authored for `branch` — trusted by
+    /// construction (Finding S), so unlike
     /// [`add_dest_commit`](Self::add_dest_commit) this never reads `dest`
     /// back out of a repository or re-verifies its marker: the caller
     /// already knows the exact tuple because it just built the commit. A
     /// freshly authored dest commit is never decisions/0046's content-empty
     /// alias shape either (`build_pending_dest_tip` skips building one at
-    /// all when the merged tree doesn't change), so `dest` is always its own
-    /// canonical destination here.
+    /// all when the merged tree doesn't change), so `dest` is always its
+    /// own canonical destination here.
     ///
     /// This run's own push already succeeded before this is ever called —
     /// already bounded by the pending-history limits, so recording it never
@@ -1153,14 +1158,15 @@ mod tests {
 
     #[test]
     fn record_built_mapping_adds_an_exact_mapping_without_reading_the_repo() {
-        // Finding S: `build_dest_commit` already knows the exact (source, dest,
-        // branch) tuple for a commit it just authored — recording it must
-        // not need to look the commit back up or re-verify its marker, so
-        // `source` here doesn't correspond to any real object in `repo`'s
-        // odb at all. `dest` must be a real, locally present commit: Finding R's
-        // existence check in `resolve` (a different method, exercised below
-        // to prove the mapping was recorded, not by `record_built_mapping`
-        // itself) would otherwise correctly treat an ordinary orphaned
+        // Finding S: `build_dest_commit` already knows the exact (source,
+        // dest, branch) tuple for a commit it just authored — recording it
+        // must not need to look the commit back up or re-verify its marker,
+        // so `source` here doesn't correspond to any real object in
+        // `repo`'s odb at all. `dest` must be a real, locally present
+        // commit: Finding R's existence check in `resolve` (a different
+        // method, exercised below to prove the mapping was recorded, not by
+        // `record_built_mapping` itself) would otherwise correctly treat an
+        // ordinary orphaned
         // mapping as unusable.
         let (_dir, repo, root) = empty_repo();
         let source = Oid::from_bytes(&[3; 20]).unwrap();
@@ -1573,11 +1579,12 @@ mod tests {
 
     #[test]
     fn mapping_index_self_verifies_a_source_marker_against_its_own_recorded_branch() {
-        // Finding Q: once "feature" itself is deleted from source, "task"'s own
-        // scan is the only remaining path to a DestToSource marker branded
-        // "feature" that task inherited as an ordinary ancestor commit —
-        // self-verification must accept it even though the scanning head
-        // ("task") differs from the marker's own recorded branch.
+        // Finding Q: once "feature" itself is deleted from source, "task"'s
+        // own scan is the only remaining path to a DestToSource marker
+        // branded "feature" that task inherited as an ordinary ancestor
+        // commit — self-verification must accept it even though the
+        // scanning head ("task") differs from the marker's own recorded
+        // branch.
         let (_dir, repo, root) = empty_repo();
         let marker_tree = tree_with_file(&repo, Some(root), "back.txt", b"back");
         let imported = commit(

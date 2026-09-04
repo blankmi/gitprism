@@ -843,11 +843,12 @@ fn sync_pair_to_dest_with_key(
                     // The destination ref is visible to later branch anchor
                     // lookups this run, with no re-query.
                     run_cache.dest_ref_exists.insert(branch.to_string(), true);
-                    // decisions/0046 Addendum 3, Finding Q: a `ForceMirrorOnly` push just
-                    // replaced `branch`'s own dest chain wholesale — any
-                    // mapping this run recorded from that replaced chain
-                    // whose dest commit didn't survive into `new_dest_tip`'s
-                    // own ancestry is now a mapping to an orphan. Left alone,
+                    // decisions/0046 Addendum 3, Finding Q: a
+                    // `ForceMirrorOnly` push just replaced `branch`'s own
+                    // dest chain wholesale — any mapping this run recorded
+                    // from that replaced chain whose dest commit didn't
+                    // survive into `new_dest_tip`'s own ancestry is now a
+                    // mapping to an orphan. Left alone,
                     // a branch scheduled later in this same run could anchor
                     // on it and push straight back onto history this run
                     // itself just discarded. A mapping for the same source
@@ -864,8 +865,8 @@ fn sync_pair_to_dest_with_key(
                                 .expect("force rebuild always planned invalidation"),
                         );
                     }
-                    // Finding S: `build_dest_commit` already returned the exact
-                    // (source, dest) pair for each of these — recorded
+                    // Finding S: `build_dest_commit` already returned the
+                    // exact (source, dest) pair for each of these — recorded
                     // straight into the index, with no re-read or
                     // re-HMAC-verify of a commit this very call just
                     // authored.

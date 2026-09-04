@@ -438,8 +438,9 @@ fn sync_pair_to_dest(
         std::fs::read_to_string(source_root.join(exclude::FILENAME)).unwrap_or_default();
     // decisions/0046: `run` builds the mapping index exactly once, from the
     // current repo/dest state, before any branch is processed — the one
-    // init site Finding R moved the old lazy-rebuild-on-`None` into. This test-only
-    // wrapper calls a single branch at a time rather than scheduling a whole
+    // init site Finding R moved the old lazy-rebuild-on-`None` into. This
+    // test-only wrapper calls a single branch at a time rather than
+    // scheduling a whole
     // run, so it stands in for that init site itself, rebuilding fresh from
     // the current state on every call. A test that needs the "built once,
     // carried across several branches in one run" invariant under test calls

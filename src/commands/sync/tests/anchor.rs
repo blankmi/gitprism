@@ -2485,15 +2485,15 @@ fn run_schedules_a_new_parent_before_a_lexically_earlier_new_child() {
 
 #[test]
 fn run_does_not_resurrect_an_orphaned_dest_commit_after_a_same_run_amend() {
-    // Finding Q's confirmed failure: mirror-only "feature" already has a two-commit
-    // dest chain D1(S1), D2(S2). In the same run, "feature" gets amended
-    // (S2 -> S2') and a new "task" branch — forked from the pre-amend S2 —
-    // appears for the first time. Distance scheduling processes "feature"
-    // (alphabetically first) before "task", so the ForceMirrorOnly rebuild
-    // that replaces feature's dest history and orphans D2 must also
-    // invalidate the run's in-memory index entry for S2 -> D2 — otherwise
-    // "task" anchors on that entry and resurrects D2 as an ancestor of a
-    // brand-new dest ref.
+    // Finding Q's confirmed failure: mirror-only "feature" already has a
+    // two-commit dest chain D1(S1), D2(S2). In the same run, "feature" gets
+    // amended (S2 -> S2') and a new "task" branch — forked from the
+    // pre-amend S2 — appears for the first time. Distance scheduling
+    // processes "feature" (alphabetically first) before "task", so the
+    // ForceMirrorOnly rebuild that replaces feature's dest history and
+    // orphans D2 must also invalidate the run's in-memory index entry for
+    // S2 -> D2 — otherwise "task" anchors on that entry and resurrects D2
+    // as an ancestor of a brand-new dest ref.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -2935,8 +2935,8 @@ fn run_keeps_a_surviving_childs_dest_native_content_after_its_parent_branch_is_d
 
 #[test]
 fn run_anchors_a_sibling_on_a_deleted_mirror_only_branchs_own_dest_ref() {
-    // Finding Q, second half: "feature" (mirror-only, never round-tripped) mirrors
-    // its own commit F1 to dest as D_F1, branded "feature" via a
+    // Finding Q, second half: "feature" (mirror-only, never round-tripped)
+    // mirrors its own commit F1 to dest as D_F1, branded "feature" via a
     // SourceToDest marker. "other" forks from F1 and gains a commit of its
     // own. Feature's local source branch is then deleted — routine
     // post-merge cleanup — so `source_branches` no longer names it and

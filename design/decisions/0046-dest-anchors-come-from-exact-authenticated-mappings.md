@@ -728,7 +728,7 @@ cited in code only by a three-letter shorthand of the form "F", hyphen,
 a letter (A, B, or C), with no matching entry anywhere in `design/`. This
 decision's own addenda already number their findings A–P, so that shorthand
 reads as "Finding A" and so on — different, unrelated rules (e.g. Addendum
-1's parse-once change is its actual Finding A). AGENTS.md makes
+1's parse-once change is its actual Finding D). AGENTS.md makes
 `design/decisions/` the source of truth; these three behaviours existed only
 in comments. This addendum gives them their own names, continuing the
 addenda's letter sequence, and the citing code comments are updated
@@ -738,24 +738,27 @@ already does.
 
 ## Decision
 
-**Finding Q — provenance survives source-branch deletion.**
-Reconstruction lists dest's branches directly (`git::remote_branch_names`)
-rather than only the branches source still has, so a mirror-only branch's
-dest ref keeps contributing its `SourceToDest` mappings after its local
-source branch is deleted (decisions/0018 Case 2's routine post-merge
-cleanup removes the source branch, not the dest ref). Verification of a
-marker inherited this way is against the marker's own recorded branch
-(`marker::verify_self`), never against the branch whose history is
-currently being scanned: once the owning branch is gone from source, a
-descendant's own first-parent scan is the only remaining path to that
-marker, and the HMAC already authenticates the branch recorded inside it
-regardless of which head is doing the scanning. Without this, a deleted
-mirror-only branch's dest content would stop being reachable through the
-mapping index at all, and a sibling forked from it would fall back to a
-coarser graft and duplicate that content.
+**Finding Q — a mapping's provenance is scoped to the marker's own recorded
+branch, not the scanning head.** That scoping governs both reconstruction
+after a source-branch deletion and force-rebuild invalidation. Reconstruction
+lists dest's branches directly (`git::remote_branch_names`) rather than only
+the branches source still has, so a mirror-only branch's dest ref keeps
+contributing its `SourceToDest` mappings after its local source branch is
+deleted — the same routine post-merge cleanup decisions/0018 Case 2
+describes, here deleting the local source branch while the dest ref
+survives. Verification of a marker inherited this way is against the
+marker's own recorded branch (`marker::verify_self`), never against the
+branch whose history is currently being scanned: once the owning branch is
+gone from source, a descendant's own first-parent scan is the only
+remaining path to that marker, and the HMAC already authenticates the
+branch recorded inside it regardless of which head is doing the scanning.
+Without this, a deleted mirror-only branch's dest content would stop being
+reachable through the mapping index at all, and a sibling forked from it
+would fall back to a coarser graft and duplicate that content.
 Tests: `mapping_index_self_verifies_a_source_marker_against_its_own_recorded_branch`
 and `invalidate_replaced_chain_drops_only_the_named_branchs_unreachable_mappings`
-(`src/commands/sync/mapping_index.rs:1576` and `:1373`); end-to-end in
+(`src/commands/sync/mapping_index.rs:1576` and `:1373`, the latter proving
+force-rebuild invalidation is scoped to the rebuilt branch); end-to-end in
 `run_keeps_a_surviving_childs_dest_native_content_after_its_parent_branch_is_deleted`
 and `run_anchors_a_sibling_on_a_deleted_mirror_only_branchs_own_dest_ref`
 (`src/commands/sync/tests/anchor.rs`).
@@ -793,14 +796,21 @@ just authored for `branch` this run without re-reading the commit or
 re-verifying its marker: the caller already knows the exact tuple by
 construction, having just built it.
 
-CODE-004 records this rule's trade-off: when the nearest mapped ancestor has
-both the branch's own projection and a sibling's, the own projection is
-dropped even when it is comparable (an ancestor or descendant of the
-sibling's), so a force-rebuild may rewind dest further than the amend that
-triggered it required. This is safe under decisions/0038 (a mirror-only
-rebuild is a force-with-lease) and is accepted for now; CODE-004's plan
-(`docs/plans/2026-09-02/CODE-004-exclude-branch-own-anchor.md`) holds the
-alternative of keeping the own projection when it is the common ancestor.
+CODE-004 records this rule's trade-off, which has two shapes depending on
+which side is the ancestor. When the branch's own projection `D_own` is an
+ancestor of the sibling's `D_sib`, self-exclusion drops `D_own` and the
+anchor jumps forward to `D_sib` instead, importing sibling-only ancestry
+into the rebuild — the case CODE-004's recommended Option A addresses, by
+retaining an own-only destination when it is the ancestor of every other.
+When `D_sib` is instead the ancestor of `D_own`, self-exclusion still drops
+the (descendant) `D_own` and anchors on `D_sib`, so a force-rebuild may
+rewind dest further than the amend that triggered it required; Option A
+leaves this second case unchanged, since rule 3 would already select
+`D_sib` once `D_own` is excluded. Both are safe under decisions/0038 (a
+mirror-only rebuild is a force-with-lease) and are accepted for now;
+CODE-004's plan (`docs/plans/2026-09-02/CODE-004-exclude-branch-own-anchor.md`)
+holds the alternative of keeping the own projection in the first case,
+where it is the common ancestor.
 Tests: `resolve_for_anchor_excludes_the_current_branchs_own_sole_projection_of_a_shared_ancestor`
 and `resolve_for_anchor_keeps_the_current_branchs_own_mapping_when_no_alternative_exists`
 (`src/commands/sync/mapping_index.rs:1705` and `:1784`).

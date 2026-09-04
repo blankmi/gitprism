@@ -573,11 +573,11 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
 
 /// Every branch name currently on `url` — a real `git ls-remote --heads`
 /// subprocess, parsed by [`parse_ls_remote_heads`]. decisions/0046 Addendum
-/// 3, Finding Q: mapping-index reconstruction must see a mirror-only branch's own dest
-/// ref even after its local source branch is deleted (decisions/0018 Case
-/// 2's routine post-merge cleanup) — `source`'s own branch listing cannot
-/// name a branch source no longer has, so dest itself is asked directly. A
-/// genuine `ls-remote` failure is still an `Err`.
+/// 3, Finding Q: mapping-index reconstruction must see a mirror-only
+/// branch's own dest ref even after its local source branch is deleted
+/// (decisions/0018 Case 2's routine post-merge cleanup) — `source`'s own
+/// branch listing cannot name a branch source no longer has, so dest itself
+/// is asked directly. A genuine `ls-remote` failure is still an `Err`.
 pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<RemoteBranchListing> {
     validate_remote(url)?;
     let mut command = git_command();
