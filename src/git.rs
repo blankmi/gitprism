@@ -604,6 +604,121 @@ pub(crate) fn fetch_shallow(repo_dir: &Path, url: &str, branch: &str, depth: u32
     fetch_with_depth(repo_dir, url, branch, Some(depth))
 }
 
+/// design/decisions/0049: the transient, per-run namespace
+/// [`fetch_heads_into_namespace`] lands dest heads under. Cleared at the
+/// start of every run; nothing reads it across runs; no marker or mapping
+/// state is ever stored here (decisions/0046's "no dedicated
+/// `refs/gitprism/*` mapping refs" constraint is about durable mapping
+/// state and is unaffected).
+pub(crate) const FETCHED_DEST_NAMESPACE: &str = "refs/gitprism/fetched/dest/";
+
+/// Where [`fetch_heads_into_namespace`] lands `name`'s dest head, and where
+/// a caller reads it back from via git2.
+pub(crate) fn dest_head_namespace_ref(name: &str) -> String {
+    format!("{FETCHED_DEST_NAMESPACE}{name}")
+}
+
+/// Fetches every branch in `names` from `url` in one transport
+/// (decisions/0049), landing each at [`dest_head_namespace_ref`] instead of
+/// `FETCH_HEAD` — `git fetch -q --stdin`, reading one
+/// `+refs/heads/<name>:refs/gitprism/fetched/dest/<name>` refspec line per
+/// name. `names` is expected to already be `MAX_SOURCE_BRANCHES`-bounded
+/// (the caller's own `remote_branch_names` listing); each name is still
+/// re-validated here so a caller-constructed line can never contain a
+/// newline or start with `-`. The fetch is all-or-nothing over the whole
+/// list: a name listed but deleted on `url` before this call runs fails the
+/// whole fetch with git's own "couldn't find remote ref" error, and no
+/// namespace ref is left behind for it or for any other name in the same
+/// call.
+///
+/// Every existing namespace ref is deleted first, through git2 — not `git
+/// fetch --prune`, which only prunes refs still matched by a wildcard
+/// refspec, never one built from an explicit name list — so a previous run's
+/// entries can't survive into this one. More than `MAX_SOURCE_BRANCHES`
+/// pre-existing namespace refs fails outright: gitprism itself never leaves
+/// more than that behind, so a larger count can only mean something else put
+/// them there.
+pub(crate) fn fetch_heads_into_namespace(
+    repo_dir: &Path,
+    url: &str,
+    names: &[String],
+) -> Result<()> {
+    validate_remote(url)?;
+    for name in names {
+        validate_branch_name(name)?;
+    }
+
+    let repo = git2::Repository::open(repo_dir)
+        .context("opening the local repository to clear the dest fetch namespace")?;
+    clear_dest_head_namespace(&repo)?;
+
+    // Nothing to fetch: no subprocess spawned for an empty list.
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let mut input = Vec::new();
+    for name in names {
+        input.extend_from_slice(
+            format!("+refs/heads/{name}:{}\n", dest_head_namespace_ref(name)).as_bytes(),
+        );
+    }
+
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("fetch")
+        .arg("-q")
+        .arg("--stdin")
+        .arg("--")
+        .arg(url)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_git_stdin_output(command, &input, SMALL_OUTPUT, configured_git_timeout()?)
+        .context("running git fetch --stdin against configured remote")?;
+
+    if !output.status.success() {
+        let diagnostic = git_diagnostic(&output.stderr, Some(url));
+        anyhow::bail!(
+            "git fetch --stdin against configured remote failed ({}): {diagnostic}",
+            output.status
+        );
+    }
+
+    Ok(())
+}
+
+fn clear_dest_head_namespace(repo: &git2::Repository) -> Result<()> {
+    let mut existing = Vec::new();
+    {
+        let mut references = repo
+            .references_glob(&format!("{FETCHED_DEST_NAMESPACE}*"))
+            .context("listing the existing dest fetch namespace")?;
+        for reference in &mut references {
+            let reference = reference.context("reading an existing dest fetch namespace ref")?;
+            let name = reference
+                .name()
+                .context("reading an existing dest fetch namespace ref's name")?
+                .to_string();
+            existing.push(name);
+            if existing.len() > crate::limits::MAX_SOURCE_BRANCHES {
+                anyhow::bail!(
+                    "more than {} refs already exist under {FETCHED_DEST_NAMESPACE} — something \
+                     other than gitprism put them there",
+                    crate::limits::MAX_SOURCE_BRANCHES
+                );
+            }
+        }
+    }
+    for name in existing {
+        repo.find_reference(&name)
+            .with_context(|| format!("reopening dest fetch namespace ref {name:?} to delete it"))?
+            .delete()
+            .with_context(|| format!("deleting stale dest fetch namespace ref {name:?}"))?;
+    }
+    Ok(())
+}
+
 /// Whether `refspec` currently exists as a branch on `url` — a real `git
 /// ls-remote --exit-code` subprocess check, run before attempting a [`fetch`]
 /// where "doesn't exist yet" is an expected, ordinary outcome rather than a
@@ -1783,6 +1898,145 @@ mod tests {
         assert!(
             source_repo.is_shallow(),
             "a --depth=1 fetch must leave the clone shallow"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_lands_every_listed_branch_and_skips_an_unlisted_one() {
+        let dest_dir = tempdir().unwrap();
+        let main_tip = repo_with_a_commit_on(dest_dir.path(), "main");
+        let other_tip = repo_with_a_commit_on(dest_dir.path(), "other");
+        repo_with_a_commit_on(dest_dir.path(), "unlisted");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string(), "other".to_string()],
+        )
+        .expect("fetching two existing branches into the namespace should succeed");
+
+        assert_eq!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("main"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            main_tip
+        );
+        assert_eq!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("other"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            other_tip
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("unlisted"))
+                .is_err(),
+            "a branch dest has but the caller didn't list must not land in the namespace"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_fails_and_leaves_no_ref_when_a_listed_branch_is_deleted_before_the_fetch()
+     {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        // HEAD must point elsewhere before "main" can be deleted.
+        repo_with_a_commit_on(dest_dir.path(), "unused");
+        dest_repo.set_head("refs/heads/unused").unwrap();
+        dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        let error = fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string()],
+        )
+        .expect_err("a listed branch deleted before the fetch must fail the whole fetch");
+
+        assert!(
+            error.to_string().contains("couldn't find remote ref")
+                || format!("{error:#}").contains("couldn't find remote ref"),
+            "expected git's own missing-ref message, got: {error:#}"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("main"))
+                .is_err(),
+            "a failed bulk fetch must leave no namespace ref behind"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_round_trips_an_unusual_but_valid_branch_name() {
+        let dest_dir = tempdir().unwrap();
+        let tip = repo_with_a_commit_on(dest_dir.path(), "a/b.c-d");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["a/b.c-d".to_string()],
+        )
+        .expect("an unusual but valid branch name must round-trip");
+
+        assert_eq!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("a/b.c-d"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            tip
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_removes_a_stale_ref_from_a_previous_runs_namespace() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+        let stale_tip = repo_with_a_commit_on(source_dir.path(), "stale-carrier");
+        source_repo
+            .reference(
+                &dest_head_namespace_ref("deleted-on-dest"),
+                stale_tip,
+                false,
+                "stand-in for a previous run's namespace entry",
+            )
+            .unwrap();
+
+        fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string()],
+        )
+        .expect("fetching this run's list must succeed regardless of a stale namespace ref");
+
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("deleted-on-dest"))
+                .is_err(),
+            "a stale ref from a previous run's namespace must be cleared before this run's fetch"
         );
     }
 
