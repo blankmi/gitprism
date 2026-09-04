@@ -39,7 +39,8 @@ use crate::commands::sync::policy_check::{
     find_control_file_policy_mismatch, policy_mismatch_message,
 };
 use crate::commands::sync::{
-    build_dest_commit, build_source_commit, pending_commits, pending_dest_commits,
+    build_dest_commit, build_pending_dest_tip, build_source_commit, pending_commits,
+    pending_dest_commits,
 };
 use crate::config::Config;
 use crate::exclude;
@@ -322,51 +323,24 @@ fn start_source_to_dest(
         );
     }
 
-    let mut parent = dest_tip;
-    let mut selected = None;
-    for source_oid in pending {
-        let source_commit = repo.find_commit(source_oid)?;
-        if marker::verify(
-            &source_commit,
-            branch,
-            &[marker::Direction::Setup, marker::Direction::DestToSource],
-            None,
-            state_key,
-        )
-        .is_some()
-        {
-            continue;
-        }
-        let parent_commit = repo.find_commit(parent)?;
-        let base_tree = match source_commit.parent(0) {
-            Ok(base) => filter_tree(repo, &base.tree()?, Path::new(""), exclude_list)?,
-            Err(_) => repo.treebuilder(None)?.write()?,
-        };
-        let theirs_tree = filter_tree(repo, &source_commit.tree()?, Path::new(""), exclude_list)?;
-        match git::merge_tree(source_root, base_tree, parent_commit.tree_id(), theirs_tree)? {
-            git::MergeTreeOutcome::Clean(tree) if tree == parent_commit.tree_id() => continue,
-            git::MergeTreeOutcome::Clean(tree) => {
-                parent = build_dest_commit(
-                    repo,
-                    config,
-                    parent,
-                    &source_commit,
-                    tree,
-                    branch,
-                    state_key,
-                )?;
-            }
-            git::MergeTreeOutcome::Conflict { paths } => {
-                selected = Some((source_oid, parent, paths));
-                break;
-            }
-        }
-    }
-    let Some((source_oid, dest_base, paths)) = selected else {
+    let build = build_pending_dest_tip(
+        repo,
+        config,
+        exclude_list,
+        boundary,
+        dest_tip,
+        source_tip,
+        source_root,
+        branch,
+        state_key,
+    )?;
+    let Some(conflict) = build.conflict else {
         anyhow::bail!(
             "gitprism resolve: {branch:?} <- {branch:?} has no source-to-dest conflict to resolve"
         )
     };
+    let dest_base = build.new_tip.unwrap_or(dest_tip);
+    let (source_oid, paths) = (conflict.commit, conflict.paths);
     if dest_base != dest_tip {
         // decisions/0039 narrows 0038's resolve.rs guidance: force here
         // would require positively detecting a source-side rewrite, which
@@ -1190,6 +1164,10 @@ fn resolve_start(
         .with_context(|| format!("resolving source branch {branch:?} to a commit"))?
         .id();
 
+    // Sync's dest→source path does build a prefix chain
+    // (build_pending_source_tip); resolve deliberately takes only
+    // pending.first() per invocation (decisions/0015), so there's nothing
+    // to unify here.
     let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
         .with_context(|| {
             format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
@@ -1275,6 +1253,8 @@ fn resolve_continue(
         .peel_to_commit()
         .context("resolving fetched dest branch to a commit")?
         .id();
+    // Same as resolve_start — resolve deliberately takes only
+    // pending.first(), so nothing here duplicates sync's prefix-replay loop.
     let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
         .with_context(|| {
             format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
@@ -2688,6 +2668,466 @@ mod tests {
         assert_eq!(
             dest_repo.find_blob(resolved.id()).unwrap().content(),
             b"human resolution"
+        );
+    }
+
+    /// Whether any commit reachable from `branch`'s dest tip carries a
+    /// `Gitprism-Source-Commit` trailer naming `needle` — used to check that
+    /// a source commit was never replayed onto dest.
+    fn dest_history_contains_source_commit(
+        dest_repo: &Repository,
+        branch: &str,
+        needle: Oid,
+    ) -> bool {
+        let tip = dest_repo
+            .find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut walk = dest_repo.revwalk().unwrap();
+        walk.push(tip.id()).unwrap();
+        let trailer = format!("Gitprism-Source-Commit: {needle}");
+        walk.filter_map(Result::ok).any(|oid| {
+            dest_repo
+                .find_commit(oid)
+                .unwrap()
+                .message()
+                .unwrap_or("")
+                .contains(&trailer)
+        })
+    }
+
+    /// CODE-002 step 1 / ARCH-001 step 1's parity test. `main` round-trips a
+    /// dest-native commit `d` into source as marker `m`
+    /// (`Gitprism-Branch: main`); `feature` is cut from `main` right after
+    /// `m`, so `m` sits in `feature`'s own first-parent history too —
+    /// inherited from `main`, not `feature`'s own. `feature` then gains a
+    /// source commit that conflicts with dest `feature`'s independent
+    /// content, so both `sync` and `resolve` must hit a real source-to-dest
+    /// conflict at the same commit. `resolve`'s own pending scan
+    /// (`marker::verify`, branch-scoped) fails to recognize `m` as already
+    /// accounted for once it's inherited onto `feature`, unlike sync's
+    /// `loop_prevented` (`marker::verify_self`) — so today, `resolve`
+    /// replays `m` as part of the clean prefix it pushes ahead of the
+    /// conflict.
+    #[test]
+    fn resolve_selects_syncs_conflict_and_must_not_replay_a_sibling_branchs_dest_marker() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let c0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "base")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", c0, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+
+        // d: a dest-native commit, independent of source, landing directly
+        // on dest's main after the graft.
+        let d = add_independent_dest_commit(&dest_repo, c0, ("dest-native.txt", "dest content"));
+
+        // m: main round-trips d into source — a real content change (not a
+        // no-op marker), so a merge that actually replays it is
+        // distinguishable from one that correctly skips it.
+        let mut builder = source_repo
+            .treebuilder(Some(&graft.tree().unwrap()))
+            .unwrap();
+        let dest_native_blob = source_repo.blob(b"dest content").unwrap();
+        builder
+            .insert(
+                "dest-native.txt",
+                dest_native_blob,
+                git2::FileMode::Blob.into(),
+            )
+            .unwrap();
+        let m_tree = source_repo.find_tree(builder.write().unwrap()).unwrap();
+        let marker_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let m_message = marker::build_message(
+            "gitprism sync: dest -> source",
+            marker::Direction::DestToSource,
+            "main",
+            d,
+            "Gitprism-Dest-Commit",
+            &[graft.id()],
+            m_tree.id(),
+            &marker_signature,
+            &marker_signature,
+            &marker::load_key().unwrap(),
+        );
+        let m = source_repo
+            .commit(
+                Some("refs/heads/main"),
+                &marker_signature,
+                &marker_signature,
+                &m_message,
+                &m_tree,
+                &[&graft],
+            )
+            .unwrap();
+
+        let m_commit = source_repo.find_commit(m).unwrap();
+        source_repo.branch("feature", &m_commit, false).unwrap();
+        source_repo.set_head("refs/heads/feature").unwrap();
+        checkout_head_exact(&source_repo);
+        let conflicting_source_commit =
+            add_commit(&source_repo, "feature", &[("f.txt", "source content")]);
+
+        // dest's own feature ref forks straight from c0 (never sees d), then
+        // gains its own independent, conflicting change to f.txt.
+        dest_repo
+            .reference("refs/heads/feature", c0, true, "test mirror-only branch")
+            .unwrap();
+        let dest_feature_tip =
+            add_independent_dest_commit_on(&dest_repo, c0, "feature", ("f.txt", "dest content"));
+
+        // A per-branch boundary marker naming `dest_feature_tip` exactly —
+        // the same synthetic-marker convention every other mirror-only-
+        // branch test in this module uses to make an otherwise
+        // gitprism-untouched dest ref recognized as safe to build on.
+        let conflicting_commit = source_repo.find_commit(conflicting_source_commit).unwrap();
+        let boundary_message = marker::build_message(
+            "gitprism sync: dest -> source",
+            marker::Direction::DestToSource,
+            "feature",
+            dest_feature_tip,
+            "Gitprism-Dest-Commit",
+            &[conflicting_source_commit],
+            conflicting_commit.tree_id(),
+            &marker_signature,
+            &marker_signature,
+            &marker::load_key().unwrap(),
+        );
+        source_repo
+            .commit(
+                Some("refs/heads/feature"),
+                &marker_signature,
+                &marker_signature,
+                &boundary_message,
+                &conflicting_commit.tree().unwrap(),
+                &[&conflicting_commit],
+            )
+            .unwrap();
+        checkout_head_exact(&source_repo);
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+
+        let sync_error = crate::commands::sync::run(source_dir.path(), config.path())
+            .expect_err("feature's real conflict must halt sync");
+        let sync_message = format!("{sync_error:#}");
+        assert!(
+            sync_message.contains(&conflicting_source_commit.to_string()),
+            "sync's own error should name the conflicting commit: {sync_message}"
+        );
+
+        // Control: sync's own loop_prevented (marker::verify_self) already
+        // correctly skips m here, so the later resolve-specific failure
+        // isn't an artifact of a fixture that never lets sync build
+        // anything either.
+        assert!(
+            !dest_history_contains_source_commit(&dest_repo, "feature", m),
+            "sync must not replay m — a DestToSource marker inherited from main — as part of \
+             the clean prefix it pushes ahead of the conflict"
+        );
+
+        let resolve_error = run_with_direction(
+            source_dir.path(),
+            config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("resolve must find the same conflict sync reported");
+        let resolve_message = format!("{resolve_error:#}");
+
+        let operation =
+            find_source_to_dest_operation(&source_repo, "feature", &marker::load_key().unwrap())
+                .unwrap();
+        git::worktree_remove(source_dir.path(), &operation.worktree).unwrap();
+        source_repo
+            .find_reference(&operation.refname)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        assert!(
+            resolve_message.contains(&conflicting_source_commit.to_string()),
+            "resolve must select the identical conflicting commit sync reported: {resolve_message}"
+        );
+
+        assert!(
+            !dest_history_contains_source_commit(&dest_repo, "feature", m),
+            "resolve must not replay m — a DestToSource marker inherited from main — as part of \
+             the clean prefix it pushes ahead of the conflict"
+        );
+    }
+
+    /// Builds a mirror-only `feature` with two commits that merge cleanly
+    /// onto dest, then a third that conflicts — for comparing the clean
+    /// prefix `sync` pushes against the one `resolve` pushes, starting from
+    /// the identical pre-run state. Returns everything the caller needs to
+    /// run either command and inspect dest's resulting `feature` history:
+    /// the dest/source dirs and repos, the config, and dest `feature`'s tip
+    /// before either command runs.
+    fn feature_with_two_clean_commits_then_a_conflict() -> (
+        tempfile::TempDir,
+        Repository,
+        tempfile::TempDir,
+        Repository,
+        tempfile::NamedTempFile,
+        Oid,
+    ) {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let c0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "base")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", c0, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        source_repo.branch("feature", &graft, false).unwrap();
+        drop(graft);
+        source_repo.set_head("refs/heads/feature").unwrap();
+        checkout_head_exact(&source_repo);
+
+        add_commit(&source_repo, "feature", &[("a.txt", "1")]);
+        add_commit(&source_repo, "feature", &[("b.txt", "1")]);
+        let conflicting_source_commit =
+            add_commit(&source_repo, "feature", &[("f.txt", "source content")]);
+
+        dest_repo
+            .reference("refs/heads/feature", c0, true, "test mirror-only branch")
+            .unwrap();
+        let dest_feature_before =
+            add_independent_dest_commit_on(&dest_repo, c0, "feature", ("f.txt", "dest content"));
+
+        // Same synthetic per-branch boundary marker as the test above, so
+        // this otherwise gitprism-untouched dest ref is recognized as safe
+        // to build on.
+        let conflicting_commit = source_repo.find_commit(conflicting_source_commit).unwrap();
+        let marker_signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let boundary_message = marker::build_message(
+            "gitprism sync: dest -> source",
+            marker::Direction::DestToSource,
+            "feature",
+            dest_feature_before,
+            "Gitprism-Dest-Commit",
+            &[conflicting_source_commit],
+            conflicting_commit.tree_id(),
+            &marker_signature,
+            &marker_signature,
+            &marker::load_key().unwrap(),
+        );
+        source_repo
+            .commit(
+                Some("refs/heads/feature"),
+                &marker_signature,
+                &marker_signature,
+                &boundary_message,
+                &conflicting_commit.tree().unwrap(),
+                &[&conflicting_commit],
+            )
+            .unwrap();
+        drop(conflicting_commit);
+        checkout_head_exact(&source_repo);
+
+        let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+        (
+            dest_dir,
+            dest_repo,
+            source_dir,
+            source_repo,
+            config,
+            dest_feature_before,
+        )
+    }
+
+    /// Every tree gitprism built on `branch` beyond `before`, oldest first —
+    /// the content-addressed part of a dest commit, stable across two
+    /// independently timestamped builds of "the same" chain (sync's own vs.
+    /// resolve's — `build_dest_commit` stamps a fresh `Signature::now()`
+    /// committer time each call, so the built commits' own oids necessarily
+    /// differ between the two). Tree-level comparison only catches content
+    /// drift — it does not catch a divergence in commit markers (direction,
+    /// branch, `Gitprism-Source-Commit`) between the two builds, since those
+    /// live in the commit message, not the tree.
+    fn dest_tree_ids_beyond(dest_repo: &Repository, branch: &str, before: Oid) -> Vec<Oid> {
+        let tip = dest_repo
+            .find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let mut walk = dest_repo.revwalk().unwrap();
+        walk.push(tip.id()).unwrap();
+        walk.hide(before).unwrap();
+        walk.simplify_first_parent().unwrap();
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+            .unwrap();
+        walk.filter_map(Result::ok)
+            .map(|oid| dest_repo.find_commit(oid).unwrap().tree_id())
+            .collect()
+    }
+
+    /// ARCH-001 step 1's second assertion set: with a clean prefix of two
+    /// commits before the conflict, `resolve` must push exactly the dest
+    /// commits `sync` would have built — compared as trees, since the two
+    /// commands run at different times and therefore stamp different
+    /// committer timestamps (see `dest_tree_ids_beyond`).
+    #[test]
+    fn resolve_pushes_the_same_clean_prefix_sync_would_have_built() {
+        let (_dest_dir, dest_repo, source_dir, _source_repo, config, dest_feature_before) =
+            feature_with_two_clean_commits_then_a_conflict();
+        crate::commands::sync::run(source_dir.path(), config.path())
+            .expect_err("feature's real conflict must still halt sync");
+        let sync_prefix = dest_tree_ids_beyond(&dest_repo, "feature", dest_feature_before);
+        assert_eq!(
+            sync_prefix.len(),
+            2,
+            "sync should push exactly the two clean commits ahead of the conflict"
+        );
+
+        let (_dest_dir2, dest_repo2, source_dir2, source_repo2, config2, dest_feature_before2) =
+            feature_with_two_clean_commits_then_a_conflict();
+        run_with_direction(
+            source_dir2.path(),
+            config2.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("feature's real conflict must still halt resolve");
+        let resolve_prefix = dest_tree_ids_beyond(&dest_repo2, "feature", dest_feature_before2);
+
+        assert_eq!(
+            resolve_prefix, sync_prefix,
+            "resolve must push exactly the dest commits sync would have built for the same clean prefix"
+        );
+
+        let operation =
+            find_source_to_dest_operation(&source_repo2, "feature", &marker::load_key().unwrap())
+                .unwrap();
+        git::worktree_remove(source_dir2.path(), &operation.worktree).unwrap();
+        source_repo2
+            .find_reference(&operation.refname)
+            .unwrap()
+            .delete()
+            .unwrap();
+    }
+
+    /// decisions/0048's own scenario 1 (see `sync::tests::dest_to_source`'s
+    /// `mirror_only_branch_later_added_to_config_branches_only_reflects_dest_native_commits`,
+    /// the review's adopted repro), exercised through `gitprism resolve`'s
+    /// dest→source path instead of `sync` — resolve and sync must never
+    /// disagree about which dest commit is next (decisions/0008). Before the
+    /// fix, `resolve`'s own `pending_dest_commits` call picks up main's own
+    /// already-mirrored commit as the phantom first pending commit and hits
+    /// the identical same-line conflict CODE-001 reports; the fix requires
+    /// no change to `resolve` itself.
+    #[test]
+    fn resolve_dest_to_source_selects_the_customer_commit_not_a_mirrored_commit_after_a_branch_is_promoted()
+     {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+        let graft = source_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+
+        // Two source commits on main touching the same line.
+        add_commit(&source_repo, "main", &[("shared.txt", "v2\n")]);
+        let s2 = add_commit(&source_repo, "main", &[("shared.txt", "v3\n")]);
+
+        let config_main_only = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+        crate::commands::sync::run(source_dir.path(), config_main_only.path()).expect("first sync");
+
+        // Cut a release branch from main AFTER setup; mirror it (mirror-only).
+        source_repo
+            .branch("release", &source_repo.find_commit(s2).unwrap(), false)
+            .unwrap();
+        crate::commands::sync::run(source_dir.path(), config_main_only.path())
+            .expect("second sync mirrors release");
+        let dest_release_tip = dest_repo
+            .find_branch("release", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+
+        // Customer merges a PR into dest's release.
+        let c = add_independent_dest_commit_on(
+            &dest_repo,
+            dest_release_tip,
+            "release",
+            ("customer.txt", "customer\n"),
+        );
+
+        // Seed source's remote with release, then promote release to
+        // round-tripped.
+        git::push(
+            source_repo.workdir().unwrap(),
+            &source_remote.path().display().to_string(),
+            s2,
+            "release",
+            PushMode::FastForwardOnly,
+        )
+        .unwrap();
+        let config_both = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        );
+
+        source_repo.set_head("refs/heads/release").unwrap();
+        checkout_head_exact(&source_repo);
+
+        run(source_dir.path(), config_both.path(), "release", false).expect(
+            "resolve must pick up the customer's commit cleanly, not a phantom conflict on main's \
+             own mirrored history",
+        );
+
+        let source_remote_repo = Repository::open(source_remote.path()).unwrap();
+        let release_tip = source_remote_repo
+            .find_branch("release", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        assert!(
+            release_tip
+                .message()
+                .unwrap()
+                .contains(&format!("Gitprism-Dest-Commit: {c}")),
+            "resolve must select the customer's own dest commit as the pending one, not a \
+             mirrored commit"
+        );
+        let mut revwalk = source_remote_repo.revwalk().unwrap();
+        revwalk.push(release_tip.id()).unwrap();
+        revwalk.hide(s2).unwrap();
+        assert_eq!(
+            revwalk.count(),
+            1,
+            "only the customer's commit should be reflected into source's release"
         );
     }
 }

@@ -65,6 +65,12 @@ finalized — see open questions).
   [decisions/0010](../decisions/0010-preserve-author-stamp-committer.md).
 * ~~Exact exclude-list filename/syntax~~ — resolved, see
   [decisions/0011](../decisions/0011-exclude-list-is-gitignore-syntax.md).
+* ~~Can a branch be added to `branches` after `setup` has already run for the
+  others?~~ — resolved, see
+  [decisions/0048](../decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md):
+  yes, for a branch already mirrored to dest — `setup` is not involved; add
+  the branch and run `sync`, which resumes it from the newest authenticated
+  boundary on either side.
 
 # Cited by
 

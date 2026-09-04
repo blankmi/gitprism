@@ -2611,3 +2611,433 @@ its own regression.
 
 Gates on the finished tree: fmt, clippy `-D warnings`, `cargo test` at 338
 passing (up from 335), and `cargo build --release --locked`, all clean.
+
+## 2026-09-03 — dest→source resumes from the newest authenticated boundary (0048)
+
+**Decided [decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)**,
+step 3 of `docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md`, fixing
+the 2026-09-02 repository review's CODE-001 (HIGH/P0): a branch cut from a
+round-tripped branch after `setup`, later added to `config.branches`,
+inherits only the parent's `Setup` graft in its own first-parent history, so
+`pending_dest_commits` (`src/commands/sync/mod.rs`) resumes from dest's tip
+at setup time — every dest commit since, including commits gitprism itself
+mirrored from the parent branch, becomes pending, and each hard-stops the
+branch on a phantom conflict once it collides with the parent's own already-
+synced content. `setup` refuses to re-graft such a branch (it already carries
+an inherited `Setup`/`DestToSource` marker), so there was no supported
+recovery. Reproduced by execution in the review's Appendix.
+
+The boundary becomes the newest commit on dest's first-parent line that is
+either B1 (today's `Setup`/`DestToSource` marker boundary, unchanged) or B2
+(a `SourceToDest` marker commit, self-verified against its own recorded
+branch via `marker::verify_self`, whose source counterpart is an ancestor of
+source's current tip via `graph_descendant_of`). B1 stays a precondition,
+checked before any dest-side walk for B2 runs, so a dest branch force-rewound
+behind an already-imported commit is refused exactly as today rather than
+silently accepted — the first draft of the plan missed this and was revised
+before this decision was written (plan's own revision history). Loop
+prevention inside `pending_dest_commits` stays scoped to the branch's own
+name; widening it to `verify_self` would drop a fast-forwarded sibling
+branch's independent content instead of reflecting it back (scenario 3 in the
+plan). Rejected deriving the boundary from decisions/0046's mapping index,
+built only after dest→source runs by that decision's own ordering.
+
+`design/decisions/index.md` gains the 0048 entry; no code changed. Step 4
+implements `marker_scan::dest_to_source_boundary` and wires it into
+`pending_dest_commits`.
+
+## 2026-09-03 — step 4 code review: B2 needed no dest-native commit beneath it (0048 amendment)
+
+A code review of step 4's implementation found the B2 predicate as decided
+insufficient: `verify_self` plus `graph_descendant_of(source_tip,
+counterpart)` alone only proves the *candidate commit's own* source
+counterpart is reachable — not that everything beneath it, on *this*
+branch's own dest history, was ever imported. The "Why" section's
+`dest_tip_accounted_for` argument only holds for the branch a marker
+commit was actually pushed for, not for an arbitrary later branch
+mirror-aliased onto the same dest commit. Reproduced end to end via
+`sync::run`, no hand-crafted markers: a dest-native commit imported on one
+branch, then a later branch mirror-aliased past it, left the later
+branch's own dest-native content — a customer commit added after the
+alias — silently unreflected, with `sync` reporting "nothing new to
+reflect back."
+
+Specified as an amendment to
+[decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+— found flawed and superseded by the corrected model (below) before it was
+ever committed to the file itself.
+A B2 candidate now also needs no dest-native commit — one that isn't
+itself a valid, self-verified `SourceToDest` marker — sitting strictly
+between B1 and it; `marker_scan::dest_to_source_boundary` finds the newest
+qualifying candidate within the contiguous run of markers starting
+immediately above B1, and the first dest-native commit in that run ends
+it. A related gap in the same review — the walk is first-parent-only but
+its B1 precondition checks full ancestry, so a B1 reachable only via a
+non-first-parent merge could run the walk off dest's history with a raw
+error — is fixed alongside: the walk now bails clearly, naming
+decisions/0019's first-parent limitation, once it exhausts dest's
+first-parent line without reaching B1.
+
+A regression test
+(`dest_to_source_does_not_drop_dest_native_content_beneath_a_cross_branch_mirror_marker`
+in `src/commands/sync/tests/dest_to_source.rs`) reproduces the review's
+scenario end to end and was verified to fail against the pre-amendment
+code with exactly the reported symptom. Scenario 4's existing test
+(`dest_to_source_resumes_from_its_own_import_marker_when_nothing_new_has_landed`)
+had a comment claiming it caught a missing B1 lower bound; verified false
+(disabling the bound still fails the fixture, but earlier, and for the
+new first-parent-line reason above, not by silently resuming from an
+older marker) — the comment now says so, and a dedicated unit test
+(`ignores_a_qualifying_b2_shaped_marker_below_b1` in `marker_scan.rs`)
+isolates the lower bound itself.
+
+Gates on the finished tree: fmt, clippy `-D warnings`, `cargo test
+--workspace --all-features` at 356 passing (up from 354), and `cargo build
+--release --locked`, all clean.
+
+## 2026-09-03 — 0048's dest-native-disqualification amendment itself corrected
+
+The project owner reviewed the previous entry's amendment and found it also
+wrong, before any of it was committed: "unimported dest-native commit" is
+narrower than the real invariant. Disqualifying *any* dest-native commit
+between B1 and a B2 candidate cannot distinguish one source has already
+imported (via a marker reachable from `source_tip` that lives on a different
+branch's dest line) from one it hasn't — so it stops the frontier at the
+first native commit unconditionally, reintroducing CODE-001's own headline
+symptom for any branch descended from a parent that has imported dest-native
+content, exactly the scenario this decision exists to fix. It also had no
+way to name a bare dest-native `dest_tip` (with nothing later) as a boundary
+at all.
+
+[Decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+is rewritten in place (Decision, Why, Consequences, and a new Rejected
+alternatives section) to the corrected model: the boundary is the end of the
+longest contiguous prefix of dest's first-parent line past B1 for which every
+commit is proven **represented** in `source_tip` — a `SourceToDest` marker
+represented via its own counterpart's reachability (case 1, unchanged from
+the first round), any other commit (dest-native, or an invalid/unauthenticated
+marker) represented only via a self-verified `DestToSource` marker reachable
+from `source_tip`, regardless of its own recorded branch, naming that exact
+dest oid (case 2, new). The walk stops at the first unrepresented commit; the
+boundary is the commit before it, which may now be an accepted dest-native
+commit, not only a marker. This is the same branch-agnostic-authentication/
+branch-specific-reachability invariant decisions/0043's 2026-08-27 addendum
+(F-04) already established for the mirror-image problem, cited directly.
+Both rejected rounds — the bare ancestor check and the blanket
+disqualification rule — are recorded in the decision's new "Rejected
+alternatives" section with the worked `source: s3 ── M(C0)` /
+`dest: C0 ── D(s3)` example showing why case 1 alone under- and
+over-shoots depending on branch-cut timing. Four required test scenarios
+(the two branch-cut timings around `M(C0)`, `dest_tip == C0` with no later
+marker, and an authenticated `SourceToDest` marker unreachable from this
+branch's own `source_tip`) are specified in the decision for the
+implementation rework.
+
+`design/decisions/index.md`'s 0048 entry is updated to match. Decision-only
+change: `src/commands/sync/marker_scan.rs` and its tests still encode the
+now-rejected round-2 rule as of this entry; rewriting them against the
+corrected model is CODE-001 step 4's rework, not done here.
+
+## 2026-09-03 — step 5: source→dest's own safety check widened to agree with 0048 (audit closed)
+
+CODE-001 step 5 audited the one remaining `newest_dest_marker` caller,
+`anchor::dest_tip_accounted_for`'s case 3 (`src/commands/sync/anchor.rs`) —
+source→dest's own "is dest's tip safe to build on" check. A code review of
+step 4 had already reproduced the gap this step exists to close: a
+promoted branch whose dest→source pass finds `dest_tip` represented purely
+via decisions/0048's case 2 (an inherited marker naming it exactly, no
+case-1 marker of `dest_tip`'s own) writes nothing new to source, so B1 never
+moves — and case 3, comparing only against B1, then refused the *same run's*
+source→dest pass for the same branch. The promoted branch round-tripped
+dest→source but not both directions in one run, which is what `setup`'s
+refusal was supposed to have a real path to via `sync`.
+
+Fixed, but not by editing `dest_tip_accounted_for`'s case 3 directly, as the
+plan's own wording suggested. `dest_tip_accounted_for` is also
+`branch_scoped_dest_tip`'s fixpoint check (decisions/0044's F-02: does a
+branch anchored on a sibling's own dest commit need a branch-scoped marker
+of its own, or does that commit already carry this branch's identity) — a
+question that must stay branch-scoped. Decisions/0048's case 1/case 2 are
+deliberately branch-*agnostic* (`marker::verify_self`); folding the
+represented-prefix walk into case 3 directly let a branch anchored on a
+sibling's own marker (e.g. a task branch forked from a mirror-only feature
+branch with no commits of its own) wrongly conclude the sibling's marker
+already satisfied its own identity, so it never got a marker of its own —
+breaking later branch-scoped scans that depend on one existing. Caught by
+execution, not inspection: two existing tests regressed —
+`sync_pair_to_dest_gives_a_branch_with_no_commits_of_its_own_a_branch_scoped_marker`
+directly, and `mirror_only_branch_later_added_to_config_branches_only_reflects_dest_native_commits`
+downstream (a promoted branch's own earlier mirror silently reused a
+sibling's marker, `newest_source_marker` later found nothing branch-scoped
+for it, fell back to the graft, and replayed already-mirrored source content
+into a same-line conflict).
+
+The fix instead adds a separate function, `dest_tip_represented_in_source`,
+consulted only by `dest_resume_point_for_branch` (source→dest's safety
+question) alongside the unchanged `dest_tip_is_accounted_for`: it re-checks
+B1's ancestor precondition directly (so an ordinary "not accounted for yet"
+stays today's per-branch `None`, not a whole-run error) and then reuses
+`dest_to_source_boundary` verbatim — `dest_tip` is safe exactly when the
+walk's own boundary is `dest_tip` itself. `branch_scoped_dest_tip` and
+decisions/0039's `mirror_only_rewrite_detected` are deliberately left
+consulting only the original, branch-scoped `dest_tip_accounted_for` — the
+latter also because a round-tripped branch never reaches its rewrite-rebuild
+arm regardless. [Decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+gains a Consequences note recording this split and why it isn't folded into
+the shared predicate.
+
+Verified by execution: a new end-to-end test
+(`sync_pair_to_dest_accepts_a_dest_tip_represented_only_via_case_two`, dest→source
+then source→dest for the same branch in one `run`) fails with source→dest's
+"isn't at a point this clone can safely build on" refusal before the fix and
+passes after, with dest's tip genuinely advancing past the represented
+dest-native commit to carry source's own later content too. A second,
+negative unit test on the `dest_resume_point` seam confirms the widening
+still refuses a case-1-qualifying marker sitting on an *unimported*
+dest-native commit, matching `marker_scan`'s own equivalent walk-level test.
+
+A second review pass, before any of the above was committed, found the
+widening itself unsafe for a different shape: decisions/0048's own
+scenario 2 (dest `hotfix` cut from dest `main` at `main`'s own mirror
+commit, nothing of `hotfix`'s own on either side) plus a same-run
+source→dest pass — a combination scenario 2's existing test never
+exercised. `dest_tip_represented_in_source`'s walk is branch-agnostic by
+design and finds `main`'s own mirror fully "represented" regardless of
+whose branch name it carries, but `dest_resume_point_for_branch`'s other
+half, `newest_source_marker`, is branch-scoped and finds nothing on
+`hotfix`'s own line — falling back to the graft and replaying `main`'s
+already-mirrored source content onto `hotfix` as new, hitting the same
+same-line conflict CODE-001 exists to fix, reached through a different
+door. Reproduced by execution first (a chained
+`sync_pair_from_dest`/`sync_pair_to_dest` test on scenario 2's fixture hit
+the conflict), then fixed by requiring the boundary half to be able to back
+the safety grant up: `dest_tip_represented_in_source` now also requires
+either `newest_source_marker` to already find something branch-scoped on
+the line, or that nothing between B1 and `dest_tip` carries a
+self-verified `SourceToDest` marker at all. A dest ref parked purely on a
+sibling's own mirror chain still refuses, with the operator's existing
+recovery (delete the stray dest ref; decisions/0046's anchor resolution and
+`branch_scoped_dest_tip` then give it a marker of its own) unchanged.
+[Decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+records both the widening and this narrowing in its Consequences.
+
+Full suite: 366 passed (363 before this step, plus three new tests — the
+positive round-trip test, the branch-scoped negative unit test, and the
+scenario-2 refusal regression test); `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+clean; `cargo build --release --locked` succeeds.
+
+## 2026-09-03 — code review of step 5's widening found a real safety-gate bug and a whole-run-abort bug, both fixed before commit
+
+A code review of step 5's own widening (`anchor::dest_tip_represented_in_source`,
+still uncommitted) found one blocking bug and one should-fix, both in the
+same function, plus doc drift. Both are recorded in
+[decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)'s
+new 2026-09-03 addendum, which also relocates step 5's own rule description
+out of `# Consequences` into that addendum, restated to describe the
+corrected rule rather than the bug it replaces.
+
+**CODE-001 (blocking):** the safety check's either/or — "`newest_source_marker(dest_tip,
+branch)` finds something branch-scoped on the line" or "nothing on the line
+carries a `SourceToDest` marker at all" — is unsafe. `newest_source_marker`
+stops at the first branch-scoped match walking down from `dest_tip`, so a
+*foreign*-branded marker sitting *above* the branch-scoped one it eventually
+finds makes that scan return a stale, older boundary, while the
+represented-prefix walk itself still grants representation because the
+foreign marker is represented via case 1/case 2. The either/or then granted
+safety on the stale boundary, and the branch replayed already-mirrored
+content as new commits — CODE-001's own bug class through a new door.
+Reproduced by execution (mirror `main` partway, mirror `release` further
+along the same source line so its own marker lands above `main`'s on dest,
+fast-forward dest `main` onto dest `release`'s tip, advance source `main` to
+match, then sync `main` again): before the fix, the run silently granted
+safety and reported the branch up to date with nothing pending, rather than
+refusing.
+
+Fixed by collapsing the either/or into one walk,
+`newest_source_to_dest_marker_branch_between`: the newest self-verified
+`SourceToDest` marker anywhere on dest's first-parent line from `dest_tip`
+down to (and including) B1 — whichever branch's own scan would or wouldn't
+find it — must be branded for the branch being processed, or there must be
+no such marker in that range at all. `any_source_to_dest_marker_between` is
+removed, replaced by this walk. New regression test
+(`sync_pair_to_dest_refuses_when_a_foreign_branded_marker_sits_above_a_stale_branch_scoped_one`,
+`tests::dest_to_source`) confirmed empirically to fail before the fix
+(silently grants safety, no error) and pass after (refuses with today's
+clean "isn't at a point this clone can safely build on" message).
+
+**CODE-002 (should-fix):** `dest_to_source_boundary`'s own `bail!` for
+decisions/0019's first-parent limitation (B1 confirmed a full-ancestry
+descendant of `dest_tip`, but not reachable via first-parent alone —
+already covered by the boundary walk's own tests in `marker_scan.rs`) was
+left to propagate as `Err` through `dest_tip_represented_in_source`'s `?`.
+For a configured branch this made no difference (`sync_pair_to_dest_with_key`
+already bails the identical way on its own `?`), but for a *discovered*
+branch it aborted the entire run instead of the per-branch halt
+decisions/0046 Addendum 2 requires. Fixed with a bounded pre-check,
+`b1_reachable_via_first_parent`, run before either walk that would
+otherwise `bail!` on this shape, converting the refusal to `Ok(false)` — the
+same per-branch shape every other "not accounted for" outcome in this
+function already returns. New regression test
+(`dest_resume_point_returns_none_instead_of_erroring_when_b1_is_off_the_first_parent_line`,
+`tests::anchor`) confirmed empirically to fail before the fix (`Err`
+propagates, naming decisions/0019's first-parent limitation) and pass after
+(`Ok(None)`).
+
+Doc drift also fixed: `anchor.rs`'s own doc comment on the disjunct CODE-001
+replaced (which claimed it was "safe regardless of what else sits on it" —
+exactly what CODE-001 disproved) and on the B1-precondition paragraph (which
+claimed the first-parent-limitation `bail!` was deliberately left to
+propagate as a hard error — exactly what CODE-002 fixed) are both rewritten
+to describe the corrected behavior; `marker_scan.rs`'s cross-reference to
+the old either/or wording is corrected too; and 0048's now-stale note that
+`marker_scan.rs`'s implementation was still "current, uncommitted" (true
+when written for step 4, false since d777a02) is deleted.
+
+Full suite: 368 passed (366 before this round, plus the two new regression
+tests), all three of step 5's own tests (the positive round-trip test, the
+branch-scoped negative unit test, and the scenario-2 refusal regression
+test) still passing under the corrected single-walk logic; `cargo fmt --all
+-- --check` and `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo build --release --locked` succeeds.
+
+## 2026-09-03 — re-review of step 5's fix-up found the safety gate's range still didn't match the boundary scan's own range
+
+A second code review of the previous entry's fix
+(`anchor::newest_source_to_dest_marker_branch_between`), also before it was
+ever committed, found one more real bug, with a verified one-line fix.
+
+**CODE-001:** the walk searched only `dest_tip` down to (and including) B1 —
+the same range [`dest_to_source_boundary`](../src/commands/sync/marker_scan.rs)
+itself is bounded to. That range doesn't match what this check is actually
+guarding: B1 is advanced by dest→source imports, which never consult this
+source→dest-side safety gate at all, so the newest self-verified
+`SourceToDest` marker genuinely on the line can sit *below* B1 once such an
+import has moved past it. When that happens the B1-bounded search finds
+nothing in range, reports "no marker at all", and grants safety on an empty
+search — while [`newest_source_marker`](../src/commands/sync/marker_scan.rs)
+(branch-scoped, unbounded, the actual boundary `dest_resume_point_for_branch`
+resumes from next) walks straight past the foreign-branded marker below B1 to
+a stale, older one further down that happens to be branded for this branch,
+and the run replays already-mirrored content as a phantom conflict.
+Reproduced by execution: extending
+`sync_pair_to_dest_refuses_when_a_foreign_branded_marker_sits_above_a_stale_branch_scoped_one`'s
+fixture with two more dest-native commits (so B1 lands above both existing
+mirror markers), a real `sync_pair_from_dest` import of a dest-native edit to
+already-mirrored content (`release.txt` — CODE-001's own headline symptom),
+and a second import branded "sibling" per decisions/0048's own scenario-9
+device, produced exactly this: a hard conflict on `release.txt` instead of
+today's clean safety refusal.
+
+Fixed by searching the *whole* of dest's first-parent line instead of
+stopping at B1 — the same unbounded range `newest_source_marker` itself
+walks, so the two can no longer disagree about what the newest marker on the
+line is. Bounded only by `MAX_MARKER_SCAN_COMMITS`, same as every other scan
+in this module. Widening the search cannot regress anything the B1-bounded
+version already refused — it can only turn some wrongly-granted cases into
+correct refusals. With `b1` no longer used for control flow, it drops as a
+parameter of this function; `b1_reachable_via_first_parent`'s own doc comment
+(CODE-002) is corrected to say it now protects only `dest_to_source_boundary`'s
+walk, not this one. New regression test
+(`sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_foreign_mirror_beneath_it`,
+`tests::dest_to_source`) confirmed empirically to fail before the fix (a real
+conflict on `release.txt`) and pass after (today's clean "isn't at a point
+this clone can safely build on" refusal).
+
+Two doc-only findings from the same review, both recorded in
+[decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)'s
+addendum, no code change:
+
+* **CODE-003:** `b1_reachable_via_first_parent`'s own scan-limit `bail!` is,
+  in practice, a whole-run-abort path the addendum's "never a whole-run
+  abort" framing doesn't quite cover — reachable only if dest's first-parent
+  line exceeds 100,000 commits without ever reaching B1. Practically
+  unreachable; now noted as an explicit exception.
+* **CODE-004:** `dest_tip_represented_in_source` returns `Ok(false)`
+  whenever `b1 == dest_tip` (`graph_descendant_of` is non-reflexive) —
+  harmless today only because `dest_tip_accounted_for`'s case 3 already
+  short-circuits before this function is ever called with that input. Now
+  documented as a precondition on the function itself.
+
+`anchor.rs`'s and `marker_scan.rs`'s doc comments describing the old
+B1-bounded range are corrected to describe the whole first-parent line.
+Decision 0048's addendum (its own "Decision" condition 2 and "Rejected
+mid-flight" bullet, both of which described the range-bounded rule), its
+front-matter description, and `design/decisions/index.md`'s 0048 entry are
+all updated to match — the decision file gains a new "Corrected by a second
+review, also before commit" section, distinct from the addendum's existing
+"Rejected mid-flight, before either was committed" list, since this one was
+found by a second review of the addendum, still before any of it was ever
+committed.
+
+Full suite: 369 passed (368 before this round, plus the one new regression
+test), all five of step 5's own tests (the positive round-trip test, the
+branch-scoped negative unit test, the scenario-2 refusal regression test,
+the stale-branch-scoped-boundary regression test, and the whole-run-abort
+regression test) still passing under the corrected whole-line logic;
+`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean; `cargo build --release --locked`
+succeeds.
+
+## 2026-09-03 — CODE-001 closed
+
+`docs/plans/2026-09-02/CODE-001-dest-to-source-boundary.md` is fully
+implemented (steps 1-6). Original finding: a branch cut from a
+round-tripped branch after `setup`, later added to `config.branches`,
+inherited only the parent's `Setup` graft, so `pending_dest_commits` resumed
+from dest's tip at setup time and replayed the parent's own already-mirrored
+commits into a phantom conflict, with no supported recovery (`setup` refuses
+to re-graft a branch carrying an inherited marker). [Decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+fixed the dest→source boundary itself (step 4: the represented-prefix walk,
+after two more predicates were found insufficient and rejected before either
+was committed) and then, by its own 2026-09-03 addendum (step 5), widened
+source→dest's push-safety gate to agree with it (three more review-found
+bugs — a stale-boundary disjunct, a whole-run-abort, and a range mismatch —
+fixed before commit), so a
+promoted branch now round-trips both directions in one run. Step 6 removes
+the interim limitation notes this plan's step 1 put in `README.md` and
+`design/requirements/0001-workflow-and-scope.md`, replacing them with the
+now-supported path (add the branch, run `sync`; `setup` is not involved) and
+a pointer to decisions/0048.
+
+Full suite: 369 passed (unchanged from the previous entry — this step is
+doc-only); `cargo fmt --all -- --check` and `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo build --release
+--locked` succeeds.
+
+## 2026-09-04 — external review of the committed branch: the safety gate was on only one accounting path
+
+An external review of the committed ARCH-001/CODE-001 branch found that the
+newest-mirror-marker gate the two 2026-09-03 reviews above added and then
+widened (`anchor::newest_source_to_dest_marker_branch_between`) ran only
+inside `dest_tip_represented_in_source`, which
+`dest_resume_point_for_branch` consults solely when
+`dest_tip_is_accounted_for` has already returned false.
+
+**CODE-001:** `dest_tip_accounted_for`'s case 3 — source's newest
+`DestToSource` marker names `dest_tip` exactly — is satisfied by any ordinary
+same-branch import, the most common way into the shape the gate guards. It
+short-circuits the `||` before the gate is reached, and
+[`newest_source_marker`](../src/commands/sync/marker_scan.rs) then walks past
+the foreign-branded mirror to the stale branch-scoped one beneath it.
+Reproduced by execution: the previous entry's fixture with n2 imported
+*normally* for `main` (instead of via the "sibling"-branded scenario-9
+device, which is the only reason that test ever reached the gate) produced
+the identical phantom conflict on `release.txt`. Not a regression introduced
+by this branch — the same bypass existed before the 0048 addendum — but the
+addendum claimed to close exactly this symptom.
+
+Fixed by moving the gate into its own function
+(`anchor::newest_mirror_marker_belongs_to_branch`) that
+`dest_resume_point_for_branch` applies after *either* accounting path accepts
+`dest_tip`; `dest_tip_represented_in_source` now answers only the
+represented-prefix question. Doc comments in `anchor.rs` and
+[decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+(new "Corrected by a third review, after commit" section) updated to match.
+Regression test:
+`sync_pair_to_dest_refuses_a_foreign_mirror_beneath_a_tip_accounted_for_by_an_ordinary_import`
+(`tests::dest_to_source`), confirmed to fail before the fix and pass after.
+
+Full suite: 370 passed (369 plus the new regression test); `cargo fmt --all
+-- --check` and `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo build --release --locked` succeeds.
