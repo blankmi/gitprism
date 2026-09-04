@@ -377,6 +377,12 @@ fn run_git_stdin_output(
     run_spawned_git_output(command, Some(input), limits, timeout)
 }
 
+/// Shared spawn/capture core for both [`run_git_output_with_timeout`] and
+/// [`run_git_stdin_output`]. Callers must set `command`'s `Stdio` for stdin
+/// explicitly before calling this — it does not default it, to preserve
+/// decision 0031's null-stdin invariant for every path: a future caller that
+/// forgets to set stdin would otherwise inherit the operator's real stdin
+/// instead of getting a safe default.
 fn run_spawned_git_output(
     mut command: Command,
     stdin_input: Option<&[u8]>,
