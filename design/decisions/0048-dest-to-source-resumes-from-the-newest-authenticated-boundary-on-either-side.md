@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: dest-to-source resumes from the newest authenticated boundary on either side
-description: Fixes CODE-001 (docs/2026-09-02_REPOSITORY_REVIEW.md, section 3) — a branch cut from a round-tripped branch after `setup`, later added to `config.branches`, only inherited the parent's `Setup` graft, so `pending_dest_commits` replayed the parent's own mirrored commits and hard-stopped on a phantom conflict, with no supported path since `setup` refuses a branch that already carries an inherited marker. The dest→source boundary is now the end of the longest contiguous prefix of dest's first-parent line, starting immediately after the existing `Setup`/`DestToSource` marker boundary (B1), for which every commit is proven **represented** in source's current tip: a commit is represented when either it is itself a valid `SourceToDest` marker whose own source counterpart is reachable from source's tip (case 1), or a self-verified `DestToSource` marker reachable from source's tip — regardless of that marker's own recorded branch — names that exact dest commit (case 2); a `SourceToDest` marker whose own counterpart isn't reachable can still be represented by case 2, so the two cases are not a partition by commit shape — only a dest-native or invalid/unauthenticated marker commit is restricted to case 2 alone, because it can never satisfy case 1 at all. The walk stops at the first unrepresented commit; the boundary is the commit before it, which may be B1 itself, a qualifying `SourceToDest` marker, or an accepted dest-native commit. Supersedes two insufficient predicates found during implementation, before either was committed: a bare ancestor check on each marker's own counterpart (blind to dest-native content skipped when a branch is mirror-aliased onto another branch's marker), and a blanket "any dest-native commit disqualifies" rule (cannot distinguish an imported dest-native commit from an unimported one, reintroducing CODE-001's own bug for any branch descended from a parent with import history). A 2026-09-03 addendum (CODE-001 step 5) extends this same represented-prefix predicate to source→dest's own push-safety gate, so a branch promoted into `config.branches` after being mirror-only can round-trip both directions in one run — plus three review-found corrections to that extension: two before either was committed (the safety check's "is there a branch-scoped marker anywhere on this line" half was replaced with "is the *newest* marker on the line branded for this branch", after a foreign-branded marker sitting above a stale branch-scoped one was shown to grant safety on the stale boundary; and B1's first-parent-reachability precondition was made a per-branch `Ok(false)` instead of a whole-run-aborting `Err` for a discovered branch), and one found by a second review, also before commit: that "newest marker" check was itself still wrongly bounded to the B1..dest_tip range rather than searched over dest's whole first-parent line, letting a newest mirror marker that a dest→source import had advanced B1 past go undetected and grant safety on a stale boundary — fixed by searching the whole line instead.
+description: Fixes CODE-001 (docs/2026-09-02_REPOSITORY_REVIEW.md, section 3) — a branch cut from a round-tripped branch after `setup`, later added to `config.branches`, only inherited the parent's `Setup` graft, so `pending_dest_commits` replayed the parent's own mirrored commits and hard-stopped on a phantom conflict, with no supported path since `setup` refuses a branch that already carries an inherited marker. The dest→source boundary is now the end of the longest contiguous prefix of dest's first-parent line, starting immediately after the existing `Setup`/`DestToSource` marker boundary (B1), for which every commit is proven **represented** in source's current tip: a commit is represented when either it is itself a valid `SourceToDest` marker whose own source counterpart is reachable from source's tip (case 1), or a self-verified `DestToSource` marker reachable from source's tip — regardless of that marker's own recorded branch — names that exact dest commit (case 2); a `SourceToDest` marker whose own counterpart isn't reachable can still be represented by case 2, so the two cases are not a partition by commit shape — only a dest-native or invalid/unauthenticated marker commit is restricted to case 2 alone, because it can never satisfy case 1 at all. The walk stops at the first unrepresented commit; the boundary is the commit before it, which may be B1 itself, a qualifying `SourceToDest` marker, or an accepted dest-native commit. Supersedes two insufficient predicates found during implementation, before either was committed: a bare ancestor check on each marker's own counterpart (blind to dest-native content skipped when a branch is mirror-aliased onto another branch's marker), and a blanket "any dest-native commit disqualifies" rule (cannot distinguish an imported dest-native commit from an unimported one, reintroducing CODE-001's own bug for any branch descended from a parent with import history). A 2026-09-03 addendum (CODE-001 step 5) extends this same represented-prefix predicate to source→dest's own push-safety gate, so a branch promoted into `config.branches` after being mirror-only can round-trip both directions in one run — plus three review-found corrections to that extension: two before either was committed (the safety check's "is there a branch-scoped marker anywhere on this line" half was replaced with "is the *newest* marker on the line branded for this branch", after a foreign-branded marker sitting above a stale branch-scoped one was shown to grant safety on the stale boundary; and B1's first-parent-reachability precondition was made a per-branch `Ok(false)` instead of a whole-run-aborting `Err` for a discovered branch), and one found by a second review, also before commit: that "newest marker" check was itself still wrongly bounded to the B1..dest_tip range rather than searched over dest's whole first-parent line, letting a newest mirror marker that a dest→source import had advanced B1 past go undetected and grant safety on a stale boundary — fixed by searching the whole line instead. A fourth correction, found by an external review after commit (2026-09-04): that gate ran only on the represented-prefix accounting path, so an ordinary same-branch import naming dest's tip bypassed it via `dest_tip_accounted_for`'s case 3 — fixed by applying the gate after either accounting path accepts dest's tip.
 tags: [architecture, branches, markers, dest-to-source]
 status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-09-03T00:00:00Z }
@@ -565,6 +565,38 @@ found condition 2's range itself wrong, with a verified one-line fix:
   in the function's own doc comment so a future direct caller doesn't
   assume otherwise.
 
+## Corrected by a third review, after commit
+
+An external review of the committed branch (2026-09-04) found that the
+newest-mirror-marker gate above was placed on only one of the two accounting
+paths, with a verified fix:
+
+* **CODE-001: the gate ran only when `dest_tip_accounted_for` had already
+  said no.** `dest_resume_point_for_branch` consulted
+  `dest_tip_represented_in_source` — and therefore the
+  `newest_source_to_dest_marker_branch_between` gate inside it — only as the
+  second half of an `||` after `dest_tip_is_accounted_for` returned false.
+  But `dest_tip_accounted_for`'s case 3 is satisfied by any ordinary
+  same-branch dest→source import naming `dest_tip` exactly — the most common
+  way into the shape the second-review fix guards against — and case 3 says
+  nothing about which mirror marker `newest_source_marker` will find beneath
+  `dest_tip`. The second review's regression test only exercised the gate
+  because it branded its second import "sibling" (the scenario-9 device),
+  forcing case 3 to fail. Reproduced by execution: the same fixture with n2
+  imported normally for `main` produced the identical phantom conflict on
+  `release.txt` the second review had fixed. Not a regression introduced by
+  this decision — the same bypass existed before the addendum — but the
+  addendum claimed to close exactly this symptom. Fixed by moving the gate
+  out of `dest_tip_represented_in_source` into its own function
+  (`newest_mirror_marker_belongs_to_branch`) that `dest_resume_point_for_branch`
+  applies after *either* accounting path accepts `dest_tip`. Case 1 passes
+  it trivially (`dest_tip` is itself the newest marker, branded for the
+  branch); case 2 passes when nothing was ever mirrored below the graft; the
+  represented-prefix path is unchanged in effect. `mirror_only_rewrite_detected`
+  stays fail-safe on the new refusal: in this shape the stale branch-scoped
+  boundary is still an ancestor of source's tip, so no rewrite is detected
+  and the outcome is the ordinary per-branch halt.
+
 ## Consequences
 
 * `gitprism resolve`'s source→dest path, which calls
@@ -582,6 +614,9 @@ found condition 2's range itself wrong, with a verified one-line fix:
   (`sync_pair_to_dest_refuses_when_a_foreign_branded_marker_sits_above_a_stale_branch_scoped_one`);
   a regression test for the whole-run-abort bug
   (`dest_resume_point_returns_none_instead_of_erroring_when_b1_is_off_the_first_parent_line`);
-  and, added by a second review before commit, a regression test for
-  CODE-001's range bug
-  (`sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_foreign_mirror_beneath_it`).
+  added by a second review before commit, a regression test for CODE-001's
+  range bug
+  (`sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_foreign_mirror_beneath_it`);
+  and, added by a third review after commit, a regression test for the
+  gate's placement
+  (`sync_pair_to_dest_refuses_a_foreign_mirror_beneath_a_tip_accounted_for_by_an_ordinary_import`).

@@ -141,46 +141,17 @@ fn dest_tip_accounted_for(
 /// *is* `dest_tip`, meaning every commit between B1 and `dest_tip` was
 /// individually proven represented in `source_tip`.
 ///
-/// Representation alone is not enough, though — granting it must not outrun
-/// what [`dest_resume_point_for_branch`]'s other half, [`newest_source_marker`],
-/// can actually resume from. That scan is branch-scoped by design
-/// ([`marker::verify`] against `branch` exactly, no `verify_self` exemption
-/// for `SourceToDest`, unlike this decision's case 1/case 2), so a dest ref
-/// parked entirely on a *sibling* branch's own mirror chain (e.g. dest
-/// `hotfix` cut from dest `main` at `main`'s own mirror commit, with no
-/// mirror of `hotfix` itself yet) can be fully represented by this walk —
-/// case 1 doesn't care whose marker it is — while carrying no
-/// `hotfix`-branded marker anywhere on its own line at all.
-/// `newest_source_marker` would then find nothing and fall back to the
-/// graft, replaying `main`'s own already-mirrored source content onto
-/// `hotfix`'s dest tip as if it were new — a same-line conflict, or silent
-/// duplication for non-conflicting content.
-///
-/// The check this needs is not "does `newest_source_marker` find
-/// *something* branded for `branch`, or does the line carry no
-/// `SourceToDest` marker at all" — that either/or is unsafe:
-/// `newest_source_marker` stops at the first branch-scoped match it finds
-/// walking down from `dest_tip`, so a *foreign*-branded marker sitting
-/// *above* it (itself represented via case 1/case 2) would grant safety on a
-/// stale, older boundary. See decisions/0048's addendum ("Corrected by a
-/// second review") for the failure case and repro. The correct question is
-/// asked in one walk instead, [`newest_source_to_dest_marker_branch_between`]:
-/// whichever self-verified `SourceToDest` marker is *newest* anywhere on the
-/// **whole** of dest's first-parent line — regardless of whose own
-/// branch-scoped scan would or wouldn't find it, and regardless of where B1
-/// itself sits on that line — must be branded for `branch` itself, or there
-/// must be no such marker at all on the line (genuinely nothing has ever
-/// been mirrored onto this line, so `newest_source_marker`'s own `None` and
-/// its graft fallback are correct, not a blind spot). That walk is
-/// deliberately unbounded by B1, not just by `dest_tip` down to it: B1 is
-/// advanced by dest→source imports, which never consult this safety gate,
-/// so the newest mirror marker on the line can legitimately sit below B1
-/// once an import has moved past it (see that function's own doc comment).
-/// A `dest_tip` represented only via a foreign-branded marker — above or
-/// below B1 — still refuses today's way, and the operator's existing
-/// recovery (delete the stray dest ref; the `!dest_ref_exists` arm then
-/// re-anchors it via decisions/0046 and `branch_scoped_dest_tip` writes it a
-/// marker of its own) stands.
+/// Representation alone is not enough, though — a dest ref parked entirely
+/// on a *sibling* branch's own mirror chain (e.g. dest `hotfix` cut from
+/// dest `main` at `main`'s own mirror commit, with no mirror of `hotfix`
+/// itself yet) can be fully represented by this walk — case 1 doesn't care
+/// whose marker it is — while carrying no `hotfix`-branded marker anywhere
+/// on its own line at all. That second half of the safety question is
+/// [`newest_mirror_marker_belongs_to_branch`], applied by
+/// [`dest_resume_point_for_branch`] after *either* accounting path accepts
+/// `dest_tip` — not here, since [`dest_tip_accounted_for`]'s own case 3
+/// reaches the same shape without ever calling this function (decisions/0048
+/// addendum, "Corrected by a third review").
 ///
 /// The walk's own B1-ancestor precondition is checked directly here first,
 /// rather than by catching [`dest_to_source_boundary`]'s `Err`: a `dest_tip`
@@ -233,10 +204,57 @@ fn dest_tip_represented_in_source(
     }
 
     let boundary = dest_to_source_boundary(repo, source_tip, dest_tip, branch, key)?;
-    if boundary != dest_tip {
-        return Ok(false);
-    }
+    Ok(boundary == dest_tip)
+}
 
+/// Whether [`newest_source_marker`] can be trusted to find the *right*
+/// boundary on dest's line for `branch` — the second half of
+/// [`dest_resume_point_for_branch`]'s safety question, applied after
+/// *either* accounting path ([`dest_tip_accounted_for`] or
+/// [`dest_tip_represented_in_source`]) has accepted `dest_tip`.
+///
+/// Representation alone is not enough: granting it must not outrun what
+/// [`newest_source_marker`] can actually resume from. That scan is
+/// branch-scoped by design ([`marker::verify`] against `branch` exactly, no
+/// `verify_self` exemption for `SourceToDest`, unlike decisions/0048's
+/// case 1/case 2), and it stops at the first branch-scoped match walking
+/// down from `dest_tip`. A *foreign*-branded mirror marker sitting *above*
+/// that match — a customer's fast-forward of dest `main` onto dest
+/// `release`'s own mirror, say — is walked straight past, and the scan
+/// resumes from a stale, older boundary, replaying already-mirrored content
+/// as a phantom conflict. See decisions/0048's addendum ("Corrected by a
+/// second review" and "Corrected by a third review") for the failure cases
+/// and repros.
+///
+/// The check is therefore asked in one walk,
+/// [`newest_source_to_dest_marker_branch_between`]: whichever self-verified
+/// `SourceToDest` marker is *newest* anywhere on the **whole** of dest's
+/// first-parent line must be branded for `branch` itself, or there must be
+/// no such marker at all on the line (genuinely nothing has ever been
+/// mirrored onto it, so `newest_source_marker`'s own `None` and its graft
+/// fallback are correct, not a blind spot). That walk is deliberately
+/// unbounded by B1: B1 is advanced by dest→source imports, which never
+/// consult this gate, so the newest mirror marker can legitimately sit
+/// below it.
+///
+/// This applies to every accounting path, not only the represented-prefix
+/// one. [`dest_tip_accounted_for`]'s case 3 is satisfied by any ordinary
+/// same-branch import naming `dest_tip` — the most common way into exactly
+/// this shape — and case 3 says nothing about which mirror marker
+/// `newest_source_marker` will find beneath. Case 1 passes trivially
+/// (`dest_tip` is itself the newest marker and is branded for `branch`);
+/// case 2 passes when nothing was ever mirrored below the graft. A
+/// `dest_tip` sitting on a foreign-branded newest marker refuses today's
+/// way regardless of how it was accounted for, and the operator's existing
+/// recovery (delete the stray dest ref; the `!dest_ref_exists` arm then
+/// re-anchors it via decisions/0046 and `branch_scoped_dest_tip` writes it
+/// a marker of its own) stands.
+fn newest_mirror_marker_belongs_to_branch(
+    repo: &Repository,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<bool> {
     Ok(
         match newest_source_to_dest_marker_branch_between(repo, dest_tip, key)? {
             None => true,
@@ -253,9 +271,7 @@ fn dest_tip_represented_in_source(
 /// comment for why an `Err` here is unsafe for a discovered branch.
 /// [`newest_source_to_dest_marker_branch_between`] doesn't share this
 /// precondition (it walks the whole of dest's first-parent line
-/// unconditionally, with no B1 of its own to miss), but this still runs
-/// ahead of it too, since both walks are called from the same place in
-/// sequence and the precondition is cheap. Bounded by
+/// unconditionally, with no B1 of its own to miss). Bounded by
 /// [`limits::MAX_MARKER_SCAN_COMMITS`] the same way every other scan in this
 /// module is (decisions/0032); exceeding it is still a genuine hard error,
 /// not converted to `false` — in practice the one whole-run-abort path
@@ -290,17 +306,17 @@ fn b1_reachable_via_first_parent(repo: &Repository, dest_tip: Oid, b1: Oid) -> R
 /// anywhere on the **whole** of dest's first-parent line from `dest_tip`
 /// (bounded only by [`limits::MAX_MARKER_SCAN_COMMITS`], the same static
 /// limit every other marker scan in this module uses — decisions/0032),
-/// regardless of that marker's own recorded branch —
-/// [`dest_tip_represented_in_source`]'s replacement for the unsafe either/or
-/// its doc comment describes. Walking newest-first from `dest_tip` means the
+/// regardless of that marker's own recorded branch — the walk behind
+/// [`newest_mirror_marker_belongs_to_branch`], replacing the unsafe
+/// either/or its doc comment describes. Walking newest-first from `dest_tip` means the
 /// first self-verified marker this finds *is* the newest one, so no separate
 /// "which one is newest" comparison is needed. `Ok(None)` means nothing has
 /// ever been mirrored onto this line at all — `newest_source_marker`'s own
 /// `None`/graft-fallback case is genuinely safe, not a blind spot.
 ///
 /// Deliberately **not** bounded to B1 (contrast [`dest_to_source_boundary`],
-/// which is): see [`dest_tip_represented_in_source`]'s own doc comment for
-/// why a B1-bounded version of this exact walk is unsafe — B1 is advanced by
+/// which is): see [`newest_mirror_marker_belongs_to_branch`]'s own doc comment
+/// for why a B1-bounded version of this exact walk is unsafe — B1 is advanced by
 /// dest→source imports this check never consults, so the newest mirror
 /// marker on the line can legitimately sit below it. Walking
 /// the whole line instead makes this exactly the range
@@ -359,7 +375,10 @@ pub(super) fn dest_tip_is_accounted_for(
 ///   that carries no marker of its own at all but is nonetheless the end of
 ///   B1's own represented-prefix walk, the shape a dest→source pass leaves
 ///   behind when it found `dest_tip` already represented and so wrote
-///   nothing new to source for it.
+///   nothing new to source for it. Then, whichever of the two accepted it,
+///   [`newest_mirror_marker_belongs_to_branch`]: the boundary scan below is
+///   branch-scoped, so it is only trustworthy when the newest mirror marker
+///   on dest's line is this branch's own (or there is none).
 /// * **Boundary** — which source commits does dest already have? A real scan
 ///   of dest's own history for the newest `Gitprism-Source-Commit` trailer
 ///   ([`newest_source_marker`]) — *not* the graft point. The graft point is
@@ -388,6 +407,9 @@ pub(crate) fn dest_resume_point_for_branch(
     if !dest_tip_is_accounted_for(repo, source_tip, dest_tip, branch, key)?
         && !dest_tip_represented_in_source(repo, source_tip, dest_tip, branch, key)?
     {
+        return Ok(None);
+    }
+    if !newest_mirror_marker_belongs_to_branch(repo, dest_tip, branch, key)? {
         return Ok(None);
     }
 

@@ -1349,6 +1349,155 @@ fn sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_forei
 }
 
 #[test]
+fn sync_pair_to_dest_refuses_a_foreign_mirror_beneath_a_tip_accounted_for_by_an_ordinary_import() {
+    // CODE-001 (found by a third, external review, after the fix above was
+    // committed): the newest-mirror-marker safety gate only ran inside
+    // `dest_tip_represented_in_source`, which `dest_resume_point_for_branch`
+    // consults only when `dest_tip_accounted_for` has already said no. The
+    // test above only reaches that path because it brands n2's import
+    // "sibling". Import n2 *normally* for "main" instead — the most common
+    // way into this shape — and `dest_tip_accounted_for`'s case 3 (source's
+    // newest DestToSource marker names dest_tip exactly) accepts dest_tip
+    // before the gate is ever consulted. `newest_source_marker` then walks
+    // past M2 (branded "release") to the stale M1 and replays s2's
+    // already-mirrored release.txt as a phantom conflict. The gate must run
+    // after *either* accounting path accepts dest_tip.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let d0 = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1\n")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", d0, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+
+    let s1 = add_commit_with_message(&source_repo, "main", &[("main.txt", "v1\n")], "s1");
+
+    let config_main_only = Config::load(
+        write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let mut main_run_cache = RunCache::default();
+    sync_pair_to_dest(
+        &repo,
+        source_dir.path(),
+        &config_main_only,
+        "main",
+        &reporter,
+        &mut main_run_cache,
+    )
+    .expect("main must mirror s1 to dest first");
+
+    source_repo
+        .branch("release", &source_repo.find_commit(s1).unwrap(), false)
+        .unwrap();
+    let s2 = add_commit_with_message(&source_repo, "release", &[("release.txt", "v1\n")], "s2");
+
+    let config_both = Config::load(
+        write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main", "release"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let mut release_run_cache = RunCache::default();
+    sync_pair_to_dest(
+        &repo,
+        source_dir.path(),
+        &config_both,
+        "release",
+        &reporter,
+        &mut release_run_cache,
+    )
+    .expect("release must mirror s2, anchored on main's own D(s1) mapping");
+
+    let dest_release_tip = dest_repo
+        .find_branch("release", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // Customer fast-forwards dest main onto dest release's tip.
+    dest_repo
+        .reference(
+            "refs/heads/main",
+            dest_release_tip,
+            true,
+            "customer fast-forward: main onto release",
+        )
+        .unwrap();
+
+    // Source main is also advanced to s2.
+    source_repo
+        .reference(
+            "refs/heads/main",
+            s2,
+            true,
+            "main catches up with release's content",
+        )
+        .unwrap();
+    refresh_checked_out_branch(&source_repo, "main");
+
+    // Two dest-native commits on dest main, both imported normally for
+    // "main" — the second import's marker names n2 exactly, so
+    // `dest_tip_accounted_for`'s case 3 accepts dest_tip on its own.
+    let n1 = add_independent_dest_commit_on(
+        &dest_repo,
+        "main",
+        dest_release_tip,
+        ("release.txt", "v2\n"),
+        "customer edits already-mirrored release.txt",
+    );
+    sync_pair_from_dest(&repo, source_dir.path(), &config_both, "main", &reporter)
+        .expect("n1 must import cleanly");
+    add_independent_dest_commit_on(
+        &dest_repo,
+        "main",
+        n1,
+        ("other.txt", "other\n"),
+        "a second dest-native commit",
+    );
+    sync_pair_from_dest(&repo, source_dir.path(), &config_both, "main", &reporter)
+        .expect("n2 must import cleanly");
+
+    let mut final_run_cache = RunCache::default();
+    let error = sync_pair_to_dest(
+        &repo,
+        source_dir.path(),
+        &config_both,
+        "main",
+        &reporter,
+        &mut final_run_cache,
+    )
+    .expect_err(
+        "a dest_tip accounted for by an ordinary same-branch import, sitting above a \
+         foreign-branded mirror marker, must still refuse — not replay already-mirrored content",
+    );
+    assert!(
+        format!("{error:#}").contains("isn't at a point this clone can safely build on"),
+        "expected today's clean safety refusal, not a phantom conflict from the stale \
+         branch-scoped boundary: {error:#}"
+    );
+}
+
+#[test]
 fn dest_main_fast_forwarded_to_a_mirrored_release_branch_only_reflects_content_since_its_own_mirror()
  {
     // Scenario 3: dest main gets fast-forwarded onto dest release's own

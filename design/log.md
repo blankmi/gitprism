@@ -3004,3 +3004,40 @@ Full suite: 369 passed (unchanged from the previous entry — this step is
 doc-only); `cargo fmt --all -- --check` and `cargo clippy --workspace
 --all-targets --all-features -- -D warnings` clean; `cargo build --release
 --locked` succeeds.
+
+## 2026-09-04 — external review of the committed branch: the safety gate was on only one accounting path
+
+An external review of the committed ARCH-001/CODE-001 branch found that the
+newest-mirror-marker gate the two 2026-09-03 reviews above added and then
+widened (`anchor::newest_source_to_dest_marker_branch_between`) ran only
+inside `dest_tip_represented_in_source`, which
+`dest_resume_point_for_branch` consults solely when
+`dest_tip_is_accounted_for` has already returned false.
+
+**CODE-001:** `dest_tip_accounted_for`'s case 3 — source's newest
+`DestToSource` marker names `dest_tip` exactly — is satisfied by any ordinary
+same-branch import, the most common way into the shape the gate guards. It
+short-circuits the `||` before the gate is reached, and
+[`newest_source_marker`](../src/commands/sync/marker_scan.rs) then walks past
+the foreign-branded mirror to the stale branch-scoped one beneath it.
+Reproduced by execution: the previous entry's fixture with n2 imported
+*normally* for `main` (instead of via the "sibling"-branded scenario-9
+device, which is the only reason that test ever reached the gate) produced
+the identical phantom conflict on `release.txt`. Not a regression introduced
+by this branch — the same bypass existed before the 0048 addendum — but the
+addendum claimed to close exactly this symptom.
+
+Fixed by moving the gate into its own function
+(`anchor::newest_mirror_marker_belongs_to_branch`) that
+`dest_resume_point_for_branch` applies after *either* accounting path accepts
+`dest_tip`; `dest_tip_represented_in_source` now answers only the
+represented-prefix question. Doc comments in `anchor.rs` and
+[decisions/0048](decisions/0048-dest-to-source-resumes-from-the-newest-authenticated-boundary-on-either-side.md)
+(new "Corrected by a third review, after commit" section) updated to match.
+Regression test:
+`sync_pair_to_dest_refuses_a_foreign_mirror_beneath_a_tip_accounted_for_by_an_ordinary_import`
+(`tests::dest_to_source`), confirmed to fail before the fix and pass after.
+
+Full suite: 370 passed (369 plus the new regression test); `cargo fmt --all
+-- --check` and `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo build --release --locked` succeeds.
