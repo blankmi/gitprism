@@ -718,3 +718,105 @@ of the design.
   unchanged after collapsing to `verify_self`; and the test wrapper
   propagates a reconstruction failure rather than reusing a previous
   branch's index.
+
+# Addendum 3 (2026-09-04): three implementation rules recorded
+
+## Context
+
+A repository review found three behaviours of this decision's implementation
+cited in code only as `decisions/0046, F-A`, `F-B`, and `F-C`, with no
+matching entry anywhere in `design/`. This decision's own addenda already
+number their findings A–P, so "F-A" reads as "Finding A" — a different,
+unrelated rule (Addendum 1's parse-once change). AGENTS.md makes
+`design/decisions/` the source of truth; these three behaviours existed only
+in comments. This addendum gives them their own names, continuing the
+addenda's letter sequence, and the citing code comments are updated
+(`decisions/0046 Addendum 3, Finding Q` / `Finding R` / `Finding S`) to match.
+No behaviour changes; this is documentation of what the implementation
+already does.
+
+## Decision
+
+**Finding Q — provenance survives source-branch deletion.**
+Reconstruction lists dest's branches directly (`git::remote_branch_names`)
+rather than only the branches source still has, so a mirror-only branch's
+dest ref keeps contributing its `SourceToDest` mappings after its local
+source branch is deleted (decisions/0018 Case 2's routine post-merge
+cleanup removes the source branch, not the dest ref). Verification of a
+marker inherited this way is against the marker's own recorded branch
+(`marker::verify_self`), never against the branch whose history is
+currently being scanned: once the owning branch is gone from source, a
+descendant's own first-parent scan is the only remaining path to that
+marker, and the HMAC already authenticates the branch recorded inside it
+regardless of which head is doing the scanning. Without this, a deleted
+mirror-only branch's dest content would stop being reachable through the
+mapping index at all, and a sibling forked from it would fall back to a
+coarser graft and duplicate that content.
+Tests: `mapping_index_self_verifies_a_source_marker_against_its_own_recorded_branch`
+and `invalidate_replaced_chain_drops_only_the_named_branchs_unreachable_mappings`
+(`src/commands/sync/mapping_index.rs:1576` and `:1373`); end-to-end in
+`run_keeps_a_surviving_childs_dest_native_content_after_its_parent_branch_is_deleted`
+and `run_anchors_a_sibling_on_a_deleted_mirror_only_branchs_own_dest_ref`
+(`src/commands/sync/tests/anchor.rs`).
+
+**Finding R — a mapping whose canonical dest object is absent locally is a
+per-branch refusal.** Existence of a mapping's canonical dest commit is
+checked with `Repository::find_commit` before any `graph_descendant_of`
+comparison runs against it, both when resolving an anchor and when
+canonicalizing among several mappings for the same exact source commit. A
+missing canonical destination halts that one branch (`MappingLookup::
+Contradictory`); the walk does not continue past it to an older mapping.
+Walking past it would be unsafe: an older mapping can omit dest-native
+content a `DestToSource` marker on the missing commit represents, and
+replay would then silently loop-prevent something that was never actually
+carried forward. This is already partially described in Addendum 1's last
+paragraph (missing canonical destinations halt rather than being walked
+past).
+Tests: `nearest_mapping_halts_on_a_source_commit_whose_only_mapped_dest_is_missing_locally`
+and `nearest_mapping_refuses_rather_than_erroring_when_one_of_several_mappings_is_missing_locally`
+(`src/commands/sync/mapping_index.rs:1647` and `:1676`).
+
+**Finding S — self-exclusion during canonicalization for `exclude_branch`'s
+own rebuild.** When `resolve_for_anchor` is resolving an anchor for
+`exclude_branch`'s own rewrite, a destination whose only provenance is
+`exclude_branch` itself is dropped from canonicalization whenever any other
+provenance exists for the same exact source commit — that branch's own
+chain is exactly what the rewrite is discarding, so it is never a valid
+anchor for its own rebuild. If every mapped destination for that source
+commit is `exclude_branch`'s own, there is nothing to prefer instead: it is
+untouched ancestor content (for example an earlier, still-valid part of the
+branch's own chain that an amend never reached), not part of the chain being
+discarded, and it is kept as a normal, usable mapping. Separately,
+`record_built_mapping` records a `(source, dest)` pair `build_dest_commit`
+just authored for `branch` this run without re-reading the commit or
+re-verifying its marker: the caller already knows the exact tuple by
+construction, having just built it.
+
+CODE-004 records this rule's trade-off: when the nearest mapped ancestor has
+both the branch's own projection and a sibling's, the own projection is
+dropped even when it is comparable (an ancestor or descendant of the
+sibling's), so a force-rebuild may rewind dest further than the amend that
+triggered it required. This is safe under decisions/0038 (a mirror-only
+rebuild is a force-with-lease) and is accepted for now; CODE-004's plan
+(`docs/plans/2026-09-02/CODE-004-exclude-branch-own-anchor.md`) holds the
+alternative of keeping the own projection when it is the common ancestor.
+Tests: `resolve_for_anchor_excludes_the_current_branchs_own_sole_projection_of_a_shared_ancestor`
+and `resolve_for_anchor_keeps_the_current_branchs_own_mapping_when_no_alternative_exists`
+(`src/commands/sync/mapping_index.rs:1705` and `:1784`).
+
+## Why
+
+These three rules were already load-bearing implementation behaviour with
+regression tests pinning them; only their record in `design/` was missing.
+Naming them here, rather than leaving them as bare code citations to a
+decision file that didn't define them, keeps `design/decisions/` the actual
+source of truth AGENTS.md requires, and removes the collision with this
+decision's own Addendum 1/2 finding letters.
+
+## Consequences
+
+* No behaviour change. Every citing code comment is updated from
+  `decisions/0046, F-A`/`F-B`/`F-C` to `decisions/0046 Addendum 3, Finding
+  Q`/`Finding R`/`Finding S`.
+* `design/decisions/index.md`'s entry for this decision notes that Addendum 3
+  records Findings Q–S.
