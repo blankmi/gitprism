@@ -658,7 +658,7 @@ pub(super) fn reconstruct_mapping_index(
             Ok((branch.clone(), tip))
         })
         .collect::<Result<Vec<_>>>()?;
-    // decisions/0046, F-A: a mirror-only branch's dest ref must still
+    // decisions/0046 Addendum 3, Finding Q: a mirror-only branch's dest ref must still
     // contribute its own SourceToDest mappings once its local source branch
     // is deleted (decisions/0018 Case 2's routine post-merge cleanup) —
     // `source_branches` can no longer name it, so dest's actual branches are
@@ -722,7 +722,7 @@ pub(super) fn reconstruct_mapping_index(
     Ok(index)
 }
 
-/// `branch` is excluded from canonicalization (decisions/0046, F-C):
+/// `branch` is excluded from canonicalization (decisions/0046 Addendum 3, Finding S):
 /// `branch`'s own rewrite is what's being anchored here, so a mapping whose
 /// only provenance is `branch` itself is that branch's own now-discarded
 /// chain, never a valid anchor for its own rebuild — matching main's old

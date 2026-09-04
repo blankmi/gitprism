@@ -843,7 +843,7 @@ fn sync_pair_to_dest_with_key(
                     // The destination ref is visible to later branch anchor
                     // lookups this run, with no re-query.
                     run_cache.dest_ref_exists.insert(branch.to_string(), true);
-                    // decisions/0046, F-A: a `ForceMirrorOnly` push just
+                    // decisions/0046 Addendum 3, Finding Q: a `ForceMirrorOnly` push just
                     // replaced `branch`'s own dest chain wholesale — any
                     // mapping this run recorded from that replaced chain
                     // whose dest commit didn't survive into `new_dest_tip`'s
@@ -864,7 +864,7 @@ fn sync_pair_to_dest_with_key(
                                 .expect("force rebuild always planned invalidation"),
                         );
                     }
-                    // F-C: `build_dest_commit` already returned the exact
+                    // Finding S: `build_dest_commit` already returned the exact
                     // (source, dest) pair for each of these — recorded
                     // straight into the index, with no re-read or
                     // re-HMAC-verify of a commit this very call just
@@ -1022,7 +1022,7 @@ pub(crate) struct PendingDestBuild {
     /// `(source oid, dest oid)` for every commit actually built this call —
     /// `build_dest_commit`'s own trusted output, recorded into the mapping
     /// index directly on push acceptance rather than re-read and
-    /// re-verified from the repo (decisions/0046, F-C).
+    /// re-verified from the repo (decisions/0046 Addendum 3, Finding S).
     generated_mappings: Vec<(Oid, Oid)>,
     pub(crate) conflict: Option<Conflict>,
 }

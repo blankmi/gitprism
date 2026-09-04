@@ -724,10 +724,11 @@ of the design.
 ## Context
 
 A repository review found three behaviours of this decision's implementation
-cited in code only as `decisions/0046, F-A`, `F-B`, and `F-C`, with no
-matching entry anywhere in `design/`. This decision's own addenda already
-number their findings A–P, so "F-A" reads as "Finding A" — a different,
-unrelated rule (Addendum 1's parse-once change). AGENTS.md makes
+cited in code only by a three-letter shorthand of the form "F", hyphen,
+a letter (A, B, or C), with no matching entry anywhere in `design/`. This
+decision's own addenda already number their findings A–P, so that shorthand
+reads as "Finding A" and so on — different, unrelated rules (e.g. Addendum
+1's parse-once change is its actual Finding A). AGENTS.md makes
 `design/decisions/` the source of truth; these three behaviours existed only
 in comments. This addendum gives them their own names, continuing the
 addenda's letter sequence, and the citing code comments are updated
@@ -815,8 +816,8 @@ decision's own Addendum 1/2 finding letters.
 
 ## Consequences
 
-* No behaviour change. Every citing code comment is updated from
-  `decisions/0046, F-A`/`F-B`/`F-C` to `decisions/0046 Addendum 3, Finding
-  Q`/`Finding R`/`Finding S`.
+* No behaviour change. Every citing code comment is updated from the old
+  three-letter shorthand (Context, above) to `decisions/0046 Addendum 3,
+  Finding Q`/`Finding R`/`Finding S`.
 * `design/decisions/index.md`'s entry for this decision notes that Addendum 3
   records Findings Q–S.

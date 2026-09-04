@@ -212,7 +212,7 @@ impl MappingIndex {
                 .push(record.clone());
         }
 
-        // decisions/0046, F-C: a destination whose only provenance is the
+        // decisions/0046 Addendum 3, Finding S: a destination whose only provenance is the
         // branch currently being resolved is preferred against in favor of
         // a comparable/incomparable alternative some OTHER branch already
         // projected for the identical source commit — that alternative is
@@ -237,7 +237,7 @@ impl MappingIndex {
         let mut destinations: Vec<Oid> = by_dest.keys().copied().collect();
         destinations.sort_by_key(ToString::to_string);
 
-        // F-B: a mapped dest commit this clone never fetched (its dest ref
+        // Finding R: a mapped dest commit this clone never fetched (its dest ref
         // deleted after merge, or discarded by a force rewind) can't be
         // built on, and `graph_descendant_of` has no clean "not found" of
         // its own to compare it against another destination — checked here,
@@ -339,7 +339,7 @@ impl MappingIndex {
         }))
     }
 
-    /// `exclude_branch` (decisions/0046, F-C) is the branch whose own
+    /// `exclude_branch` (decisions/0046 Addendum 3, Finding S) is the branch whose own
     /// rewrite this anchor is being resolved for: mappings whose only
     /// provenance is that branch itself are excluded from canonicalization,
     /// since that branch's own chain is exactly what the rewrite discards.
@@ -407,7 +407,7 @@ impl MappingIndex {
 
     /// `branch` names the head whose history is being scanned — used only
     /// for diagnostics. Verification is against the marker's own recorded
-    /// branch (decisions/0046, F-A), the same self-verification
+    /// branch (decisions/0046 Addendum 3, Finding Q), the same self-verification
     /// [`super::loop_prevented`] already applies: once a marker's owning
     /// branch is deleted from source, a descendant's own first-parent scan
     /// is the only remaining path to it, and the HMAC already authenticates
@@ -587,7 +587,7 @@ impl MappingIndex {
     /// `branch`'s own prior chain — so anything that chain contributed to
     /// this run's index that is no longer an ancestor of (or equal to)
     /// `new_dest_tip` is now a mapping to a dest commit orphaned by that
-    /// rebuild (decisions/0046, F-A). Only records provenanced to `branch`
+    /// rebuild (decisions/0046 Addendum 3, Finding Q). Only records provenanced to `branch`
     /// itself are ever considered: a source commit also mapped through some
     /// other branch's own markers keeps that mapping regardless of what just
     /// happened to `branch`'s chain.
@@ -686,7 +686,7 @@ impl MappingIndex {
     }
 
     /// Records a `(source, dest)` mapping this run's own `build_dest_commit`
-    /// just authored for `branch` — trusted by construction (F-C), so unlike
+    /// just authored for `branch` — trusted by construction (Finding S), so unlike
     /// [`add_dest_commit`](Self::add_dest_commit) this never reads `dest`
     /// back out of a repository or re-verifies its marker: the caller
     /// already knows the exact tuple because it just built the commit. A
@@ -1153,11 +1153,11 @@ mod tests {
 
     #[test]
     fn record_built_mapping_adds_an_exact_mapping_without_reading_the_repo() {
-        // F-C: `build_dest_commit` already knows the exact (source, dest,
+        // Finding S: `build_dest_commit` already knows the exact (source, dest,
         // branch) tuple for a commit it just authored — recording it must
         // not need to look the commit back up or re-verify its marker, so
         // `source` here doesn't correspond to any real object in `repo`'s
-        // odb at all. `dest` must be a real, locally present commit: F-B's
+        // odb at all. `dest` must be a real, locally present commit: Finding R's
         // existence check in `resolve` (a different method, exercised below
         // to prove the mapping was recorded, not by `record_built_mapping`
         // itself) would otherwise correctly treat an ordinary orphaned
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn invalidate_replaced_chain_drops_only_the_named_branchs_unreachable_mappings() {
-        // Mirrors F-A: "feature" mapped S1 -> D1 and S2 -> D2. A
+        // Mirrors Finding Q: "feature" mapped S1 -> D1 and S2 -> D2. A
         // ForceMirrorOnly rebuild replaces feature's chain with D1 -> D3,
         // orphaning D2. "sibling" separately mapped that same S2 to its own
         // D2' — a mapping that must survive since it isn't feature's.
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn mapping_index_self_verifies_a_source_marker_against_its_own_recorded_branch() {
-        // F-A: once "feature" itself is deleted from source, "task"'s own
+        // Finding Q: once "feature" itself is deleted from source, "task"'s own
         // scan is the only remaining path to a DestToSource marker branded
         // "feature" that task inherited as an ordinary ancestor commit —
         // self-verification must accept it even though the scanning head
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[test]
     fn nearest_mapping_halts_on_a_source_commit_whose_only_mapped_dest_is_missing_locally() {
-        // F-B: a verified marker naming a dest commit this clone never
+        // Finding R: a verified marker naming a dest commit this clone never
         // fetched (its dest ref deleted after merge, or discarded by a
         // force rewind) is as unusable for anchoring as no mapping at
         // all — the walk must halt rather than continue to an older mapping
@@ -1673,7 +1673,7 @@ mod tests {
     #[test]
     fn nearest_mapping_refuses_rather_than_erroring_when_one_of_several_mappings_is_missing_locally()
      {
-        // F-B: canonicalizing among several mappings for the same exact
+        // Finding R: canonicalizing among several mappings for the same exact
         // source commit compares their dest oids by ancestry —
         // `graph_descendant_of` has no clean answer for an oid this clone
         // never fetched, so whether the missing one would have dominated
@@ -1702,7 +1702,7 @@ mod tests {
 
     #[test]
     fn resolve_for_anchor_excludes_the_current_branchs_own_sole_projection_of_a_shared_ancestor() {
-        // F-C: legacy wrong-order state a pre-decisions/0046 run could
+        // Finding S: legacy wrong-order state a pre-decisions/0046 run could
         // produce: task's own now-discarded chain projected F as D_task_F
         // while feature's separate chain projects the identical F as
         // D_feat_F — parallel, incomparable canonical dests for the same
@@ -1781,7 +1781,7 @@ mod tests {
 
     #[test]
     fn resolve_for_anchor_keeps_the_current_branchs_own_mapping_when_no_alternative_exists() {
-        // F-C: self-exclusion only prefers a comparable/incomparable
+        // Finding S: self-exclusion only prefers a comparable/incomparable
         // alternative some OTHER branch already projected for the identical
         // source commit. When nothing else maps it at all, the branch's own
         // mapping is untouched ancestor content an amend or rebase didn't

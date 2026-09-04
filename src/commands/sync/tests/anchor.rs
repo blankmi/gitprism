@@ -2485,7 +2485,7 @@ fn run_schedules_a_new_parent_before_a_lexically_earlier_new_child() {
 
 #[test]
 fn run_does_not_resurrect_an_orphaned_dest_commit_after_a_same_run_amend() {
-    // F-A's confirmed failure: mirror-only "feature" already has a two-commit
+    // Finding Q's confirmed failure: mirror-only "feature" already has a two-commit
     // dest chain D1(S1), D2(S2). In the same run, "feature" gets amended
     // (S2 -> S2') and a new "task" branch — forked from the pre-amend S2 —
     // appears for the first time. Distance scheduling processes "feature"
@@ -2823,7 +2823,7 @@ fn run_anchors_a_round_tripped_feature_rebase_on_its_exact_mapping_instead_of_ha
 
 #[test]
 fn run_keeps_a_surviving_childs_dest_native_content_after_its_parent_branch_is_deleted() {
-    // F-A: "feature" (round-tripped) imports dest-native X as a
+    // Finding Q: "feature" (round-tripped) imports dest-native X as a
     // DestToSource marker M branded "feature". "task" forks from feature's
     // tip after that import, inheriting M as an ordinary ancestor. Feature
     // is then merged and cleaned up — its local source branch deleted and
@@ -2935,7 +2935,7 @@ fn run_keeps_a_surviving_childs_dest_native_content_after_its_parent_branch_is_d
 
 #[test]
 fn run_anchors_a_sibling_on_a_deleted_mirror_only_branchs_own_dest_ref() {
-    // F-A, second half: "feature" (mirror-only, never round-tripped) mirrors
+    // Finding Q, second half: "feature" (mirror-only, never round-tripped) mirrors
     // its own commit F1 to dest as D_F1, branded "feature" via a
     // SourceToDest marker. "other" forks from F1 and gains a commit of its
     // own. Feature's local source branch is then deleted — routine
@@ -3109,7 +3109,7 @@ fn run_halts_instead_of_losing_content_when_a_missing_mapping_would_be_loop_prev
 
 #[test]
 fn mapping_distance_for_branch_does_not_abort_scheduling_when_a_mapping_is_missing_locally() {
-    // F-B: `run`'s own scheduling loop calls this once per remaining
+    // Finding R: `run`'s own scheduling loop calls this once per remaining
     // branch every iteration via a bare `?` — a raw `graph_descendant_of`
     // error on a dest object this clone never fetched previously
     // propagated straight through that `?`, aborting the whole run instead
