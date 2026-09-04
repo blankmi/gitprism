@@ -110,6 +110,12 @@ to be inferred.
   exactly once per run and used for the rest of that run, only earlier in
   the run now (right after the listing, rather than immediately before each
   branch's own dest→source turn).
+* `sync_pair_from_dest_with_key`'s push-race retry loop no longer refreshes
+  the dest tip on each attempt: it used to call `git::fetch` against dest
+  again every time around the loop, and now re-reads the same run-start
+  namespace ref instead. Only the loop's source refetch (a genuine live
+  fetch, needed to recompute against source's actual current tip after a
+  lost race) is unaffected by this decision.
 * Decisions/0041 ("dest→source fetches its own configured branch when
   absent locally") is now satisfied by reading the namespace ref instead of
   a per-branch fetch; its own behavior (create the local branch from the
