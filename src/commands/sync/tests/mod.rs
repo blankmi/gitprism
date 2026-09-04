@@ -165,7 +165,7 @@ fn add_dest_marker_commit(repo: &Repository, branch: &str, parent: Oid, counterp
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     let oid = repo
         .commit(
@@ -293,7 +293,7 @@ fn add_independent_dest_commit(
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     } else {
         message.to_owned()
@@ -345,7 +345,7 @@ fn add_independent_dest_commit_on(
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     } else {
         message.to_owned()
@@ -393,7 +393,7 @@ fn add_source_marker_commit_on_dest(
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     dest_repo
         .commit(
@@ -424,7 +424,7 @@ fn sync_pair_to_dest(
     reporter: &Reporter,
     run_cache: &mut RunCache,
 ) -> Result<bool> {
-    let key = marker::load_key()?;
+    let key = marker::test_key();
     let source_tip = repo
         .find_branch(branch, git2::BranchType::Local)?
         .get()
@@ -477,7 +477,7 @@ fn sync_pair_from_dest(
     branch: &str,
     reporter: &Reporter,
 ) -> Result<()> {
-    let key = marker::load_key()?;
+    let key = marker::test_key();
     sync_pair_from_dest_with_key(repo, source_root, config, branch, reporter, &key)
 }
 
@@ -778,7 +778,7 @@ fn authority_invariant_fixture(
     )
     .unwrap();
 
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let exclude_list = ExcludeList::from_contents("").unwrap();
     let their_commit = source_repo.find_commit(their_tip).unwrap();
     let filtered_tree = filter_tree(

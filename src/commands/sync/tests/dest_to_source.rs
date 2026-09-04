@@ -173,7 +173,7 @@ fn mirrored_commit_rejects_non_utf8_messages_without_advancing_refs() {
     let invalid = commit_with_raw_message(&repo, first, b"bad\xff message\n");
     let config = Config::load(write_config("unused", "unused", &["main"]).path()).unwrap();
     let tree = repo.find_commit(invalid).unwrap().tree_id();
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
 
     let dest_error = build_dest_commit(
         &repo,
@@ -215,7 +215,7 @@ fn mirrored_commit_preserves_valid_unicode_messages() {
     let unicode = commit_with_raw_message(&repo, first, "héllö 世界\n".as_bytes());
     let config = Config::load(write_config("unused", "unused", &["main"]).path()).unwrap();
     let tree = repo.find_commit(unicode).unwrap().tree_id();
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let built = build_dest_commit(
         &repo,
         &config,
@@ -1314,7 +1314,7 @@ fn sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_forei
         import_tree.id(),
         &import_signature,
         &import_signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     source_repo
         .commit(
@@ -1870,7 +1870,7 @@ fn dest_to_source_stops_at_the_branchs_own_shared_base_not_an_inherited_earlier_
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         dest_repo
             .commit(
@@ -2171,7 +2171,7 @@ fn dest_to_source_case_two_represents_an_imported_dest_native_commit_beneath_a_c
         import_tree.id(),
         &import_signature,
         &import_signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     let tip_after_import = source_repo
         .commit(
@@ -2221,7 +2221,7 @@ fn dest_to_source_case_two_represents_an_imported_dest_native_commit_beneath_a_c
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         dest_repo
             .commit(
@@ -2257,7 +2257,7 @@ fn dest_to_source_case_two_represents_an_imported_dest_native_commit_beneath_a_c
     );
 
     let repo = Repository::open(source_dir.path()).unwrap();
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let boundary = dest_to_source_boundary(&repo, tip_after_import, f, "release", &key).unwrap();
     assert_eq!(
         boundary, f,
@@ -2413,7 +2413,7 @@ fn dest_to_source_bare_dest_native_commit_is_a_valid_boundary_when_it_is_dest_ti
         import_tree.id(),
         &import_signature,
         &import_signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     let tip_after_import = source_repo
         .commit(
@@ -2528,7 +2528,7 @@ fn sync_pair_to_dest_accepts_a_dest_tip_represented_only_via_case_two() {
         import_tree.id(),
         &import_signature,
         &import_signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     let tip_after_import = source_repo
         .commit(
@@ -2676,7 +2676,7 @@ fn dest_to_source_case_one_and_two_both_fail_for_a_marker_reachable_only_from_a_
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         dest_repo
             .commit(

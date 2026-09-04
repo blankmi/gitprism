@@ -21,8 +21,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Setup => commands::setup::run(Path::new("."), &cli.config),
-        Commands::Sync => commands::sync::run(Path::new("."), &cli.config),
+        Commands::Setup => {
+            commands::setup::run_with(Path::new("."), &cli.config, &commands::EnvSecrets)
+        }
+        Commands::Sync => {
+            commands::sync::run_with(Path::new("."), &cli.config, &commands::EnvSecrets)
+        }
         Commands::Resolve {
             branch,
             direction,
@@ -36,6 +40,7 @@ fn main() -> anyhow::Result<()> {
                 ResolveDirection::DestToSource => commands::resolve::Direction::DestToSource,
                 ResolveDirection::SourceToDest => commands::resolve::Direction::SourceToDest,
             },
+            &commands::EnvSecrets,
         ),
         Commands::PolicyHash => commands::policy_hash::run(Path::new("."), &cli.config),
     }

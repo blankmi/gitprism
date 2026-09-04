@@ -586,9 +586,9 @@ impl MappingIndex {
         Ok(())
     }
 
-    /// A `ForceMirrorOnly` push for `branch` just replaced its dest ref with
-    /// `new_dest_tip`, built from a graft-derived rebuild base rather than
-    /// `branch`'s own prior chain — so anything that chain contributed
+    /// A `ForceMirrorOnly` push for `branch` just replaced its dest ref
+    /// with `new_dest_tip`, built from a graft-derived rebuild base rather
+    /// than `branch`'s own prior chain — so anything that chain contributed
     /// to this run's index that is no longer an ancestor of (or equal to)
     /// `new_dest_tip` is now a mapping to a dest commit orphaned by that
     /// rebuild (decisions/0046 Addendum 3, Finding Q). Only records
@@ -904,7 +904,7 @@ mod tests {
             tree,
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     }
 
@@ -989,7 +989,7 @@ mod tests {
                 "feature",
                 &[MarkerDirection::SourceToDest],
                 None,
-                &marker::load_key().unwrap(),
+                &marker::test_key(),
             ),
             Some(source)
         );
@@ -998,7 +998,7 @@ mod tests {
             &repo,
             &[("feature".to_owned(), dest_to_source)],
             &[("feature".to_owned(), invalid)],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let source_mapping = index.resolve(&repo, source).unwrap().unwrap();
@@ -1084,7 +1084,7 @@ mod tests {
             &repo,
             &[],
             &[("feature".to_owned(), desc)],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let resolved = index.resolve(&repo, source).unwrap().unwrap();
@@ -1143,7 +1143,7 @@ mod tests {
             &repo,
             &[],
             &[("left".to_owned(), left), ("right".to_owned(), right)],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let error = index.resolve(&repo, source).unwrap_err();
@@ -1166,8 +1166,7 @@ mod tests {
         // commit: Finding R's existence check in `resolve` (a different
         // method, exercised below to prove the mapping was recorded, not by
         // `record_built_mapping` itself) would otherwise correctly treat an
-        // ordinary orphaned
-        // mapping as unusable.
+        // ordinary orphaned mapping as unusable.
         let (_dir, repo, root) = empty_repo();
         let source = Oid::from_bytes(&[3; 20]).unwrap();
         let dest = root;
@@ -1253,7 +1252,7 @@ mod tests {
         let missing = Oid::from_bytes(&[9; 20]).unwrap();
         let mut index = MappingIndex::new();
 
-        index.record_pushed_dest_commit(&repo, "feature", missing, &marker::load_key().unwrap());
+        index.record_pushed_dest_commit(&repo, "feature", missing, &marker::test_key());
 
         assert_eq!(index.entry_count, 0);
     }
@@ -1280,7 +1279,7 @@ mod tests {
             &repo,
             &[("first".to_owned(), setup), ("second".to_owned(), setup)],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let mapping = index.resolve(&repo, setup).unwrap().unwrap();
@@ -1352,7 +1351,7 @@ mod tests {
             &repo,
             &[("main".to_owned(), merge), ("side".to_owned(), side)],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let side_mapping = index.resolve(&repo, side).unwrap().unwrap();
@@ -1439,7 +1438,7 @@ mod tests {
                 ("feature".to_owned(), d2),
                 ("sibling".to_owned(), d2_sibling),
             ],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
 
@@ -1605,7 +1604,7 @@ mod tests {
             &repo,
             &[("task".to_owned(), imported)],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let mapping = index.resolve(&repo, imported).unwrap().unwrap();
@@ -1641,7 +1640,7 @@ mod tests {
             &repo,
             &[],
             &[("task".to_owned(), feature_dest)],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
         let mapping = index.resolve(&repo, source).unwrap().unwrap();
@@ -1757,7 +1756,7 @@ mod tests {
                 ("task".to_owned(), d_task_f),
                 ("feature".to_owned(), d_feat_f),
             ],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
 
@@ -1852,7 +1851,7 @@ mod tests {
                 ("branch-b".to_owned(), tip_b),
             ],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .unwrap();
 
@@ -1896,7 +1895,7 @@ mod tests {
             &repo,
             &[("main".to_owned(), tip)],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
             2,
         )
         .expect("hitting the scan horizon must not error the whole reconstruction");
@@ -1954,7 +1953,7 @@ mod tests {
                 ("short".to_owned(), short_tip),
             ],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
             2,
         )
         .unwrap();
@@ -2005,7 +2004,7 @@ mod tests {
                 ("short".to_owned(), short_tip),
             ],
             &[],
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
             2,
         )
         .unwrap();
@@ -2121,13 +2120,7 @@ mod tests {
         let mut index = MappingIndex::with_limit(1);
         let mut visited = HashSet::new();
         index
-            .scan_source_history(
-                &repo,
-                "main",
-                second,
-                &marker::load_key().unwrap(),
-                &mut visited,
-            )
+            .scan_source_history(&repo, "main", second, &marker::test_key(), &mut visited)
             .expect("hitting the aggregate entry limit must not error the scan");
 
         assert_eq!(

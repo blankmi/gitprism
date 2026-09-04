@@ -115,7 +115,7 @@ fn dest_resume_point_refuses_a_case_one_marker_sitting_on_an_unimported_native_c
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     let case_one_marker = dest_repo
         .commit(
@@ -322,7 +322,7 @@ fn mirror_only_rewrite_detected_propagates_a_real_lookup_failure_instead_of_gues
         .id();
     assert_eq!(fetched_dest_tip, dest_marker_tip);
 
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let error =
         mirror_only_rewrite_detected(&source_repo, source_tip, fetched_dest_tip, "main", &key)
             .expect_err(
@@ -1095,7 +1095,7 @@ fn sync_pair_to_dest_incorporates_a_benign_race_on_a_mirror_only_branch_via_reco
     // recognize and build on it rather than treating it as unaccounted
     // for — and, crucially, without needing to detect (or fire) a
     // rewrite to do so, since source_tip still equals this exact marker.
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let exclude_list = ExcludeList::from_contents("").unwrap();
     let s2_commit = repo.find_commit(s2).unwrap();
     let filtered_tree = filter_tree(
@@ -1198,7 +1198,7 @@ fn sync_pair_to_dest_recovers_from_a_stale_no_dest_ref_cache_entry_on_a_race_ret
     // Another writer completes feature-x's very first mirror
     // concurrently, landing before this run's own retry ever queries
     // dest for real.
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let exclude_list = ExcludeList::from_contents("").unwrap();
     let s1_commit = repo.find_commit(s1).unwrap();
     let filtered_tree = filter_tree(
@@ -2095,7 +2095,7 @@ fn reconstruct_mapping_index_caches_a_source_branchs_missing_dest_ref_as_nonexis
 
     let repo = Repository::open(source_dir.path()).unwrap();
     let dest_url = dest_dir.path().display().to_string();
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let mut run_cache = RunCache::default();
 
     reconstruct_mapping_index(
@@ -2152,7 +2152,7 @@ fn reconstruct_mapping_index_degrades_to_a_per_branch_refusal_instead_of_abortin
 
     let repo = Repository::open(source_dir.path()).unwrap();
     let dest_url = dest_dir.path().display().to_string();
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let mut run_cache = RunCache::default();
 
     let index = reconstruct_mapping_index(
@@ -2328,7 +2328,7 @@ fn reconstruct_mapping_index_recovers_a_deleted_branch_alongside_an_unrelated_un
 
     let repo = Repository::open(source_dir.path()).unwrap();
     let dest_url = dest_dir.path().display().to_string();
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let mut run_cache = RunCache::default();
 
     let index = reconstruct_mapping_index(
@@ -2751,7 +2751,7 @@ fn run_anchors_a_round_tripped_feature_rebase_on_its_exact_mapping_instead_of_ha
             "feat/supplier-specific-accounting-data",
             &[MarkerDirection::DestToSource],
             Some(dest_feature_merge),
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
         .is_some(),
         "the feature merge must be represented by its authenticated source marker"
@@ -3073,7 +3073,7 @@ fn run_halts_instead_of_losing_content_when_a_missing_mapping_would_be_loop_prev
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     source_repo
         .commit(

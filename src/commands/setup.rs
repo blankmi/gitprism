@@ -38,6 +38,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use git2::{Repository, Signature};
 
+use crate::commands::SecretSource;
 use crate::config::Config;
 use crate::exclude::{self};
 use crate::git;
@@ -45,14 +46,34 @@ use crate::limits;
 use crate::marker::{self, Direction as MarkerDirection};
 use crate::policy;
 
-pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSource) -> Result<()> {
     let remove_file = |path: &Path| fs::remove_file(path);
-    run_with_remove_file(cwd, config_path, &remove_file)
+    run_with_remove_file(cwd, config_path, secrets, &remove_file)
+}
+
+/// Test-only convenience: builds this fixture's own secrets from its
+/// control files, so existing fixture tests keep calling `run(cwd,
+/// config_path)` unchanged (see `commands::FixedSecrets`).
+#[cfg(test)]
+pub(crate) fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+    // Resolved the same way `run_with` resolves it below, so a relative
+    // `--config` fixture hashes the same file `run_with` actually reads.
+    let resolved_config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        cwd.join(config_path)
+    };
+    let secrets = crate::commands::FixedSecrets::for_fixture(
+        &resolved_config_path,
+        &cwd.join(exclude::FILENAME),
+    );
+    run_with(cwd, config_path, &secrets)
 }
 
 fn run_with_remove_file(
     cwd: &Path,
     config_path: &Path,
+    secrets: &dyn SecretSource,
     remove_file: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let repo = Repository::discover(cwd).with_context(|| {
@@ -92,7 +113,12 @@ fn run_with_remove_file(
     } else {
         source_root.join(config_path)
     };
-    let policy = policy::load(&config_path, &source_root.join(exclude::FILENAME))?;
+    let expected_digest = secrets.expected_policy_digest()?;
+    let policy = policy::load(
+        &config_path,
+        &source_root.join(exclude::FILENAME),
+        &expected_digest,
+    )?;
     let config_raw = policy.config_raw;
     let ignore_raw = policy.ignore_raw;
     let config = policy.config;
@@ -104,7 +130,7 @@ fn run_with_remove_file(
     )?;
     // Validate the pair secret after the immutable policy pin has passed, and
     // before any fetch or ref/tree mutation.
-    let state_key = marker::load_key()?;
+    let state_key = secrets.state_key()?;
     let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
     // decisions/0021 needs config.branches available before the precondition
     // check below runs (to know which existing local branch names are
@@ -1295,7 +1321,16 @@ mod tests {
         let sub_dir = source_dir.path().join("sub");
         fs::create_dir(&sub_dir).unwrap();
 
-        run(&sub_dir, Path::new(crate::config::FILENAME)).expect("setup should succeed");
+        // Unlike this module's other fixtures, `cwd` (`sub_dir`) here isn't
+        // source's root, so the bare `run` shim's own `cwd.join(...)` ignore
+        // path would be wrong — build secrets from the real, resolved
+        // locations directly instead.
+        let secrets = crate::commands::FixedSecrets::for_fixture(
+            &source_dir.path().join(crate::config::FILENAME),
+            &source_dir.path().join(exclude::FILENAME),
+        );
+        run_with(&sub_dir, Path::new(crate::config::FILENAME), &secrets)
+            .expect("setup should succeed");
 
         let repo = Repository::open(source_dir.path()).unwrap();
         assert!(
@@ -1612,7 +1647,11 @@ mod tests {
             }
         };
 
-        let error = run_with_remove_file(source_dir.path(), config.path(), &remove_file)
+        let secrets = crate::commands::FixedSecrets::for_fixture(
+            config.path(),
+            &source_dir.path().join(exclude::FILENAME),
+        );
+        let error = run_with_remove_file(source_dir.path(), config.path(), &secrets, &remove_file)
             .expect_err("an injected control-file removal failure must stop setup");
 
         let message = format!("{error:#}");
@@ -2455,15 +2494,13 @@ mod tests {
         );
     }
 
-    // TEST-001: `setup`'s own env-reading entry point must actually enforce
+    // TEST-001: `setup`'s own env-reading entry point (`run_with` with
+    // `EnvSecrets`) must actually enforce
     // `GITPRISM_POLICY_SHA256`/`GITPRISM_STATE_KEY`, refusing before any
     // fetch or ref/tree mutation, in that order (setup loads and verifies
-    // policy before reading the key). `policy::verify_expected_digest`/
-    // `marker::load_key` are cfg(test)-forked to always succeed today, so
-    // these three fail until TEST-001 step 2 removes those forks.
+    // policy before reading the key).
 
     #[test]
-    #[ignore = "TEST-001 step 2: policy::verify_expected_digest is cfg(test)-forked to always succeed until the fork is removed"]
     fn run_refuses_with_a_wrong_policy_digest_and_leaves_no_side_effects() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
         unsafe {
@@ -2479,8 +2516,12 @@ mod tests {
         Repository::init(source_dir.path()).unwrap();
         let config = write_config(&dest_dir.path().display().to_string(), &["main"]);
 
-        let error = run(source_dir.path(), config.path())
-            .expect_err("a wrong policy digest must refuse before any fetch or mutation");
+        let error = run_with(
+            source_dir.path(),
+            config.path(),
+            &crate::commands::EnvSecrets,
+        )
+        .expect_err("a wrong policy digest must refuse before any fetch or mutation");
         assert!(
             error.to_string().contains("does not match"),
             "error must say the pin does not match: {error}"
@@ -2510,7 +2551,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TEST-001 step 2: marker::load_key is cfg(test)-forked to always succeed until the fork is removed"]
     fn run_refuses_without_a_state_key_env_var_and_leaves_no_side_effects() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
         unsafe {
@@ -2530,8 +2570,12 @@ mod tests {
             std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
         }
 
-        let error = run(source_dir.path(), config.path())
-            .expect_err("an unset state key must refuse before any fetch or mutation");
+        let error = run_with(
+            source_dir.path(),
+            config.path(),
+            &crate::commands::EnvSecrets,
+        )
+        .expect_err("an unset state key must refuse before any fetch or mutation");
         assert!(
             error.to_string().contains("GITPRISM_STATE_KEY"),
             "error must name the missing variable: {error}"
@@ -2561,7 +2605,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TEST-001 step 2: policy::verify_expected_digest/marker::load_key are cfg(test)-forked to always succeed until the forks are removed"]
     fn run_succeeds_with_correct_state_key_and_policy_digest_env_vars() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
 
@@ -2582,11 +2625,53 @@ mod tests {
             std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
         }
 
-        run(source_dir.path(), config.path())
-            .expect("correct env vars must let the real env-reading path run to completion");
+        run_with(
+            source_dir.path(),
+            config.path(),
+            &crate::commands::EnvSecrets,
+        )
+        .expect("correct env vars must let the real env-reading path run to completion");
 
         unsafe {
             std::env::remove_var("GITPRISM_STATE_KEY");
+            std::env::remove_var("GITPRISM_POLICY_SHA256");
+        }
+    }
+
+    // TEST-001 step 3: setup's own precedence — a missing config file (load
+    // and verify policy) is reported before a missing state key, since
+    // setup reads the policy before reading the key.
+    #[test]
+    fn run_reports_a_missing_config_file_before_a_missing_state_key() {
+        let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("GITPRISM_STATE_KEY");
+            // A benign placeholder: the config file read below fails before
+            // this value is ever compared against anything.
+            std::env::set_var("GITPRISM_POLICY_SHA256", "0".repeat(64));
+        }
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        // No .gitprism.toml written at all.
+
+        let error = run_with(
+            source_dir.path(),
+            Path::new(crate::config::FILENAME),
+            &crate::commands::EnvSecrets,
+        )
+        .expect_err("a missing config file must refuse before the state key is ever read");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("config"),
+            "expected a config-reading error, got: {message}"
+        );
+        assert!(
+            !message.to_uppercase().contains("GITPRISM_STATE_KEY"),
+            "the config error must not be shadowed by a state-key complaint: {message}"
+        );
+
+        unsafe {
             std::env::remove_var("GITPRISM_POLICY_SHA256");
         }
     }

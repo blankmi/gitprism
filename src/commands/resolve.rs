@@ -33,6 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
+use crate::commands::SecretSource;
 use crate::commands::sync::anchor::dest_resume_point_for_branch;
 use crate::commands::sync::filter::filter_tree;
 use crate::commands::sync::policy_check::{
@@ -62,15 +63,48 @@ fn read_state_file(path: &Path, description: &str) -> Result<String> {
         .map(str::to_owned)
 }
 
+/// Builds this fixture's own secrets from its control files (see
+/// `commands::FixedSecrets`), resolving a relative `config_path` against
+/// `cwd` the same way `run_with_direction` resolves it below, so a fixture
+/// hashes the same file `run_with_direction` actually reads.
 #[cfg(test)]
-pub fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Result<()> {
+fn fixture_secrets(cwd: &Path, config_path: &Path) -> crate::commands::FixedSecrets {
+    let resolved_config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        cwd.join(config_path)
+    };
+    crate::commands::FixedSecrets::for_fixture(&resolved_config_path, &cwd.join(exclude::FILENAME))
+}
+
+/// Test-only convenience: dest-to-source with this fixture's own secrets,
+/// so existing fixture tests keep calling `run(cwd, config_path, branch,
+/// continue)` unchanged.
+#[cfg(test)]
+pub(crate) fn run(cwd: &Path, config_path: &Path, branch: &str, r#continue: bool) -> Result<()> {
+    let secrets = fixture_secrets(cwd, config_path);
     run_with_direction(
         cwd,
         config_path,
         branch,
         r#continue,
         Direction::DestToSource,
+        &secrets,
     )
+}
+
+/// Test-only convenience for the `--direction source-to-dest` fixtures:
+/// same idea as [`run`], parameterized by direction.
+#[cfg(test)]
+fn run_with_direction_test(
+    cwd: &Path,
+    config_path: &Path,
+    branch: &str,
+    r#continue: bool,
+    direction: Direction,
+) -> Result<()> {
+    let secrets = fixture_secrets(cwd, config_path);
+    run_with_direction(cwd, config_path, branch, r#continue, direction, &secrets)
 }
 
 pub fn run_with_direction(
@@ -79,6 +113,7 @@ pub fn run_with_direction(
     branch: &str,
     r#continue: bool,
     direction: Direction,
+    secrets: &dyn SecretSource,
 ) -> Result<()> {
     // Repository discovery first, so a wrong cwd reports that, not a
     // missing/malformed state key (F-14) — both are validated before
@@ -89,7 +124,7 @@ pub fn run_with_direction(
             cwd.display()
         )
     })?;
-    let state_key = marker::load_key()?;
+    let state_key = secrets.state_key()?;
     let source_root = repo
         .workdir()
         .context("gitprism resolve requires a repo with a working tree, not a bare repo")?
@@ -100,7 +135,12 @@ pub fn run_with_direction(
     } else {
         source_root.join(config_path)
     };
-    let verified_policy = policy::load(&config_path, &source_root.join(exclude::FILENAME))?;
+    let expected_digest = secrets.expected_policy_digest()?;
+    let verified_policy = policy::load(
+        &config_path,
+        &source_root.join(exclude::FILENAME),
+        &expected_digest,
+    )?;
     let config = verified_policy.config;
     let config_raw = verified_policy.config_raw;
     let ignore_raw = verified_policy.ignore_raw;
@@ -1705,7 +1745,7 @@ mod tests {
             source_parent.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -1719,7 +1759,7 @@ mod tests {
             .unwrap();
         checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
-        let error = run_with_direction(
+        let error = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "feature",
@@ -1731,7 +1771,7 @@ mod tests {
         assert!(message.contains("source-to-dest"), "message was: {message}");
         assert!(message.contains("--continue"), "message was: {message}");
         let operation =
-            find_source_to_dest_operation(&source_repo, "feature", &marker::load_key().unwrap())
+            find_source_to_dest_operation(&source_repo, "feature", &marker::test_key())
                 .unwrap_or_else(|lookup_error| {
                     panic!(
                         "run_with_direction's error was: {message}\nlooking up its operation ref failed: {lookup_error:#}"
@@ -1828,7 +1868,7 @@ mod tests {
             source_parent.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -1851,7 +1891,7 @@ mod tests {
         fs::set_permissions(&worktrees_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
         let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
-        let result = run_with_direction(
+        let result = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "feature",
@@ -1895,7 +1935,7 @@ mod tests {
             source_parent.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -1910,7 +1950,7 @@ mod tests {
         checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
-        let first_error = run_with_direction(
+        let first_error = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -1920,7 +1960,7 @@ mod tests {
         .expect_err("the independent same-file changes must conflict");
         let first_message = format!("{first_error:#}");
         let operation =
-            find_source_to_dest_operation(&source_repo, "main", &marker::load_key().unwrap())
+            find_source_to_dest_operation(&source_repo, "main", &marker::test_key())
                 .unwrap_or_else(|lookup_error| {
                     panic!(
                         "run_with_direction's error was: {first_message}\nlooking up its operation ref failed: {lookup_error:#}"
@@ -1933,7 +1973,7 @@ mod tests {
         index.write().unwrap();
 
         add_independent_dest_commit(&dest_repo, dest_change, ("race.txt", "dest moved"));
-        let error = run_with_direction(
+        let error = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -1986,7 +2026,7 @@ mod tests {
             source_parent.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -2023,7 +2063,7 @@ mod tests {
 
         let config = write_config("unused", &dest_dir.path().display().to_string(), &[]);
 
-        let error = run_with_direction(
+        let error = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2058,8 +2098,7 @@ mod tests {
              refuses on a policy mismatch"
         );
         assert!(
-            find_source_to_dest_operation(&source_repo, "main", &marker::load_key().unwrap())
-                .is_err(),
+            find_source_to_dest_operation(&source_repo, "main", &marker::test_key()).is_err(),
             "a refused resolve must not leave an in-progress operation behind"
         );
     }
@@ -2068,9 +2107,9 @@ mod tests {
     fn run_reports_the_repository_error_for_a_wrong_cwd_not_the_state_key_error() {
         // F-14: repository discovery must run before state-key validation,
         // so a wrong cwd reports "not a git repository," never a state-key
-        // complaint (`marker::load_key` uses a fixed test key and can't
-        // itself fail here, but the ordering this guards is the same either
-        // way — see the F-14 report note in this commit).
+        // complaint (the fixed test key from `FixedSecrets` can't itself fail
+        // here, but the ordering this guards is the same either way — see
+        // the F-14 report note in this commit).
         let dir = tempdir().unwrap();
 
         let error = run(dir.path(), Path::new(".gitprism.toml"), "main", false)
@@ -2086,16 +2125,13 @@ mod tests {
         );
     }
 
-    // TEST-001: `resolve`'s own env-reading entry point must actually
-    // enforce `GITPRISM_STATE_KEY`/`GITPRISM_POLICY_SHA256`, refusing before
-    // any fetch or ref mutation, in that order (resolve reads the key
-    // before loading and verifying policy). `marker::load_key`/
-    // `policy::verify_expected_digest` are cfg(test)-forked to always
-    // succeed today, so these three fail until TEST-001 step 2 removes
-    // those forks.
+    // TEST-001: `resolve`'s own env-reading entry point (`run_with_direction`
+    // with `EnvSecrets`) must actually enforce
+    // `GITPRISM_STATE_KEY`/`GITPRISM_POLICY_SHA256`, refusing before any
+    // fetch or ref mutation, in that order (resolve reads the key before
+    // loading and verifying policy).
 
     #[test]
-    #[ignore = "TEST-001 step 2: marker::load_key is cfg(test)-forked to always succeed until the fork is removed"]
     fn run_refuses_without_a_state_key_env_var_and_leaves_no_side_effects() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
         unsafe {
@@ -2108,12 +2144,15 @@ mod tests {
 
         let source_dir = tempdir().unwrap();
         source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        // `source_grafted_onto` itself performs a real fetch while building
+        // the graft — clear its FETCH_HEAD so the assertion below actually
+        // proves this call made no fetch of its own, not just that the
+        // fixture's own setup fetch survived.
+        let _ = fs::remove_file(source_dir.path().join(".git/FETCH_HEAD"));
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
-        let expected_digest = crate::policy::hash_files(
-            config.path(),
-            &source_dir.path().join(exclude::FILENAME),
-        )
-        .unwrap();
+        let expected_digest =
+            crate::policy::hash_files(config.path(), &source_dir.path().join(exclude::FILENAME))
+                .unwrap();
         unsafe {
             std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
         }
@@ -2124,6 +2163,7 @@ mod tests {
             "main",
             false,
             Direction::DestToSource,
+            &crate::commands::EnvSecrets,
         )
         .expect_err("an unset state key must refuse before any fetch or mutation");
         assert!(
@@ -2154,7 +2194,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TEST-001 step 2: policy::verify_expected_digest is cfg(test)-forked to always succeed until the fork is removed"]
     fn run_refuses_with_a_wrong_policy_digest_and_leaves_no_side_effects() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
 
@@ -2164,6 +2203,11 @@ mod tests {
 
         let source_dir = tempdir().unwrap();
         source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        // `source_grafted_onto` itself performs a real fetch while building
+        // the graft — clear its FETCH_HEAD so the assertion below actually
+        // proves this call made no fetch of its own, not just that the
+        // fixture's own setup fetch survived.
+        let _ = fs::remove_file(source_dir.path().join(".git/FETCH_HEAD"));
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
         unsafe {
             std::env::set_var(
@@ -2180,6 +2224,7 @@ mod tests {
             "main",
             false,
             Direction::DestToSource,
+            &crate::commands::EnvSecrets,
         )
         .expect_err("a wrong policy digest must refuse before any fetch or mutation");
         assert!(
@@ -2211,7 +2256,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TEST-001 step 2: policy::verify_expected_digest/marker::load_key are cfg(test)-forked to always succeed until the forks are removed"]
     fn run_succeeds_with_correct_state_key_and_policy_digest_env_vars() {
         let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
 
@@ -2245,11 +2289,9 @@ mod tests {
             &dest_dir.path().display().to_string(),
             &["main"],
         );
-        let expected_digest = crate::policy::hash_files(
-            config.path(),
-            &source_dir.path().join(exclude::FILENAME),
-        )
-        .unwrap();
+        let expected_digest =
+            crate::policy::hash_files(config.path(), &source_dir.path().join(exclude::FILENAME))
+                .unwrap();
         unsafe {
             std::env::set_var(
                 "GITPRISM_STATE_KEY",
@@ -2264,6 +2306,7 @@ mod tests {
             "main",
             false,
             Direction::DestToSource,
+            &crate::commands::EnvSecrets,
         )
         .expect("correct env vars must let the real env-reading path run to completion");
 
@@ -2271,6 +2314,41 @@ mod tests {
             std::env::remove_var("GITPRISM_STATE_KEY");
             std::env::remove_var("GITPRISM_POLICY_SHA256");
         }
+    }
+
+    // TEST-001 step 3: resolve's own precedence — a missing state key is
+    // reported before a missing config file, since resolve reads the key
+    // before loading and verifying policy.
+    #[test]
+    fn run_reports_a_missing_state_key_before_a_missing_config_file() {
+        let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("GITPRISM_STATE_KEY");
+            std::env::remove_var("GITPRISM_POLICY_SHA256");
+        }
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        // No .gitprism.toml written at all.
+
+        let error = run_with_direction(
+            source_dir.path(),
+            Path::new(crate::config::FILENAME),
+            "main",
+            false,
+            Direction::DestToSource,
+            &crate::commands::EnvSecrets,
+        )
+        .expect_err("a missing state key must refuse before the config file is ever read");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("GITPRISM_STATE_KEY"),
+            "expected the state-key error, got: {message}"
+        );
+        assert!(
+            !message.contains("config"),
+            "the state-key error must not be shadowed by a config-reading complaint: {message}"
+        );
     }
 
     #[test]
@@ -2668,7 +2746,7 @@ mod tests {
             source_parent.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -2683,7 +2761,7 @@ mod tests {
         checkout_head_exact(&source_repo);
         let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
 
-        let error = run_with_direction(
+        let error = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2714,8 +2792,7 @@ mod tests {
 
         let worktree_repo = Repository::open(&worktree_path).unwrap();
         let operation =
-            find_source_to_dest_operation(&source_repo, "main", &marker::load_key().unwrap())
-                .unwrap();
+            find_source_to_dest_operation(&source_repo, "main", &marker::test_key()).unwrap();
         assert_eq!(
             worktree_repo.head().unwrap().peel_to_commit().unwrap().id(),
             operation.state_commit
@@ -2733,7 +2810,7 @@ mod tests {
             format!("{}\n", outside.path().join(".git").display()),
         )
         .unwrap();
-        let tampered = run_with_direction(
+        let tampered = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2757,7 +2834,7 @@ mod tests {
             format!("gitdir: {}\n", outside_metadata.display()),
         )
         .unwrap();
-        let dual_tampered = run_with_direction(
+        let dual_tampered = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2779,7 +2856,7 @@ mod tests {
         index.add_path(Path::new("f.txt")).unwrap();
         index.write().unwrap();
 
-        let rejected = run_with_direction(
+        let rejected = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2790,7 +2867,7 @@ mod tests {
         assert!(format!("{rejected:#}").contains("excluded paths"));
 
         fs::remove_file(worktree_repo.path().join("CHERRY_PICK_HEAD")).unwrap();
-        let missing_head = run_with_direction(
+        let missing_head = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2805,7 +2882,7 @@ mod tests {
         let mut changed_config = original_config.clone();
         changed_config.extend_from_slice(b"\n# changed during resolution\n");
         fs::write(config.path(), changed_config).unwrap();
-        let stale_policy = run_with_direction(
+        let stale_policy = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2823,7 +2900,7 @@ mod tests {
         index.add_path(Path::new("f.txt")).unwrap();
         index.write().unwrap();
 
-        run_with_direction(
+        run_with_direction_test(
             source_dir.path(),
             config.path(),
             "main",
@@ -2943,7 +3020,7 @@ mod tests {
             m_tree.id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         let m = source_repo
             .commit(
@@ -2986,7 +3063,7 @@ mod tests {
             conflicting_commit.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -3020,7 +3097,7 @@ mod tests {
              the clean prefix it pushes ahead of the conflict"
         );
 
-        let resolve_error = run_with_direction(
+        let resolve_error = run_with_direction_test(
             source_dir.path(),
             config.path(),
             "feature",
@@ -3031,8 +3108,7 @@ mod tests {
         let resolve_message = format!("{resolve_error:#}");
 
         let operation =
-            find_source_to_dest_operation(&source_repo, "feature", &marker::load_key().unwrap())
-                .unwrap();
+            find_source_to_dest_operation(&source_repo, "feature", &marker::test_key()).unwrap();
         git::worktree_remove(source_dir.path(), &operation.worktree).unwrap();
         source_repo
             .find_reference(&operation.refname)
@@ -3110,7 +3186,7 @@ mod tests {
             conflicting_commit.tree_id(),
             &marker_signature,
             &marker_signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         source_repo
             .commit(
@@ -3183,7 +3259,7 @@ mod tests {
 
         let (_dest_dir2, dest_repo2, source_dir2, source_repo2, config2, dest_feature_before2) =
             feature_with_two_clean_commits_then_a_conflict();
-        run_with_direction(
+        run_with_direction_test(
             source_dir2.path(),
             config2.path(),
             "feature",
@@ -3199,8 +3275,7 @@ mod tests {
         );
 
         let operation =
-            find_source_to_dest_operation(&source_repo2, "feature", &marker::load_key().unwrap())
-                .unwrap();
+            find_source_to_dest_operation(&source_repo2, "feature", &marker::test_key()).unwrap();
         git::worktree_remove(source_dir2.path(), &operation.worktree).unwrap();
         source_repo2
             .find_reference(&operation.refname)

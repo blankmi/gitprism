@@ -95,6 +95,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
+use crate::commands::SecretSource;
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git::{self, PushMode};
@@ -203,7 +204,26 @@ fn select_next_branch_by_mapping_distance(
     (halted, selected)
 }
 
-pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+/// Test-only convenience: builds this fixture's own secrets from its
+/// control files, so existing fixture tests keep calling `run(cwd,
+/// config_path)` unchanged (see `commands::FixedSecrets`).
+#[cfg(test)]
+pub(crate) fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+    // Resolved the same way `run_with` resolves it below, so a relative
+    // `--config` fixture hashes the same file `run_with` actually reads.
+    let resolved_config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        cwd.join(config_path)
+    };
+    let secrets = crate::commands::FixedSecrets::for_fixture(
+        &resolved_config_path,
+        &cwd.join(exclude::FILENAME),
+    );
+    run_with(cwd, config_path, &secrets)
+}
+
+pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSource) -> Result<()> {
     // Repository discovery first, so a wrong cwd reports that, not a
     // missing/malformed state key (F-14) — the pair secret is still
     // validated before fetching or constructing any commits either way.
@@ -213,7 +233,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             cwd.display()
         )
     })?;
-    let state_key = marker::load_key()?;
+    let state_key = secrets.state_key()?;
     let source_root = repo
         .workdir()
         .context("gitprism sync requires a repo with a working tree, not a bare repo")?
@@ -224,7 +244,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     } else {
         source_root.join(config_path)
     };
-    let verified_policy = load_run_policy(&config_path, &source_root)?;
+    let verified_policy = load_run_policy(&config_path, &source_root, secrets)?;
     let config = verified_policy.config;
     let exclude_list = verified_policy.exclude_list;
     // Threaded into the source→dest loop below for decisions/0037's
@@ -396,8 +416,17 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_run_policy(config_path: &Path, source_root: &Path) -> Result<policy::VerifiedPolicy> {
-    policy::load(config_path, &source_root.join(exclude::FILENAME))
+fn load_run_policy(
+    config_path: &Path,
+    source_root: &Path,
+    secrets: &dyn SecretSource,
+) -> Result<policy::VerifiedPolicy> {
+    let expected_digest = secrets.expected_policy_digest()?;
+    policy::load(
+        config_path,
+        &source_root.join(exclude::FILENAME),
+        &expected_digest,
+    )
 }
 
 /// A local branch [`list_source_branches`] could not read as a mirror

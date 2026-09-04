@@ -457,7 +457,7 @@ pub(super) fn dest_resume_point(
     source_tip: Oid,
     dest_tip: Oid,
 ) -> Result<Option<Oid>> {
-    let key = marker::load_key()?;
+    let key = marker::test_key();
     dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)
 }
 
