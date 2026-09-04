@@ -3121,3 +3121,35 @@ Full suite: 386 passed (383 unit + 3 `tests/cli.rs`, up from the 370
 baseline plus these sixteen); `cargo fmt --all -- --check` and `cargo
 clippy --workspace --all-targets --all-features -- -D warnings` clean;
 `cargo build --release --locked` succeeds.
+
+## 2026-09-04 — PERF-001 steps 1-3: measurement, a bounded-stdin runner variant, and decisions/0049
+
+`docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md`: reconstruction
+and dest→source each open one transport per dest branch (up to
+`MAX_SOURCE_BRANCHES` times), so a dest with a few hundred branches makes
+even a no-op sync slow. Step 1 adds a `#[cfg(test)]` thread-local subprocess
+counter in `src/git.rs` and a baseline test: a no-op sync with dest carrying
+12 branches (2 configured) spawns 20 git subprocesses today.
+
+Step 2 adds [decisions/0031](decisions/0031-centralized-git-process-runner.md)'s
+Addendum 2026-09-04 (a runner variant, `run_git_stdin_output`, may pipe
+caller-generated bounded input from a helper thread instead of a null
+stdin — decision 0031's null-stdin rule is about not inheriting an
+interactive stdin, not about a caller supplying its own already-bounded
+data) and implements it, sharing one spawn/capture core with the existing
+runner.
+
+Step 3 decides [decisions/0049](decisions/0049-dest-heads-are-fetched-once-into-a-transient-namespace.md):
+one `git fetch -q --stdin` at the start of `run`, built from the existing
+bounded `ls-remote` listing, lands every listed dest head under a transient
+`refs/gitprism/fetched/dest/*` namespace (cleared before every fetch) that
+reconstruction and dest→source then read via git2 instead of fetching per
+branch; source→dest's own per-branch lease fetch (decisions/0040) is
+unchanged. Amends decisions/0046 Addendum 2, Finding K and decisions/0041;
+explicitly does not touch decisions/0046's "no dedicated `refs/gitprism/*`
+mapping refs" constraint, which is about durable mapping state, not this
+transient per-run cache.
+
+Steps 4-7 (the `fetch_heads_into_namespace` implementation, reconstruction
+and dest→source reading the namespace, and tightening the measurement) are
+tracked in the same plan file.
