@@ -3041,3 +3041,289 @@ Regression test:
 Full suite: 370 passed (369 plus the new regression test); `cargo fmt --all
 -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D
 warnings` clean; `cargo build --release --locked` succeeds.
+
+## 2026-09-04 — DOC-001 closed: decisions/0046 Addendum 3 records Findings Q-S
+
+`docs/plans/2026-09-02/DOC-001-record-f-a-f-b-f-c.md` is fully implemented.
+Original finding: three behaviours of decisions/0046's implementation were
+cited in code only by an ad hoc "F", hyphen, letter shorthand
+(`mapping_index.rs`, `anchor.rs`, `mod.rs`, `git.rs`, and their tests), with
+no matching entry in `design/` — and the shorthand collided with this
+decision's own Addendum 1/2 finding letters, since those already number
+their findings A–P.
+
+[Decisions/0046](decisions/0046-dest-anchors-come-from-exact-authenticated-mappings.md)'s
+new Addendum 3 gives the three behaviours their own names: provenance
+surviving source-branch deletion (Finding Q — reconstruction lists dest's
+branches directly and self-verifies an inherited marker against its own
+recorded branch); a mapping whose canonical dest object is absent locally
+halting that branch rather than being walked past to an older mapping
+(Finding R); and self-exclusion of a branch's own sole projection during
+canonicalization for its own rebuild, keeping it only when nothing else maps
+the same source commit (Finding S) — under which CODE-004's accepted
+trade-off (an own projection comparable with a sibling's is dropped even
+when it would have been the common ancestor, safe under decisions/0038) is
+now recorded. Every citing code comment across `src/git.rs`,
+`src/commands/sync/{mapping_index,anchor,mod}.rs` and their tests is
+updated from the old shorthand to `decisions/0046 Addendum 3, Finding
+Q`/`Finding R`/`Finding S`; comment-only, no behaviour change.
+`design/decisions/index.md`'s 0046 entry notes the addendum.
+
+Full suite: 370 passed (unchanged — this work is doc/comment-only); `cargo
+fmt --all -- --check` and `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean.
+
+## 2026-09-04 — TEST-001 closed: the policy pin and pair key are enforced under test
+
+`docs/plans/2026-09-02/TEST-001-pin-and-key-enforcement.md` is fully
+implemented. Original finding: `marker::load_key` and
+`policy::verify_expected_digest` forked on `#[cfg(test)]` to always succeed,
+so `GITPRISM_STATE_KEY` and `GITPRISM_POLICY_SHA256`'s production branches
+were dead code in every test build, and nothing asserted that a wrong or
+missing value refuses before any fetch or ref mutation.
+
+Both forks are removed. `marker::load_key_from_env`/
+`policy::expected_digest_from_env` always read the real environment;
+`marker::test_key()` and policy's `verify_digest` are the explicit test-only
+and pin-comparison primitives, respectively. A new `SecretSource` trait
+(`src/commands/mod.rs`) is read on demand — `state_key()`/
+`expected_policy_digest()`, called at the exact point each command already
+read the key/verified policy — so introducing it leaves each command's
+observable error precedence unchanged: `sync`/`resolve` still read the key
+before loading policy, `setup` still loads and verifies policy before reading
+the key. One precedence detail did shift: the pin is now read from the
+environment immediately before `policy::load`, rather than inside policy
+verification after the control files are read, so with the pin unset *and*
+the control files missing/unreadable, the error is now "pin must be set"
+rather than the control-file error (see decisions/0026's addendum). `main.rs`
+supplies `EnvSecrets`; tests supply `FixedSecrets`, built via
+`FixedSecrets::for_fixture` in `src/testutil.rs`, which recomputes its
+digest from the fixture's own files on every call rather than gathering it
+once upfront. See [decisions/0026](decisions/0026-protected-versioned-policy.md)'s
+new addendum.
+
+Nine new refusal tests (three per command) prove an unset
+`GITPRISM_STATE_KEY` or a wrong `GITPRISM_POLICY_SHA256` refuses before any
+fetch or ref/tree mutation — no dest ref movement, no `FETCH_HEAD`, no
+`OperationLock` file — and that correct values let the real env-reading path
+run to completion. Three more prove today's per-command precedence
+(`sync`/`resolve`: missing key reported before a missing config file;
+`setup`: missing config file reported before a missing key). A new
+`tests/cli.rs` exercises the actual compiled binary
+(`env!("CARGO_BIN_EXE_gitprism")`): `--version`, a `sync` refusal with no
+repository or env, and `policy-hash`'s output against a known-answer digest
+shared by value with a new unit test in `src/policy.rs` (the crate has no
+`[lib]` target, so the integration test can't call `digest_bytes` directly).
+
+Landed as five commits rather than six: steps 2 (remove the forks) and 3
+(introduce `SecretSource`) cannot each be independently green — step 2
+alone leaves every existing fixture test failing at runtime with no
+substitution mechanism yet, and step 3 alone breaks compilation of those
+same call sites again until step 4's fixture migration — so they're one
+commit together with step 4.
+
+Full suite: 386 passed (383 unit + 3 `tests/cli.rs`, up from the 370
+baseline plus these sixteen); `cargo fmt --all -- --check` and `cargo
+clippy --workspace --all-targets --all-features -- -D warnings` clean;
+`cargo build --release --locked` succeeds.
+
+## 2026-09-04 — PERF-001 steps 1-3: measurement, a bounded-stdin runner variant, and decisions/0049
+
+`docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md`: reconstruction
+and dest→source each open one transport per dest branch (up to
+`MAX_SOURCE_BRANCHES` times), so a dest with a few hundred branches makes
+even a no-op sync slow. Step 1 adds a `#[cfg(test)]` thread-local subprocess
+counter in `src/git.rs` and a baseline test: a no-op sync with dest carrying
+12 branches (2 configured) spawns 20 git subprocesses today.
+
+Step 2 adds [decisions/0031](decisions/0031-centralized-git-process-runner.md)'s
+Addendum 2026-09-04 (a runner variant, `run_git_stdin_output`, may pipe
+caller-generated bounded input from a helper thread instead of a null
+stdin — decision 0031's null-stdin rule is about not inheriting an
+interactive stdin, not about a caller supplying its own already-bounded
+data) and implements it, sharing one spawn/capture core with the existing
+runner.
+
+Step 3 decides [decisions/0049](decisions/0049-dest-heads-are-fetched-once-into-a-transient-namespace.md):
+one `git fetch -q --stdin` at the start of `run`, built from the existing
+bounded `ls-remote` listing, lands every listed dest head under a transient
+`refs/gitprism/fetched/dest/*` namespace (cleared before every fetch) that
+reconstruction and dest→source then read via git2 instead of fetching per
+branch; source→dest's own per-branch lease fetch (decisions/0040) is
+unchanged. Amends decisions/0046 Addendum 2, Finding K and decisions/0041;
+explicitly does not touch decisions/0046's "no dedicated `refs/gitprism/*`
+mapping refs" constraint, which is about durable mapping state, not this
+transient per-run cache.
+
+Steps 4-7 (the `fetch_heads_into_namespace` implementation, reconstruction
+and dest→source reading the namespace, and tightening the measurement) are
+tracked in the same plan file.
+
+## 2026-09-04 — PERF-001 steps 4-7: fetch_heads_into_namespace, reconstruction and dest→source wired to the namespace, measurement tightened
+
+Step 4 adds `git::fetch_heads_into_namespace` next to `fetch`: every
+existing `refs/gitprism/fetched/dest/*` ref is cleared through git2 first
+(failing above `MAX_SOURCE_BRANCHES` pre-existing refs), then every listed
+branch is fetched from `url` in one `git fetch -q --stdin` transport onto
+`refs/gitprism/fetched/dest/<name>` using the step-2 runner variant. Tests
+(two bare/local repos) cover: every listed branch lands under the namespace
+and an unlisted one doesn't; a branch deleted on dest between the listing
+and the fetch fails the whole fetch with git's own "couldn't find remote
+ref" and leaves no namespace ref behind; an unusual-but-valid branch name
+(`a/b.c-d`) round-trips; a stale ref from a previous run's namespace is
+removed by the clear-before-fetch step.
+
+Step 5 switches `reconstruct_mapping_index` to call
+`fetch_heads_into_namespace` once for the whole dest listing instead of
+fetching each advertised dest head individually, reading tips back through
+the new `dest_head_from_namespace`; `fetch_dest_head_for_reconstruction` and
+its per-branch list/fetch race recovery (decisions/0046 Addendum 2 Finding
+G) are deleted. Because the bulk fetch is all-or-nothing, a name listed but
+deleted before the fetch now surfaces as a whole-fetch error before any
+mutation instead of being individually recovered as absent — decisions/0049's
+accepted trade-off. The Finding G tests are adapted accordingly; Finding J
+and 0047's own per-branch-refusal test are unaffected.
+
+Step 6 moves the dest branch listing and its bulk namespace fetch into
+`run`, once, before dest→source, sharing both with reconstruction and with
+`sync_pair_from_dest_with_key`. The latter replaces its `remote_ref_exists`
++ `fetch` pair with: existence from the listing when it
+`can_establish_absence()` (else one `remote_ref_exists` call), tip from the
+dest namespace ref, falling back to an individual fetch only for a branch
+beyond the branch-limit horizon that the bulk fetch never covered. The
+exact "has no ref on dest anymore" error message is unchanged, and the
+push-race retry loop (which refetches source, not dest) is untouched.
+
+Step 7 finalizes the step-1 counter test (tightened incrementally across
+steps 5-6: 20 → 9 → 5 git subprocesses for the 12-branch/2-configured
+no-op case: one listing, one bulk fetch, one git-version check, one lease
+fetch per source branch) and adds the plan's second counter test — the
+same shape with 300 dest branches (2 configured, 298 dest-only, cheap
+empty-tree commits) — asserting the identical constant 5, proving the
+subprocess count no longer scales with dest's branch count at all.
+
+Full suite: 398 passed (395 unit + 3 `tests/cli.rs`); `cargo fmt --all --
+--check` and `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean; `cargo build --release --locked` succeeds. PERF-001 is
+implemented in full except step 8 (a run-wide deadline), which the plan
+scopes out as a separate, optional follow-up.
+
+
+## 2026-09-07 — reconcile the 2026-09-02 review and plan statuses
+
+Checked the review backlog against `f1794e5`. Added a dated status update to
+`docs/2026-09-02_REPOSITORY_REVIEW.md` and a completion table to its plan index;
+marked CODE-002, DOC-001, and TEST-001 implemented, CODE-004's documentation
+step complete, and TEST-GAPS partially complete. Corrected PERF-002's reference
+to superseded branch-additive exclusions and TEST-001's blanket claim of
+unchanged error precedence. No architecture or code changes.
+
+`cargo test --workspace --all-features` passed 400 tests (397 unit + 3 binary
+integration), zero failures, during the status review. Other release gates
+were not rerun for this documentation update.
+
+## 2026-09-07 — incorporate production-readiness follow-up
+
+Added CODE-010 (stale source with newer objects present can force dest backwards)
+and CODE-011 (generated marker messages exceed the reader's limit) to the
+September 2 review as a dated follow-up. These preserve the identities of the
+completed CODE-001/002 tasks. Both were reproduced through the compiled CLI
+during the review at `f1794e5`; no implementation changes made.
+
+Added proposed plans and a remaining-work queue, retaining completed, accepted
+and withdrawn statuses. CODE-010 requires owner discussion and a recorded
+authorization decision before implementation. CODE-011 includes existing-state
+recovery assessment. Corrected TEST-GAPS expectations for locally committed
+resolutions after rejected pushes and synthetic versus real merge picks; made
+its module split optional. CODE-004's optional optimization follows CODE-010.
+
+Review evidence: 400 tests passed on Rust 1.98 and 1.89, checks passed on both,
+formatting and Clippy passed on 1.98. This documentation-only incorporation
+checks local Markdown links and diff whitespace; it does not rerun Rust tests.
+
+## 2026-09-07 — decide CODE-010 and CODE-011 scope
+
+CODE-010 was first drafted as decision 0050 "ambiguous source rewrites
+require operator reconciliation": halt every non-descendant mirror-only case
+and route rewrites to a revert-based operator playbook. Reviewing that draft
+against the bundle showed it contradicted requirements/0001 step 3 (as
+amended in `cdac783`), decisions 0038 and 0039 — all of which grant
+mirror-only force on a deliberate source rewrite — left 0040's lease with
+nothing to guard, and turned every routine feature-branch rebase into a
+permanent per-branch halt. The owner reaffirmed source authority for
+mirror-only branches; the draft was withdrawn before commit.
+
+Decision 0050 as accepted, "mirror-only force requires the local tip to
+match the source remote's tip", locates the defect in *which tip is trusted*:
+0039's condition 4 compares this clone's local branch against the boundary,
+and only the source remote can tell a behind checkout from a real rewrite. A
+fifth condition is added — `source_tip` must equal the OID `git ls-remote`
+reports for `refs/heads/<branch>` on decisions/0013's source URL, queried in
+the same push attempt and re-queried on each 0040 retry. Mismatch, missing
+branch or query failure is decisions/0045's per-branch halt; the fast-forward
+path is untouched. 0039 carries an amendment banner; 0038, 0040 and the
+requirement are unchanged. Playbook 0003 covers the stale-checkout recovery
+(`merge --ff-only`, push or drop local-only commits, fix the query) and was
+executed against a local bare remote. Plan CODE-010 rewritten around the
+five-condition rule with the regression list 0050 requires.
+
+The 0032 addendum records CODE-011 as prevention plus existing-state
+limitation documentation, with no repair or migration requirement.
+
+Updated review and plan statuses; both implementations remain pending.
+Documentation only; local links checked.
+
+## 2026-09-07 — implement CODE-010 (decision 0050's fifth condition)
+
+Added `git::remote_branch_tip`, a sibling of `remote_ref_exists` that returns
+the OID a URL advertises for `refs/heads/<branch>` via `git ls-remote
+--exit-code`. Its parser trusts only the output line whose refname field is
+an *exact* match for the query — `ls-remote` matches refnames at the tail on
+a slash boundary, so a decoy ref (e.g. `refs/heads/a/refs/heads/task`) can
+share a query with the real branch and would otherwise be able to supply the
+OID condition 5 compares against. Caught by review (see below) before
+landing, not by the first draft.
+
+Wired condition 5 into `sync_pair_to_dest_with_key`'s `ForceMirrorOnly` arm
+in `sync/mod.rs`: once `mirror_only_rewrite_detected` holds, the source
+remote's advertised tip for the branch is queried fresh on every retry
+attempt (never cached across attempts or branches) and compared to the
+local tip. Equal proceeds exactly as before. Any mismatch, missing branch,
+or query failure is decisions/0045's per-branch halt (`Outcome::Error`,
+`Ok(true)`), with a new message naming the branch, local tip, source-remote
+state, prior boundary and playbook 0003 — `unsafe_to_build_on_message` is
+not reused, this halt has a different cause. The fast-forward and
+round-tripped paths are unchanged; condition 5 is unreachable from them.
+
+Regression-first per AGENTS.md: extended the F-01 stale-clone fixture in
+`sync/tests/anchor.rs` for the fetch-without-pull shape and added a
+`tests/cli.rs` fixture with real bare source/dest remotes, both confirmed
+failing against `f1794e5` before the fix (verified independently in review
+by reverting the three changed source files and rerunning). Added coverage
+for local-ahead-of-source, branch-deleted-on-source, unreachable-source-URL,
+per-branch isolation, and the `merge --ff-only` recovery/no-op-rerun path.
+Existing genuine-reset/rebase/amend/round-tripped fixtures needed their
+placeholder `"unused"` source URLs replaced with a real self-pointing URL,
+since condition 5 now actually queries it; their original expectations are
+unchanged (confirmed by the same revert-and-rerun check).
+
+Code review (code-reviewer agent) returned APPROVE WITH CHANGES: the
+tail-matching decoy-ref gap above (CODE-001, MEDIUM — the one check the
+whole change rests on), a missing assertion that the halt names both tips
+and omits "source branch was rewritten" (TEST-002), an unbounded
+malformed-OID diagnostic inconsistent with the rest of `git.rs`'s
+`git_diagnostic` framing (CODE-003), and a doc comment overstating SHA-256
+support (INFO-004). All four fixed: the parser now requires an exact
+refname match with a regression test reproducing the decoy-line output
+against a real bare remote; `tests/cli.rs` asserts both tips appear and the
+rewrite line does not; the malformed-OID field is now routed through
+`git_diagnostic`; the doc comment corrected. INFO-005 (self-remote fixtures
+substitute for a literal third-remote fixture) and INFO-006 (diagnostic-only
+error swallow in `boundary_for_halt`) were left as informational, no code
+change.
+
+`cargo test --workspace --all-features --locked`: 412 tests passed (408
+unit + 4 `tests/cli.rs`), zero failures. `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --all-features --locked -- -D
+warnings` clean. CODE-010 is implemented; decision 0050 and playbook 0003 no
+longer describe pending work.

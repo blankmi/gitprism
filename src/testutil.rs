@@ -26,9 +26,24 @@ use std::path::Path;
 use git2::{Oid, Repository, Signature};
 use tempfile::NamedTempFile;
 
+use crate::commands::FixedSecrets;
 use crate::git::{self, PushMode};
 use crate::marker::{self, Direction as MarkerDirection};
 use crate::policy;
+
+impl FixedSecrets {
+    /// A fixture's secrets: the fixed test key, and a digest recomputed from
+    /// `config_path`/`ignore_path` on every call — see `FixedSecrets`'s own
+    /// doc comment for why that has to stay lazy rather than a single
+    /// upfront `String`.
+    pub(crate) fn for_fixture(config_path: &Path, ignore_path: &Path) -> Self {
+        Self {
+            key: marker::test_key(),
+            config_path: config_path.to_path_buf(),
+            ignore_path: ignore_path.to_path_buf(),
+        }
+    }
+}
 
 /// A bare repo with one commit on `branch` — dest is always reached over a
 /// remote URL in real use (`sync` pushes to it directly; `resolve`'s
@@ -175,7 +190,7 @@ pub(crate) fn source_grafted_onto(
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         );
         repo.commit(
             Some(&format!("refs/heads/{branch}")),

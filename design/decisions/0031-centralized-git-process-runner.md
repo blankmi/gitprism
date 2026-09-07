@@ -86,3 +86,53 @@ was.
 
 Adding a new override here requires updating this table and README's
 "Installing / building" paragraph together.
+
+# Addendum 2026-09-04 — a runner variant that writes bounded stdin
+
+PERF-001 (`docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md`) needs
+`git fetch --stdin`, which reads one refspec per line from stdin instead of
+argv — the only way to fetch a bounded but potentially large (up to
+`MAX_SOURCE_BRANCHES`, decisions/0032) list of branches over one transport
+without a command-line length limit (Windows' 32 KiB argv caps refspec
+arguments well below 4,096 names). This decision's stdin-null rule exists so
+no child can inherit an interactive stdin; it says nothing about a caller
+supplying its own, already-bounded data on a pipe.
+
+## Decision
+
+`run_git_stdin_output` is a new sibling of the runner every production
+caller already goes through: it applies the same `GIT_TERMINAL_PROMPT=0`,
+output caps, and deadline, but opens stdin as a pipe instead of
+`Stdio::null()`. The caller-supplied byte string is written to that pipe
+from its own helper thread — the same pattern the existing stdout/stderr
+capture threads already use, just in the opposite direction — and the
+thread drops its end of the pipe once the write finishes, so the child sees
+a normal EOF rather than hanging on stdin. No inherited handle (the
+operator's own stdin, or any other file descriptor) is ever connected to
+the child. Both variants now share one spawn/capture core; only how stdin is
+set up before that core runs differs.
+
+The input is bounded twice: every call site builds it from a listing already
+capped at `MAX_SOURCE_BRANCHES` (decisions/0032), and the variant itself
+refuses an input above a fixed byte ceiling before spawning anything, rather
+than trusting a caller's bound alone.
+
+## Why
+
+Git already provides the primitive (`--stdin`) for the command PERF-001
+needs it for; the alternative — refspecs as command-line arguments — has a
+real, cross-platform argv limit at exactly the branch counts this bound is
+meant to allow (decisions/0032). Writing from a helper thread mirrors the
+concurrent capture threads this decision already established, rather than
+inventing a second, different pattern for the opposite direction of a pipe.
+
+## Consequences
+
+* This variant is for a caller with fully caller-generated, already-bounded
+  input only. It does not reopen interactive stdin, and no existing
+  production caller changes — every one of them keeps going through the
+  null-stdin variant.
+* Tests exercise it directly (`src/git.rs`): exact-byte delivery, the child
+  observing EOF, an input over the byte ceiling refused before any process
+  is spawned, and that timeout/output-cap behavior is otherwise unchanged
+  from the null-stdin variant.

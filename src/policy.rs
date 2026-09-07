@@ -35,11 +35,23 @@ pub(crate) fn hash_files(config_path: &Path, ignore_path: &Path) -> Result<Strin
     Ok(digest_bytes(&config, &ignore))
 }
 
-/// Read, authenticate, and only then parse the policy files.
-pub(crate) fn load(config_path: &Path, ignore_path: &Path) -> Result<VerifiedPolicy> {
+/// Read, authenticate against `expected_digest`, and only then parse the
+/// policy files. The pin itself is a parameter, not read from the
+/// environment here — see [`expected_digest_from_env`].
+pub(crate) fn load(
+    config_path: &Path,
+    ignore_path: &Path,
+    expected_digest: &str,
+) -> Result<VerifiedPolicy> {
     let config_raw = read_control_file(config_path)?;
     let ignore_raw = read_ignore(ignore_path)?;
-    load_from_bytes(config_path, ignore_path, config_raw, ignore_raw)
+    load_from_bytes(
+        config_path,
+        ignore_path,
+        config_raw,
+        ignore_raw,
+        expected_digest,
+    )
 }
 
 pub(crate) fn load_from_bytes(
@@ -47,25 +59,22 @@ pub(crate) fn load_from_bytes(
     ignore_path: &Path,
     config_raw: Vec<u8>,
     ignore_raw: Vec<u8>,
+    expected_digest: &str,
 ) -> Result<VerifiedPolicy> {
     let digest = digest_bytes(&config_raw, &ignore_raw);
-    verify_expected_digest(&digest)?;
+    verify_digest(&digest, expected_digest)?;
 
     parse_verified_bytes(config_path, ignore_path, config_raw, ignore_raw)
 }
 
-#[cfg(test)]
-fn load_from_bytes_with_expected(
-    config_path: &Path,
-    ignore_path: &Path,
-    config_raw: Vec<u8>,
-    ignore_raw: Vec<u8>,
-    expected: &str,
-) -> Result<VerifiedPolicy> {
-    let digest = digest_bytes(&config_raw, &ignore_raw);
-    verify_digest(&digest, expected)?;
-
-    parse_verified_bytes(config_path, ignore_path, config_raw, ignore_raw)
+/// Read `GITPRISM_POLICY_SHA256` — the CLI boundary's one point of contact
+/// with the environment for this pin (decisions/0026 addendum). Always
+/// reads the real environment; tests supply the expected digest directly to
+/// [`load`]/[`load_from_bytes`] instead.
+pub(crate) fn expected_digest_from_env() -> Result<String> {
+    std::env::var(ENV_DIGEST).with_context(|| {
+        format!("{ENV_DIGEST} must be set to the policy's 64-character SHA-256 digest")
+    })
 }
 
 fn parse_verified_bytes(
@@ -279,17 +288,6 @@ pub(crate) fn digest_bytes(config: &[u8], ignore: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn verify_expected_digest(actual: &str) -> Result<()> {
-    #[cfg(test)]
-    let expected = actual.to_owned();
-    #[cfg(not(test))]
-    let expected = std::env::var(ENV_DIGEST).with_context(|| {
-        format!("{ENV_DIGEST} must be set to the policy's 64-character SHA-256 digest")
-    })?;
-
-    verify_digest(actual, &expected)
-}
-
 fn verify_digest(actual: &str, expected: &str) -> Result<()> {
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("{ENV_DIGEST} must contain exactly 64 hexadecimal characters");
@@ -474,6 +472,23 @@ mod tests {
         assert_ne!(digest, digest_bytes(b"a", b"bc"));
     }
 
+    // TEST-001 step 5: `tests/cli.rs` runs the real `policy-hash` binary over
+    // these same fixed bytes and asserts it prints this same digest. The
+    // crate has no `[lib]` target, so `tests/cli.rs` (an external
+    // integration test) can't call `digest_bytes` directly to compute the
+    // expected value itself — this constant is duplicated by value in both
+    // places, cross-referenced by comment, and this unit test is what
+    // guards it actually matches `digest_bytes`'s real output.
+    #[test]
+    fn digest_bytes_matches_the_known_answer_shared_with_tests_cli_rs() {
+        assert_eq!(
+            digest_bytes(b"config bytes\n", b"ignore bytes\n"),
+            "0dc03d353c0e6daa24478eb68ffeb59e6a65407a58dd2c8890ea18d6ac340255",
+            "if this fails because digest_bytes legitimately changed, update the \
+             same literal in tests/cli.rs's own known-answer test"
+        );
+    }
+
     #[test]
     fn missing_ignore_is_hashed_as_empty() {
         let dir = tempdir().unwrap();
@@ -492,10 +507,11 @@ mod tests {
         let ignore = dir.path().join(crate::exclude::FILENAME);
         fs::write(&config, b"not valid toml [").unwrap();
         fs::write(&ignore, b"*").unwrap();
-        // In test builds the deterministic expected digest is injected by
-        // `verify_expected_digest`, so this reaches the parser only after the
-        // hash has been computed and checked.
-        let error = match load(&config, &ignore) {
+        // A self-consistent expected digest (computed from these same
+        // bytes) reaches the parser only after the hash has been computed
+        // and checked.
+        let expected = hash_files(&config, &ignore).unwrap();
+        let error = match load(&config, &ignore, &expected) {
             Ok(_) => panic!("malformed config must fail after verification"),
             Err(error) => error,
         };
@@ -507,7 +523,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = dir.path().join(".gitprism.toml");
         let ignore = dir.path().join(crate::exclude::FILENAME);
-        let error = match load_from_bytes_with_expected(
+        let error = match load_from_bytes(
             &config,
             &ignore,
             b"not valid toml [".to_vec(),

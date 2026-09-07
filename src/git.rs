@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fmt::Write as _;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
@@ -25,6 +25,12 @@ const MAX_DIAGNOSTIC_STDERR_BYTES: usize = 1024 * 1024;
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const CAPTURE_CHUNK_BYTES: usize = 16 * 1024;
 const CAPTURE_CHANNEL_CAPACITY: usize = 16;
+/// design/decisions/0031 Addendum 2026-09-04: ceiling for
+/// [`run_git_stdin_output`]'s caller-supplied stdin, independent of any
+/// caller's own bound. Sized for `MAX_SOURCE_BRANCHES` (decisions/0032)
+/// refspec lines at a generous per-line length.
+const MAX_STDIN_LINE_BYTES: usize = 4 * 1024;
+const MAX_STDIN_BYTES: usize = MAX_STDIN_LINE_BYTES * crate::limits::MAX_SOURCE_BRANCHES;
 
 #[derive(Clone, Copy)]
 struct OutputLimits {
@@ -282,6 +288,27 @@ fn run_git_output(command: Command, limits: OutputLimits) -> Result<std::process
     run_git_output_with_timeout(command, limits, configured_git_timeout()?)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of every `git` (or fake-runner-child) subprocess actually
+    /// spawned, for PERF-001's own measurement. Thread-local, not a
+    /// process-global atomic: `cargo test` runs tests on parallel threads,
+    /// and every subprocess this runner spawns is spawned from the calling
+    /// thread, so a thread-local count is exact for one test without
+    /// serializing the suite.
+    static SUBPROCESS_SPAWN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_subprocess_spawn_count() {
+    SUBPROCESS_SPAWN_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn subprocess_spawn_count() -> usize {
+    SUBPROCESS_SPAWN_COUNT.with(|count| count.get())
+}
+
 fn configured_git_timeout() -> Result<Duration> {
     let Some(raw) = env::var_os("GITPRISM_GIT_TIMEOUT_SECONDS") else {
         return Ok(Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS));
@@ -321,12 +348,65 @@ fn run_git_output_with_timeout(
     limits: OutputLimits,
     timeout: Duration,
 ) -> Result<std::process::Output> {
+    command.stdin(Stdio::null());
+    run_spawned_git_output(command, None, limits, timeout)
+}
+
+/// Same runner as [`run_git_output_with_timeout`], for a caller that must
+/// supply its own bounded byte string on stdin instead of a null stdin
+/// (design/decisions/0031 Addendum 2026-09-04 — currently only PERF-001's
+/// `git fetch --stdin`, docs/plans/2026-09-02/PERF-001-fetch-dest-heads-once.md).
+/// `input` is written to the child's stdin from a helper thread that then
+/// drops its end of the pipe, so the child observes a normal EOF; no
+/// inherited handle is ever connected. `input` longer than
+/// [`MAX_STDIN_BYTES`] is refused before anything is spawned — a caller's own
+/// bound is not trusted alone.
+fn run_git_stdin_output(
+    mut command: Command,
+    input: &[u8],
+    limits: OutputLimits,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    if input.len() > MAX_STDIN_BYTES {
+        anyhow::bail!(
+            "git subprocess stdin input of {} bytes exceeds its {MAX_STDIN_BYTES} byte limit",
+            input.len()
+        );
+    }
+    command.stdin(Stdio::piped());
+    run_spawned_git_output(command, Some(input), limits, timeout)
+}
+
+/// Shared spawn/capture core for both [`run_git_output_with_timeout`] and
+/// [`run_git_stdin_output`]. Callers must set `command`'s `Stdio` for stdin
+/// explicitly before calling this — it does not default it, to preserve
+/// decision 0031's null-stdin invariant for every path: a future caller that
+/// forgets to set stdin would otherwise inherit the operator's real stdin
+/// instead of getting a safe default.
+fn run_spawned_git_output(
+    mut command: Command,
+    stdin_input: Option<&[u8]>,
+    limits: OutputLimits,
+    timeout: Duration,
+) -> Result<std::process::Output> {
     command
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
     let mut child = command.spawn().context("starting git subprocess")?;
+    #[cfg(test)]
+    SUBPROCESS_SPAWN_COUNT.with(|count| count.set(count.get() + 1));
+    if let Some(input) = stdin_input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("capturing git subprocess stdin")?;
+        let input = input.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+            // `stdin` drops here, closing the write end so the child sees EOF.
+        });
+    }
     let stdout = child
         .stdout
         .take()
@@ -530,6 +610,122 @@ pub(crate) fn fetch_shallow(repo_dir: &Path, url: &str, branch: &str, depth: u32
     fetch_with_depth(repo_dir, url, branch, Some(depth))
 }
 
+/// design/decisions/0049: the transient, per-run namespace
+/// [`fetch_heads_into_namespace`] lands dest heads under. Cleared at the
+/// start of every run; nothing reads it across runs; no marker or mapping
+/// state is ever stored here (decisions/0046's "no dedicated
+/// `refs/gitprism/*` mapping refs" constraint is about durable mapping
+/// state and is unaffected).
+pub(crate) const FETCHED_DEST_NAMESPACE: &str = "refs/gitprism/fetched/dest/";
+
+/// Where [`fetch_heads_into_namespace`] lands `name`'s dest head, and where
+/// a caller reads it back from via git2.
+pub(crate) fn dest_head_namespace_ref(name: &str) -> String {
+    format!("{FETCHED_DEST_NAMESPACE}{name}")
+}
+
+/// Fetches every branch in `names` from `url` in one transport
+/// (decisions/0049), landing each at [`dest_head_namespace_ref`] instead of
+/// `FETCH_HEAD` — `git fetch -q --stdin`, reading one
+/// `+refs/heads/<name>:refs/gitprism/fetched/dest/<name>` refspec line per
+/// name. `names` is expected to already be `MAX_SOURCE_BRANCHES`-bounded
+/// (the caller's own `remote_branch_names` listing); each name is still
+/// re-validated here so a caller-constructed line can never contain a
+/// newline or start with `-`. The fetch is all-or-nothing over the whole
+/// list: a name listed but deleted on `url` before this call runs fails the
+/// whole fetch with git's own "couldn't find remote ref" error, and no
+/// namespace ref is left behind for it or for any other name in the same
+/// call.
+///
+/// Every existing namespace ref is deleted first, through git2 — not `git
+/// fetch --prune`, which only prunes refs still matched by a wildcard
+/// refspec, never one built from an explicit name list — so a previous run's
+/// entries can't survive into this one. More than `MAX_SOURCE_BRANCHES`
+/// pre-existing namespace refs fails outright: gitprism itself never leaves
+/// more than that behind, so a larger count can only mean something else put
+/// them there.
+pub(crate) fn fetch_heads_into_namespace(
+    repo_dir: &Path,
+    url: &str,
+    names: &[String],
+) -> Result<()> {
+    validate_remote(url)?;
+    for name in names {
+        validate_branch_name(name)?;
+    }
+
+    let repo = git2::Repository::open(repo_dir)
+        .context("opening the local repository to clear the dest fetch namespace")?;
+    clear_dest_head_namespace(&repo)?;
+
+    // Nothing to fetch: no subprocess spawned for an empty list.
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let mut input = Vec::new();
+    for name in names {
+        input.extend_from_slice(
+            format!("+refs/heads/{name}:{}\n", dest_head_namespace_ref(name)).as_bytes(),
+        );
+    }
+
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("fetch")
+        .arg("-q")
+        .arg("--stdin")
+        .arg("--")
+        .arg(url)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_git_stdin_output(command, &input, SMALL_OUTPUT, configured_git_timeout()?)
+        .context("running git fetch --stdin against configured remote")?;
+
+    if !output.status.success() {
+        let diagnostic = git_diagnostic(&output.stderr, Some(url));
+        anyhow::bail!(
+            "git fetch --stdin against configured remote failed ({}): {diagnostic}",
+            output.status
+        );
+    }
+
+    Ok(())
+}
+
+fn clear_dest_head_namespace(repo: &git2::Repository) -> Result<()> {
+    let mut existing = Vec::new();
+    {
+        let mut references = repo
+            .references_glob(&format!("{FETCHED_DEST_NAMESPACE}*"))
+            .context("listing the existing dest fetch namespace")?;
+        for reference in &mut references {
+            let reference = reference.context("reading an existing dest fetch namespace ref")?;
+            let name = reference
+                .name()
+                .context("reading an existing dest fetch namespace ref's name")?
+                .to_string();
+            existing.push(name);
+            if existing.len() > crate::limits::MAX_SOURCE_BRANCHES {
+                anyhow::bail!(
+                    "more than {} refs already exist under {FETCHED_DEST_NAMESPACE} — something \
+                     other than gitprism put them there; delete the refs under \
+                     {FETCHED_DEST_NAMESPACE} after investigating why they exist",
+                    crate::limits::MAX_SOURCE_BRANCHES
+                );
+            }
+        }
+    }
+    for name in existing {
+        repo.find_reference(&name)
+            .with_context(|| format!("reopening dest fetch namespace ref {name:?} to delete it"))?
+            .delete()
+            .with_context(|| format!("deleting stale dest fetch namespace ref {name:?}"))?;
+    }
+    Ok(())
+}
+
 /// Whether `refspec` currently exists as a branch on `url` — a real `git
 /// ls-remote --exit-code` subprocess check, run before attempting a [`fetch`]
 /// where "doesn't exist yet" is an expected, ordinary outcome rather than a
@@ -571,13 +767,99 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
     }
 }
 
+/// The OID `url` currently advertises for `refs/heads/<branch>` —
+/// decisions/0050's condition 5. Same `ls-remote --exit-code` shape as
+/// [`remote_ref_exists`], but the advertised object id itself is the answer,
+/// not just whether the ref exists: `Some(oid)` on exit 0 with a parseable
+/// object id, `None` on exit 2 (queried, matched nothing — the branch isn't
+/// on `url`), `Err` for every other failure, including output that doesn't
+/// parse as an object id. A parse failure is never read as "no such branch"
+/// or as a match; both would let a query gitprism can't make sense of
+/// authorize a force it has no evidence for.
+pub fn remote_branch_tip(repo_dir: &Path, url: &str, branch: &str) -> Result<Option<git2::Oid>> {
+    validate_remote(url)?;
+    validate_branch_name(branch)?;
+    let refname = format!("refs/heads/{branch}");
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("ls-remote")
+        .arg("--exit-code")
+        .arg("--")
+        .arg(url)
+        .arg(&refname)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_git_output(command, SMALL_OUTPUT)
+        .context("running git ls-remote against configured remote")?;
+
+    match output.status.code() {
+        Some(0) => Ok(Some(parse_remote_branch_tip(&output.stdout, &refname)?)),
+        // git's own convention for `--exit-code`: 2 means the query
+        // succeeded but matched nothing, distinct from any other failure
+        // (bad URL, network, auth, ...).
+        Some(2) => Ok(None),
+        _ => {
+            let diagnostic = git_diagnostic(&output.stderr, Some(url));
+            anyhow::bail!(
+                "git ls-remote for branch {branch:?} against configured remote failed ({}): {diagnostic}",
+                output.status
+            )
+        }
+    }
+}
+
+/// Parses `git ls-remote`'s output for `refname`'s object id. `ls-remote
+/// <url> refs/heads/<branch>` matches that pattern at the *tail*, on a
+/// slash boundary — `refs/heads/task` also matches a ref literally named
+/// `refs/heads/a/refs/heads/task` — so a single query can return more than
+/// one line, and a remote under source's control could otherwise supply a
+/// decoy line ahead of the real one to steer decisions/0050's condition 5.
+/// This only ever trusts the line whose second, tab-separated field is
+/// *exactly* `refname`; every other line is ignored, and no exact match at
+/// all is `Err`, never a fallback to the first or only line. The object-id
+/// field is required to be a full 40-hex-character SHA-1 object id — the
+/// only length `git2::Oid::from_str` (called below) actually accepts; a
+/// 64-character SHA-256-shaped field passes this length/hex-digit gate but
+/// still fails there, surfacing as `Err`, not a match. That gate still
+/// matters on its own: it rejects a short or zero-padded hex field before
+/// it ever reaches `git2::Oid::from_str`, which would otherwise accept it.
+/// [`remote_branch_tip`]'s exit-0 case has already established the query
+/// matched something, so no matching line, or a malformed field on the
+/// matching line, is a malformed answer, not an absence.
+fn parse_remote_branch_tip(stdout: &[u8], refname: &str) -> Result<git2::Oid> {
+    let refname_bytes = refname.as_bytes();
+    let matching_line = stdout.split(|&byte| byte == b'\n').find(|line| {
+        let mut fields = line
+            .split(|byte: &u8| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        fields.next();
+        fields.next() == Some(refname_bytes)
+    });
+    let Some(line) = matching_line else {
+        anyhow::bail!("git ls-remote returned no line matching refname {refname:?}");
+    };
+    let field = line
+        .split(|byte: &u8| byte.is_ascii_whitespace())
+        .find(|field| !field.is_empty());
+    let Some(field) = field else {
+        anyhow::bail!("git ls-remote returned no advertised object id");
+    };
+    let hex = std::str::from_utf8(field).context("git ls-remote output is not valid UTF-8")?;
+    if !matches!(hex.len(), 40 | 64) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let diagnostic = git_diagnostic(field, None);
+        anyhow::bail!("git ls-remote returned an unparseable object id: {diagnostic}");
+    }
+    git2::Oid::from_str(hex).with_context(|| format!("parsing advertised object id {hex:?}"))
+}
+
 /// Every branch name currently on `url` — a real `git ls-remote --heads`
-/// subprocess, parsed by [`parse_ls_remote_heads`]. decisions/0046, F-A:
-/// mapping-index reconstruction must see a mirror-only branch's own dest
-/// ref even after its local source branch is deleted (decisions/0018 Case
-/// 2's routine post-merge cleanup) — `source`'s own branch listing cannot
-/// name a branch source no longer has, so dest itself is asked directly. A
-/// genuine `ls-remote` failure is still an `Err`.
+/// subprocess, parsed by [`parse_ls_remote_heads`]. decisions/0046 Addendum
+/// 3, Finding Q: mapping-index reconstruction must see a mirror-only
+/// branch's own dest ref even after its local source branch is deleted
+/// (decisions/0018 Case 2's routine post-merge cleanup) — `source`'s own
+/// branch listing cannot name a branch source no longer has, so dest itself
+/// is asked directly. A genuine `ls-remote` failure is still an `Err`.
 pub(crate) fn remote_branch_names(repo_dir: &Path, url: &str) -> Result<RemoteBranchListing> {
     validate_remote(url)?;
     let mut command = git_command();
@@ -1422,6 +1704,80 @@ mod tests {
     }
 
     #[test]
+    fn subprocess_runner_stdin_variant_delivers_exact_bytes_and_the_child_sees_eof() {
+        // `runner_child("stdin")` blocks on `read_to_end` until it observes
+        // EOF, so this test hanging (rather than completing within its own
+        // timeout) would itself prove a missing EOF — no separate assertion
+        // needed for that half of design/decisions/0031's addendum.
+        let input = b"+refs/heads/a:refs/gitprism/fetched/dest/a\n";
+        let output = run_git_stdin_output(
+            runner_child("stdin"),
+            input,
+            SMALL_OUTPUT,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let expected = format!("stdin-bytes={}", input.len());
+        assert!(
+            output
+                .stdout
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "expected {expected:?} in stdout, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_refuses_oversized_input_before_spawning() {
+        let oversized = vec![b'x'; MAX_STDIN_BYTES + 1];
+        let error = run_git_stdin_output(
+            // A child that would prove a spawn happened by writing to a
+            // distinguishable file is unnecessary here: `runner_child("sleep")`
+            // would hang for 60s if actually spawned, so a fast `Err` return
+            // itself demonstrates nothing was started.
+            runner_child("sleep"),
+            &oversized,
+            SMALL_OUTPUT,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("byte") && error.to_string().contains("limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_still_times_out_and_reaps_direct_child() {
+        let error = run_git_stdin_output(
+            runner_child("sleep"),
+            b"",
+            SMALL_OUTPUT,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[test]
+    fn subprocess_runner_stdin_variant_still_rejects_stdout_overflow() {
+        let error = run_git_stdin_output(
+            runner_child("stdout"),
+            b"",
+            OutputLimits {
+                stdout: 1024,
+                stderr: 1024,
+                total: 2048,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stdout output limit"));
+    }
+
+    #[test]
     fn subprocess_runner_times_out_and_reaps_direct_child() {
         // The deadline itself (well under the child's 60s sleep) is not what
         // makes this flaky on a loaded CI runner; it's process-spawn/schedule
@@ -1577,6 +1933,111 @@ mod tests {
     }
 
     #[test]
+    fn remote_branch_tip_reports_the_advertised_oid_for_a_branch_that_exists() {
+        let dest_dir = tempdir().unwrap();
+        let expected = repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        assert_eq!(
+            remote_branch_tip(
+                source_dir.path(),
+                &dest_dir.path().display().to_string(),
+                "main",
+            )
+            .expect("checking an existing branch should succeed"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn remote_branch_tip_reports_none_for_a_branch_that_does_not_exist() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        assert_eq!(
+            remote_branch_tip(
+                source_dir.path(),
+                &dest_dir.path().display().to_string(),
+                "no-such-branch",
+            )
+            .expect("checking a missing branch should succeed, just report None"),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_branch_tip_fails_loudly_against_an_unreachable_remote() {
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        let missing = source_dir.path().join("does-not-exist");
+
+        let error = remote_branch_tip(source_dir.path(), &missing.display().to_string(), "main")
+            .expect_err("an unreachable remote must be Err, never None or a guessed OID");
+        assert!(
+            !error.to_string().contains("no such branch"),
+            "an unreachable remote must never be read as \"no such branch\": {error}"
+        );
+    }
+
+    #[test]
+    fn parse_remote_branch_tip_rejects_output_that_does_not_parse_as_an_object_id() {
+        assert!(
+            parse_remote_branch_tip(b"", "refs/heads/main").is_err(),
+            "empty output must be Err"
+        );
+        assert!(
+            parse_remote_branch_tip(b"not-an-oid\trefs/heads/main\n", "refs/heads/main").is_err(),
+            "non-hex output must be Err"
+        );
+        assert!(
+            parse_remote_branch_tip(b"deadbeef\trefs/heads/main\n", "refs/heads/main").is_err(),
+            "a short hex field must be Err, not truncated into a real OID"
+        );
+    }
+
+    #[test]
+    fn parse_remote_branch_tip_accepts_a_well_formed_ls_remote_line() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            parse_remote_branch_tip(
+                format!("{sha1}\trefs/heads/main\n").as_bytes(),
+                "refs/heads/main"
+            )
+            .unwrap(),
+            git2::Oid::from_str(sha1).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_remote_branch_tip_ignores_a_decoy_line_matching_the_query_only_at_the_tail() {
+        // `git ls-remote <url> refs/heads/task` matches refname patterns at
+        // the tail, on a slash boundary, so a ref literally named
+        // `refs/heads/a/refs/heads/task` also matches and can be returned
+        // ahead of the real `refs/heads/task` line — reproduced for real
+        // against a local bare remote with both refs pushed:
+        //
+        //   e042d1e...  refs/heads/a/refs/heads/task
+        //   5b8b2a3...  refs/heads/task
+        //
+        // Only the line whose refname field is the exact query may supply
+        // the OID.
+        let decoy = "4e571a683ee217067e44089f64b64a8d890c395b";
+        let real = "5b8b2a3d418d31373725f8c436300a0b07dd4306";
+        let stdout = format!("{decoy}\trefs/heads/a/refs/heads/task\n{real}\trefs/heads/task\n");
+
+        assert_eq!(
+            parse_remote_branch_tip(stdout.as_bytes(), "refs/heads/task").unwrap(),
+            git2::Oid::from_str(real).unwrap(),
+            "a decoy line matching only at the tail must never supply the OID"
+        );
+    }
+
+    #[test]
     fn fetch_fails_loudly_on_an_unknown_ref() {
         let dest_dir = tempdir().unwrap();
         repo_with_a_commit_on(dest_dir.path(), "main");
@@ -1635,6 +2096,252 @@ mod tests {
         assert!(
             source_repo.is_shallow(),
             "a --depth=1 fetch must leave the clone shallow"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_lands_every_listed_branch_and_skips_an_unlisted_one() {
+        let dest_dir = tempdir().unwrap();
+        let main_tip = repo_with_a_commit_on(dest_dir.path(), "main");
+        let other_tip = repo_with_a_commit_on(dest_dir.path(), "other");
+        repo_with_a_commit_on(dest_dir.path(), "unlisted");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string(), "other".to_string()],
+        )
+        .expect("fetching two existing branches into the namespace should succeed");
+
+        assert_eq!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("main"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            main_tip
+        );
+        assert_eq!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("other"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            other_tip
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("unlisted"))
+                .is_err(),
+            "a branch dest has but the caller didn't list must not land in the namespace"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_fails_and_leaves_no_ref_when_a_listed_branch_is_deleted_before_the_fetch()
+     {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        // HEAD must point elsewhere before "main" can be deleted.
+        repo_with_a_commit_on(dest_dir.path(), "unused");
+        dest_repo.set_head("refs/heads/unused").unwrap();
+        dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        let error = fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string()],
+        )
+        .expect_err("a listed branch deleted before the fetch must fail the whole fetch");
+
+        assert!(
+            error.to_string().contains("couldn't find remote ref")
+                || format!("{error:#}").contains("couldn't find remote ref"),
+            "expected git's own missing-ref message, got: {error:#}"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("main"))
+                .is_err(),
+            "a failed bulk fetch must leave no namespace ref behind"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_leaves_no_ref_for_any_listed_name_when_one_of_several_is_deleted_before_the_fetch()
+     {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+        repo_with_a_commit_on(dest_dir.path(), "other");
+        let dest_repo = Repository::open(dest_dir.path()).unwrap();
+        // HEAD must point elsewhere before "main" can be deleted.
+        repo_with_a_commit_on(dest_dir.path(), "unused");
+        dest_repo.set_head("refs/heads/unused").unwrap();
+        dest_repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        let error = fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string(), "other".to_string()],
+        )
+        .expect_err(
+            "one of several listed branches deleted before the fetch must fail the whole fetch",
+        );
+
+        assert!(
+            error.to_string().contains("couldn't find remote ref")
+                || format!("{error:#}").contains("couldn't find remote ref"),
+            "expected git's own missing-ref message, got: {error:#}"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("main"))
+                .is_err(),
+            "a bulk fetch failure must leave no namespace ref behind for the deleted name"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("other"))
+                .is_err(),
+            "a bulk fetch failure must leave no namespace ref behind for any other listed name, \
+             not just the one that was actually deleted"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_round_trips_an_unusual_but_valid_branch_name() {
+        let dest_dir = tempdir().unwrap();
+        let tip = repo_with_a_commit_on(dest_dir.path(), "a/b.c-d");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+
+        fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["a/b.c-d".to_string()],
+        )
+        .expect("an unusual but valid branch name must round-trip");
+
+        assert_eq!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("a/b.c-d"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            tip
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_bails_before_any_fetch_when_more_than_the_branch_limit_of_namespace_refs_already_exist()
+     {
+        let source_dir = tempdir().unwrap();
+        let tip = repo_with_a_commit_on(source_dir.path(), "carrier");
+        let source_repo = Repository::open(source_dir.path()).unwrap();
+        for index in 0..crate::limits::MAX_SOURCE_BRANCHES + 1 {
+            source_repo
+                .reference(
+                    &dest_head_namespace_ref(&format!("stale{index:05}")),
+                    tip,
+                    false,
+                    "stand-in for refs left by something other than gitprism",
+                )
+                .unwrap();
+        }
+
+        let error = fetch_heads_into_namespace(
+            source_dir.path(),
+            "/nonexistent/not-a-remote",
+            &["main".to_string()],
+        )
+        .expect_err("more than MAX_SOURCE_BRANCHES pre-existing namespace refs must bail");
+
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::limits::MAX_SOURCE_BRANCHES.to_string()),
+            "expected the overflow bail to name the limit, got: {error:#}"
+        );
+        assert_eq!(
+            source_repo
+                .references_glob(&format!("{FETCHED_DEST_NAMESPACE}*"))
+                .unwrap()
+                .count(),
+            crate::limits::MAX_SOURCE_BRANCHES + 1,
+            "a bail before any deletion or fetch must leave every pre-existing ref untouched"
+        );
+    }
+
+    #[test]
+    fn fetch_heads_into_namespace_removes_a_stale_ref_from_a_previous_runs_namespace() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        let source_repo = Repository::init(source_dir.path()).unwrap();
+        let stale_tip = repo_with_a_commit_on(source_dir.path(), "stale-carrier");
+        source_repo
+            .reference(
+                &dest_head_namespace_ref("deleted-on-dest"),
+                stale_tip,
+                false,
+                "stand-in for a previous run's namespace entry",
+            )
+            .unwrap();
+        // A nested name (as `a/b.c-d` round-trips as a namespace ref) must be
+        // cleared by the glob just as readily as a flat one — the glob walks
+        // `refs/gitprism/fetched/dest/*` and a naive non-recursive match
+        // could miss a nested leaf.
+        source_repo
+            .reference(
+                &dest_head_namespace_ref("a/b"),
+                stale_tip,
+                false,
+                "stand-in for a previous run's nested namespace entry",
+            )
+            .unwrap();
+
+        fetch_heads_into_namespace(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            &["main".to_string()],
+        )
+        .expect("fetching this run's list must succeed regardless of a stale namespace ref");
+
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("deleted-on-dest"))
+                .is_err(),
+            "a stale ref from a previous run's namespace must be cleared before this run's fetch"
+        );
+        assert!(
+            source_repo
+                .find_reference(&dest_head_namespace_ref("a/b"))
+                .is_err(),
+            "a nested stale ref from a previous run's namespace must be cleared too, not just a \
+             flat name"
         );
     }
 

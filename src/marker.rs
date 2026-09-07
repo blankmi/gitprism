@@ -6,12 +6,9 @@
 //! over the complete commit shape and the pair-specific mapping, so copied,
 //! edited, or forged trailers cannot move a resume boundary.
 
-#[cfg(not(test))]
 use std::env;
 
-#[cfg(not(test))]
-use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use git2::{Commit, Oid, Signature};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -27,6 +24,9 @@ const MAC_BYTES: usize = 32;
 
 /// A validated pair key. Keeping the bytes in a private type prevents
 /// callers from accidentally logging or passing the raw secret to git.
+/// `Clone`/`Copy` are plain byte-array derives — deliberately not `Debug` or
+/// `Display`, so the secret still can't be accidentally logged.
+#[derive(Clone, Copy)]
 pub(crate) struct StateKey([u8; KEY_BYTES]);
 
 /// The authenticated direction of a generated commit.
@@ -61,33 +61,38 @@ pub(crate) struct ParsedMarker {
     pub(crate) body: String,
 }
 
-/// Read and validate the external state key. Tests use a fixed key so unit
-/// and repository fixtures do not race on process-global environment state.
-pub(crate) fn load_key() -> Result<StateKey> {
-    #[cfg(test)]
-    let raw = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    #[cfg(not(test))]
+/// The fixed key unit and fixture tests use, so they don't race on
+/// process-global environment state.
+#[cfg(test)]
+const TEST_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+/// Read and validate `GITPRISM_STATE_KEY`. Always reads the real
+/// environment, on every call — tests that need a key use [`test_key`]
+/// instead, so there is nothing left here to fork on `cfg(test)`.
+pub(crate) fn load_key_from_env() -> Result<StateKey> {
     let raw = env::var(ENV_KEY)
         .with_context(|| format!("{ENV_KEY} must be set to exactly 64 hexadecimal characters"))?;
-    #[cfg(test)]
-    {
-        parse_key(raw)
-    }
-    #[cfg(not(test))]
-    {
-        parse_key(&raw)
-    }
+    StateKey::from_hex(&raw)
 }
 
-fn parse_key(raw: &str) -> Result<StateKey> {
-    if raw.len() != KEY_BYTES * 2 {
-        anyhow::bail!("{ENV_KEY} must contain exactly 64 hexadecimal characters")
+/// The fixed key unit and fixture tests use directly, without going through
+/// `GITPRISM_STATE_KEY` at all.
+#[cfg(test)]
+pub(crate) fn test_key() -> StateKey {
+    StateKey::from_hex(TEST_KEY_HEX).expect("the fixed test key is valid hex")
+}
+
+impl StateKey {
+    pub(crate) fn from_hex(raw: &str) -> Result<StateKey> {
+        if raw.len() != KEY_BYTES * 2 {
+            anyhow::bail!("{ENV_KEY} must contain exactly 64 hexadecimal characters")
+        }
+        let mut key = [0; KEY_BYTES];
+        for (index, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            key[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
+        }
+        Ok(StateKey(key))
     }
-    let mut key = [0; KEY_BYTES];
-    for (index, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        key[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
-    }
-    Ok(StateKey(key))
 }
 
 fn hex_value(value: u8) -> Result<u8> {
@@ -382,9 +387,9 @@ mod tests {
 
     #[test]
     fn key_validation_requires_exactly_64_hex_chars() {
-        assert!(parse_key(&"00".repeat(32)).is_ok());
-        assert!(parse_key("00").is_err());
-        assert!(parse_key(&format!("{}g", "0".repeat(63))).is_err());
+        assert!(StateKey::from_hex(&"00".repeat(32)).is_ok());
+        assert!(StateKey::from_hex("00").is_err());
+        assert!(StateKey::from_hex(&format!("{}g", "0".repeat(63))).is_err());
     }
 
     #[test]
@@ -400,7 +405,7 @@ mod tests {
             oid,
             &Signature::now("a", "a@example.com").unwrap(),
             &Signature::now("c", "c@example.com").unwrap(),
-            &load_key().unwrap(),
+            &test_key(),
         );
         assert!(parse(&format!("Gitprism-State: v1\n{message}")).is_none());
         assert!(parse("Gitprism-State: v1\nGitprism-State: v1\nGitprism-Direction: setup\nGitprism-Counterpart: 0000000000000000000000000000000000000000\nGitprism-MAC: 00").is_none());
@@ -427,7 +432,7 @@ mod tests {
             repo.find_tree(builder.write().unwrap()).unwrap()
         };
         let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
-        let key = load_key().unwrap();
+        let key = test_key();
         let counterpart = Oid::ZERO_SHA1;
         let valid_message = build_message(
             "setup",
@@ -535,7 +540,7 @@ mod tests {
             .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
             .unwrap();
         let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
-        let key = load_key().unwrap();
+        let key = test_key();
         let valid_message = build_message(
             "body",
             Direction::DestToSource,

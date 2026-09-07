@@ -457,18 +457,18 @@ pub(super) fn dest_resume_point(
     source_tip: Oid,
     dest_tip: Oid,
 ) -> Result<Option<Oid>> {
-    let key = marker::load_key()?;
+    let key = marker::test_key();
     dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)
 }
 
-/// decisions/0039: positively identifies a rewritten mirror-only source
-/// branch — a state checked directly by four conditions, not inferred from
-/// exhausted retries. Callable only once [`dest_resume_point_for_branch`]
-/// has already refused (returned `Ok(None)`) for this `(source_tip,
-/// dest_tip)` pair; the caller is also responsible for condition 1
-/// (mirror-only — absent from `config.branches`) and condition 2
-/// (`dest_ref_exists`), since both are already known at the one call site
-/// this is used from. This function checks the remaining two:
+/// decisions/0039 (amended by decisions/0050): positively identifies a
+/// rewritten mirror-only source branch — a state checked directly by four
+/// conditions here, not inferred from exhausted retries. Callable only once
+/// [`dest_resume_point_for_branch`] has already refused (returned
+/// `Ok(None)`) for this `(source_tip, dest_tip)` pair; the caller is also
+/// responsible for condition 1 (mirror-only — absent from `config.branches`)
+/// and condition 2 (`dest_ref_exists`), since both are already known at the
+/// one call site this is used from. This function checks the remaining two:
 ///
 /// 3. a previous gitprism marker is found on dest's own history — Case 1 or
 ///    Case 3 of [`dest_tip_accounted_for`] ("a prior sync genuinely
@@ -489,6 +489,14 @@ pub(super) fn dest_resume_point(
 /// *complete* — see the amendment for why `Repository::is_shallow` doesn't
 /// prove otherwise). Any other `find_commit` failure is a real error and
 /// propagates as `Err`, never guessed either way.
+///
+/// A `true` result here is still not authorization to force: decisions/0050
+/// adds a fifth condition — this clone's `source_tip` must also equal the
+/// OID the *source remote* currently advertises for `branch` — checked by
+/// the caller (`sync::mod`'s `ForceMirrorOnly` arm) against
+/// [`crate::git::remote_branch_tip`], since it needs the retry loop's
+/// per-attempt dest tip and a live network read this function deliberately
+/// stays free of.
 pub(super) fn mirror_only_rewrite_detected(
     repo: &Repository,
     source_tip: Oid,
@@ -580,67 +588,33 @@ pub(super) fn dest_ref_exists_cached(
     Ok(exists)
 }
 
-/// Fetches `branch`'s dest head for [`reconstruct_mapping_index`], resolving
-/// the decisions/0046 Addendum 2, Finding G list/fetch race: `branch` was
-/// advertised by reconstruction's own initial listing, but another writer
-/// may have deleted it before this call runs. On a fetch failure, the dest
-/// listing is refreshed at most once per run (via `refreshed_listing`,
-/// shared across every branch this run reconstructs) and the two outcomes
-/// are handled differently on purpose. A branch absent from the refreshed
-/// listing is fully recovered — *if* that listing can actually support "dest
-/// has no branch by this name" (decisions/0047 addendum:
-/// `can_establish_absence()`, true unless the branch-limit horizon was hit —
-/// an unrelated undecodable ref elsewhere never blocks this, since it
-/// doesn't stop the scan and can't be `branch` itself). Any other fetch
-/// failure — auth, network, transport, a corrupt remote, the branch still
-/// being advertised, or the listing unable to establish absence — propagates
-/// instead: silently skipping it would leave the mapping index incomplete
-/// while every other branch's lookup still believed it complete, the exact
-/// "a visible mapping hides an unscanned contradiction" hole Addendum 1
-/// closed. A per-branch halt is the right shape for a per-branch fact;
-/// reconstruction's completeness is a whole-run fact.
-pub(super) fn fetch_dest_head_for_reconstruction(
-    repo: &Repository,
-    source_root: &Path,
-    dest_url: &str,
-    branch: &str,
-    run_cache: &mut RunCache,
-    refreshed_listing: &mut Option<git::RemoteBranchListing>,
-) -> Result<Option<Oid>> {
-    let fetch_err = match git::fetch(source_root, dest_url, branch) {
-        Ok(()) => {
-            let tip = repo
-                .find_reference("FETCH_HEAD")
-                .context("reading FETCH_HEAD after fetching a destination branch")?
+/// Reads `branch`'s dest head back from decisions/0049's transient fetch
+/// namespace (`refs/gitprism/fetched/dest/<branch>`), populated by
+/// [`git::fetch_heads_into_namespace`] just before this is called. `Ok(None)`
+/// means no ref exists there for `branch` — expected only for a branch that
+/// was never part of the bulk fetch's own name list in the first place (see
+/// [`reconstruct_mapping_index`]'s caller of this function for when that's
+/// legitimate); any other read failure propagates.
+fn dest_head_from_namespace(repo: &Repository, branch: &str) -> Result<Option<Oid>> {
+    match repo.find_reference(&git::dest_head_namespace_ref(branch)) {
+        Ok(reference) => Ok(Some(
+            reference
                 .peel_to_commit()
-                .context("resolving a fetched destination branch to a commit")?
-                .id();
-            return Ok(Some(tip));
-        }
-        Err(err) => err,
-    };
-    if refreshed_listing.is_none() {
-        *refreshed_listing = Some(
-            git::remote_branch_names(source_root, dest_url)
-                .context("refreshing the dest branch listing after a fetch failure")?,
-        );
+                .with_context(|| format!("resolving destination branch {branch:?}'s fetched head"))?
+                .id(),
+        )),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!("reading destination branch {branch:?}'s fetched head from the dest namespace")
+        }),
     }
-    let listing = refreshed_listing.as_ref().expect("just populated above");
-    if listing.completeness.can_establish_absence()
-        && !listing.names.iter().any(|name| name == branch)
-    {
-        run_cache.dest_ref_exists.insert(branch.to_string(), false);
-        return Ok(None);
-    }
-    Err(fetch_err.context(format!(
-        "fetching destination branch {branch:?} from configured remote"
-    )))
 }
 
 pub(super) fn reconstruct_mapping_index(
     repo: &Repository,
     source_root: &Path,
     dest_url: &str,
+    dest_listing: &git::RemoteBranchListing,
     source_branches: &[String],
     key: &marker::StateKey,
     run_cache: &mut RunCache,
@@ -658,13 +632,16 @@ pub(super) fn reconstruct_mapping_index(
             Ok((branch.clone(), tip))
         })
         .collect::<Result<Vec<_>>>()?;
-    // decisions/0046, F-A: a mirror-only branch's dest ref must still
-    // contribute its own SourceToDest mappings once its local source branch
-    // is deleted (decisions/0018 Case 2's routine post-merge cleanup) —
-    // `source_branches` can no longer name it, so dest's actual branches are
-    // asked for directly rather than inferred from what source still has.
+    // decisions/0046 Addendum 3, Finding Q: a mirror-only branch's dest ref
+    // must still contribute its own SourceToDest mappings once its local
+    // source branch is deleted (decisions/0018 Case 2's routine post-merge
+    // cleanup) — `source_branches` can no longer name it, so dest's actual
+    // branches are asked for directly rather than inferred from what source
+    // still has.
     let mut dest_branch_names = source_branches.to_vec();
-    let dest_listing = git::remote_branch_names(source_root, dest_url)?;
+    // decisions/0049: the listing and its bulk fetch into the transient dest
+    // namespace both happen once in `run`, before either sync phase, and are
+    // shared with dest→source — not repeated here.
     // Existence for every listed name — and, when the listing can establish
     // absence, non-existence for every source branch it didn't list — is now
     // known from this one subprocess, recorded into the same cache
@@ -693,20 +670,35 @@ pub(super) fn reconstruct_mapping_index(
     }
 
     let mut dest_heads = Vec::new();
-    let mut refreshed_listing = None;
     for branch in &dest_branch_names {
         if !dest_ref_exists_cached(source_root, dest_url, branch, run_cache)? {
             continue;
         }
-        if let Some(tip) = fetch_dest_head_for_reconstruction(
-            repo,
-            source_root,
-            dest_url,
-            branch,
-            run_cache,
-            &mut refreshed_listing,
-        )? {
-            dest_heads.push((branch.clone(), tip));
+        match dest_head_from_namespace(repo, branch)? {
+            Some(tip) => dest_heads.push((branch.clone(), tip)),
+            None if dest_listing.names.iter().any(|name| name == branch) => {
+                // The bulk fetch above is all-or-nothing over its whole name
+                // list (decisions/0049): if it succeeded at all, every name
+                // in `dest_listing.names` has a namespace ref. Reaching here
+                // for one of those names is an internal inconsistency, not a
+                // legitimate absence.
+                anyhow::bail!(
+                    "destination branch {branch:?} was fetched into the dest namespace but its \
+                     ref is missing there afterward"
+                );
+            }
+            None => {
+                // Not part of the bulk fetch's own name list at all: only
+                // reachable when the listing hit `MAX_SOURCE_BRANCHES` (so
+                // `dest_ref_exists_cached` above fell back to a live
+                // `remote_ref_exists` check for a source branch beyond the
+                // horizon) and that check found a dest ref anyway. The same
+                // horizon already makes this reconstruction incomplete
+                // (`note_incomplete_reconstruction` below), which taints
+                // every exact lookup regardless — fetching this one branch's
+                // head individually would not make any lookup usable, so it
+                // is skipped instead of reintroducing a per-branch fetch.
+            }
         }
     }
     let mut index = MappingIndex::reconstruct(repo, &source_heads, &dest_heads, key)?;
@@ -722,13 +714,13 @@ pub(super) fn reconstruct_mapping_index(
     Ok(index)
 }
 
-/// `branch` is excluded from canonicalization (decisions/0046, F-C):
-/// `branch`'s own rewrite is what's being anchored here, so a mapping whose
-/// only provenance is `branch` itself is that branch's own now-discarded
-/// chain, never a valid anchor for its own rebuild — matching main's old
-/// `if candidate == branch { continue; }` sibling-search exclusion, applied
-/// at both of this function's own call sites (a brand-new branch's first
-/// mirror, and a detected mirror-only rewrite's rebuild).
+/// `branch` is excluded from canonicalization (decisions/0046 Addendum 3,
+/// Finding S): `branch`'s own rewrite is what's being anchored here, so a
+/// mapping whose only provenance is `branch` itself is that branch's own
+/// now-discarded chain, never a valid anchor for its own rebuild — matching
+/// main's old `if candidate == branch { continue; }` sibling-search
+/// exclusion, applied at both of this function's own call sites (a brand-new
+/// branch's first mirror, and a detected mirror-only rewrite's rebuild).
 pub(super) fn dest_anchor_for_branch(
     repo: &Repository,
     source_tip: Oid,

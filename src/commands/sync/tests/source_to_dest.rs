@@ -210,7 +210,7 @@ fn run_does_not_reflect_a_dest_originated_commit_back_to_dest() {
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     source_repo
         .commit(

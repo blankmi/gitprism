@@ -517,7 +517,7 @@ mod tests {
             tree,
             signature,
             signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     }
 
@@ -538,7 +538,7 @@ mod tests {
             tree,
             signature,
             signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     }
 
@@ -571,7 +571,7 @@ mod tests {
             &signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let error = dest_to_source_boundary(&repo, source_tip, root, "main", &key).unwrap_err();
         assert!(
             format!("{error:#}").contains("isn't an ancestor of dest's current tip"),
@@ -639,7 +639,7 @@ mod tests {
             &source_boundary_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let error =
             dest_to_source_boundary(&repo, source_tip, old_mirror, "main", &key).unwrap_err();
         assert!(
@@ -687,7 +687,7 @@ mod tests {
             &b2_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let boundary = dest_to_source_boundary(&repo, source_tip, b2, "main", &key).unwrap();
         assert_eq!(
             boundary, b2,
@@ -770,7 +770,7 @@ mod tests {
             &source_boundary_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let boundary = dest_to_source_boundary(&repo, source_tip, b1, "main", &key).unwrap();
         assert_eq!(
             boundary, b1,
@@ -817,7 +817,7 @@ mod tests {
             );
         }
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let error =
             dest_to_source_boundary_bounded(&repo, source_tip, tip, "main", &key, 5).unwrap_err();
         assert!(
@@ -892,7 +892,7 @@ mod tests {
             &case_one_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let boundary =
             dest_to_source_boundary(&repo, source_tip, case_one_marker, "main", &key).unwrap();
         assert_eq!(
@@ -986,7 +986,7 @@ mod tests {
             &case_one_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let boundary =
             dest_to_source_boundary(&repo, source_tip, case_one_marker, "main", &key).unwrap();
         assert_eq!(
@@ -1050,7 +1050,7 @@ mod tests {
             &import_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let boundary = dest_to_source_boundary(&repo, source_tip, native, "main", &key).unwrap();
         assert_eq!(
             boundary, native,
@@ -1110,7 +1110,7 @@ mod tests {
             &d_signature,
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let boundary = dest_to_source_boundary(&repo, source_tip, d, "main", &key).unwrap();
         assert_eq!(
             boundary, b1,
@@ -1171,7 +1171,7 @@ mod tests {
             "a merge that carries b1 as its second parent",
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let error = dest_to_source_boundary(&repo, source_tip, merge, "main", &key).unwrap_err();
         let message = format!("{error:#}");
         assert!(
@@ -1236,7 +1236,7 @@ mod tests {
             "a customer commit needing case 2",
         );
 
-        let key = marker::load_key().unwrap();
+        let key = marker::test_key();
         let error = dest_to_source_boundary_bounded(&repo, source_tip, native, "main", &key, 5)
             .unwrap_err();
         assert!(

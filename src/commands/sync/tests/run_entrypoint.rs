@@ -22,6 +22,39 @@ fn run_reports_the_repository_error_for_a_wrong_cwd_not_the_state_key_error() {
     );
 }
 
+// TEST-001 review fix (MEDIUM): the test above runs through `run` (the
+// `#[cfg(test)]` `FixedSecrets` shim), whose `state_key()` is infallible —
+// repository-discovery-before-key ordering can't actually fail on the key
+// there, so it proves nothing about production's `run_with` + `EnvSecrets`
+// path. This exercises that path directly, with both env vars unset,
+// against a directory that is not a git repository at all.
+#[test]
+fn run_with_reports_the_repository_error_for_a_wrong_cwd_not_the_key_or_pin_error() {
+    let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+    unsafe {
+        std::env::remove_var("GITPRISM_STATE_KEY");
+        std::env::remove_var("GITPRISM_POLICY_SHA256");
+    }
+
+    let dir = tempdir().unwrap();
+
+    let error = run_with(
+        dir.path(),
+        Path::new(".gitprism.toml"),
+        &crate::commands::EnvSecrets,
+    )
+    .expect_err("running outside any git repository must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("must be run inside an existing git repository"),
+        "expected the repository-discovery error, got: {message}"
+    );
+    assert!(
+        !message.contains("GITPRISM_STATE_KEY") && !message.contains("GITPRISM_POLICY_SHA256"),
+        "the repository error must not be shadowed by a key/pin complaint: {message}"
+    );
+}
+
 #[test]
 fn run_succeeds_without_a_source_url_when_nothing_needs_pushing_to_source() {
     let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
@@ -549,5 +582,194 @@ fn list_source_branches_warns_about_and_skips_a_non_utf8_branch_name() {
         skipped[0].reason.contains("non-UTF-8"),
         "the skip reason must explain why: {}",
         skipped[0].reason
+    );
+}
+
+// TEST-001: the env-reading entry point (`run_with` with `EnvSecrets`)
+// must actually enforce `GITPRISM_STATE_KEY`/`GITPRISM_POLICY_SHA256`,
+// refusing before any fetch or ref mutation.
+
+fn clear_pin_env_vars() {
+    unsafe {
+        std::env::remove_var("GITPRISM_STATE_KEY");
+        std::env::remove_var("GITPRISM_POLICY_SHA256");
+    }
+}
+
+#[test]
+fn run_refuses_without_a_state_key_env_var_and_leaves_no_side_effects() {
+    let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+    clear_pin_env_vars();
+
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "1")]);
+
+    let source_dir = tempdir().unwrap();
+    source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    // `source_grafted_onto` itself performs a real fetch while building the
+    // graft — clear its FETCH_HEAD so the assertion below actually proves
+    // this call made no fetch of its own, not just that the fixture's own
+    // setup fetch survived.
+    let _ = fs::remove_file(source_dir.path().join(".git/FETCH_HEAD"));
+    let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+    let expected_digest = crate::policy::hash_files(
+        config.path(),
+        &source_dir.path().join(crate::exclude::FILENAME),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
+    }
+
+    let error = run_with(
+        source_dir.path(),
+        config.path(),
+        &crate::commands::EnvSecrets,
+    )
+    .expect_err("an unset state key must refuse before any fetch or mutation");
+    assert!(
+        error.to_string().contains("GITPRISM_STATE_KEY"),
+        "error must name the missing variable: {error}"
+    );
+
+    let dest_tip_after = dest_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(dest_tip_after, dest_tip, "dest's refs must be unchanged");
+    assert!(
+        !source_dir.path().join(".git/FETCH_HEAD").exists(),
+        "no fetch must have happened before the key check"
+    );
+    assert!(
+        !source_dir.path().join(".git/gitprism.lock").exists(),
+        "no operation lock must have been created before the key check"
+    );
+
+    clear_pin_env_vars();
+}
+
+#[test]
+fn run_refuses_with_a_wrong_policy_digest_and_leaves_no_side_effects() {
+    let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+    clear_pin_env_vars();
+
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "1")]);
+
+    let source_dir = tempdir().unwrap();
+    source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    // `source_grafted_onto` itself performs a real fetch while building the
+    // graft — clear its FETCH_HEAD so the assertion below actually proves
+    // this call made no fetch of its own, not just that the fixture's own
+    // setup fetch survived.
+    let _ = fs::remove_file(source_dir.path().join(".git/FETCH_HEAD"));
+    let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+    unsafe {
+        std::env::set_var(
+            "GITPRISM_STATE_KEY",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        // Valid-looking (64 hex characters) but wrong.
+        std::env::set_var("GITPRISM_POLICY_SHA256", "a".repeat(64));
+    }
+
+    let error = run_with(
+        source_dir.path(),
+        config.path(),
+        &crate::commands::EnvSecrets,
+    )
+    .expect_err("a wrong policy digest must refuse before any fetch or mutation");
+    assert!(
+        error.to_string().contains("does not match"),
+        "error must say the pin does not match: {error}"
+    );
+
+    let dest_tip_after = dest_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(dest_tip_after, dest_tip, "dest's refs must be unchanged");
+    assert!(
+        !source_dir.path().join(".git/FETCH_HEAD").exists(),
+        "no fetch must have happened before the policy check"
+    );
+    assert!(
+        !source_dir.path().join(".git/gitprism.lock").exists(),
+        "no operation lock must have been created before the policy check"
+    );
+
+    clear_pin_env_vars();
+}
+
+#[test]
+fn run_succeeds_with_correct_state_key_and_policy_digest_env_vars() {
+    let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+    clear_pin_env_vars();
+
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "1")]);
+
+    let source_dir = tempdir().unwrap();
+    source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+    let expected_digest = crate::policy::hash_files(
+        config.path(),
+        &source_dir.path().join(crate::exclude::FILENAME),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var(
+            "GITPRISM_STATE_KEY",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        std::env::set_var("GITPRISM_POLICY_SHA256", &expected_digest);
+    }
+
+    run_with(
+        source_dir.path(),
+        config.path(),
+        &crate::commands::EnvSecrets,
+    )
+    .expect("correct env vars must let the real env-reading path run to completion");
+
+    clear_pin_env_vars();
+}
+
+// TEST-001 step 3: sync's own precedence — a missing state key is reported
+// before a missing config file, since sync reads the key before loading
+// and verifying policy.
+#[test]
+fn run_reports_a_missing_state_key_before_a_missing_config_file() {
+    let _guard = crate::config::ENV_VAR_LOCK.lock().unwrap();
+    clear_pin_env_vars();
+
+    let source_dir = tempdir().unwrap();
+    Repository::init(source_dir.path()).unwrap();
+    // No .gitprism.toml written at all.
+
+    let error = run_with(
+        source_dir.path(),
+        Path::new(crate::config::FILENAME),
+        &crate::commands::EnvSecrets,
+    )
+    .expect_err("a missing state key must refuse before the config file is ever read");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("GITPRISM_STATE_KEY"),
+        "expected the state-key error, got: {message}"
+    );
+    assert!(
+        !message.contains("config"),
+        "the state-key error must not be shadowed by a config-reading complaint: {message}"
     );
 }

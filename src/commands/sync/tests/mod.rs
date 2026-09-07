@@ -165,7 +165,7 @@ fn add_dest_marker_commit(repo: &Repository, branch: &str, parent: Oid, counterp
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     let oid = repo
         .commit(
@@ -293,7 +293,7 @@ fn add_independent_dest_commit(
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     } else {
         message.to_owned()
@@ -345,7 +345,7 @@ fn add_independent_dest_commit_on(
             tree.id(),
             &signature,
             &signature,
-            &marker::load_key().unwrap(),
+            &marker::test_key(),
         )
     } else {
         message.to_owned()
@@ -393,7 +393,7 @@ fn add_source_marker_commit_on_dest(
         tree.id(),
         &signature,
         &signature,
-        &marker::load_key().unwrap(),
+        &marker::test_key(),
     );
     dest_repo
         .commit(
@@ -424,7 +424,7 @@ fn sync_pair_to_dest(
     reporter: &Reporter,
     run_cache: &mut RunCache,
 ) -> Result<bool> {
-    let key = marker::load_key()?;
+    let key = marker::test_key();
     let source_tip = repo
         .find_branch(branch, git2::BranchType::Local)?
         .get()
@@ -438,18 +438,25 @@ fn sync_pair_to_dest(
         std::fs::read_to_string(source_root.join(exclude::FILENAME)).unwrap_or_default();
     // decisions/0046: `run` builds the mapping index exactly once, from the
     // current repo/dest state, before any branch is processed — the one
-    // init site F-B moved the old lazy-rebuild-on-`None` into. This test-only
-    // wrapper calls a single branch at a time rather than scheduling a whole
+    // init site Finding R moved the old lazy-rebuild-on-`None` into. This
+    // test-only wrapper calls a single branch at a time rather than
+    // scheduling a whole
     // run, so it stands in for that init site itself, rebuilding fresh from
     // the current state on every call. A test that needs the "built once,
     // carried across several branches in one run" invariant under test calls
     // `run` directly instead (see `tests::anchor`'s scheduling tests).
     let dest_url = config.dest_url()?;
     let (source_branches, _skipped) = list_source_branches(repo)?;
+    // decisions/0049: `run` builds this listing/namespace pair once up
+    // front too; rebuilt fresh here for the same reason the mapping index
+    // above is.
+    let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(source_root, &dest_url, &dest_listing.names)?;
     run_cache.mapping_index = reconstruct_mapping_index(
         repo,
         source_root,
         &dest_url,
+        &dest_listing,
         &source_branches,
         &key,
         run_cache,
@@ -467,8 +474,11 @@ fn sync_pair_to_dest(
     )
 }
 
-/// [`sync_pair_from_dest_with_key`], deriving the state key — a test-only
-/// convenience the same way [`sync_pair_to_dest`] is.
+/// [`sync_pair_from_dest_with_key`], deriving the state key and the
+/// decisions/0049 listing/namespace pair `run` would otherwise already have
+/// built once up front — a test-only convenience the same way
+/// [`sync_pair_to_dest`] is, rebuilding both fresh from the current state on
+/// every call rather than sharing them across a whole test's several calls.
 fn sync_pair_from_dest(
     repo: &Repository,
     source_root: &Path,
@@ -476,8 +486,19 @@ fn sync_pair_from_dest(
     branch: &str,
     reporter: &Reporter,
 ) -> Result<()> {
-    let key = marker::load_key()?;
-    sync_pair_from_dest_with_key(repo, source_root, config, branch, reporter, &key)
+    let key = marker::test_key();
+    let dest_url = config.dest_url()?;
+    let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(source_root, &dest_url, &dest_listing.names)?;
+    sync_pair_from_dest_with_key(
+        repo,
+        source_root,
+        config,
+        branch,
+        reporter,
+        &key,
+        &dest_listing,
+    )
 }
 
 /// Loads the exclude-list *current* as of `source_tip` — the version this
@@ -684,7 +705,12 @@ fn mirror_only_feature_branch_synced_once() -> (
     );
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -773,11 +799,16 @@ fn authority_invariant_fixture(
         &["main"]
     };
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), branches).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            branches,
+        )
+        .path(),
     )
     .unwrap();
 
-    let key = marker::load_key().unwrap();
+    let key = marker::test_key();
     let exclude_list = ExcludeList::from_contents("").unwrap();
     let their_commit = source_repo.find_commit(their_tip).unwrap();
     let filtered_tree = filter_tree(

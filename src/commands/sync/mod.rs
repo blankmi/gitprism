@@ -95,6 +95,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
+use crate::commands::SecretSource;
 use crate::config::Config;
 use crate::exclude::{self, ExcludeList};
 use crate::git::{self, PushMode};
@@ -109,7 +110,7 @@ use anchor::{
 };
 use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
-use marker_scan::dest_to_source_boundary;
+use marker_scan::{dest_to_source_boundary, newest_source_marker};
 use policy_check::{find_control_file_policy_mismatch, policy_mismatch_message};
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
@@ -203,7 +204,35 @@ fn select_next_branch_by_mapping_distance(
     (halted, selected)
 }
 
-pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+/// Test-only convenience: builds this fixture's own secrets from its
+/// control files, so existing fixture tests keep calling `run(cwd,
+/// config_path)` unchanged (see `commands::FixedSecrets`).
+#[cfg(test)]
+pub(crate) fn run(cwd: &Path, config_path: &Path) -> Result<()> {
+    // Resolved the same way `run_with` resolves it below: against the
+    // discovered repo's `workdir()`, not raw `cwd` — these differ once
+    // `cwd` is a subdirectory of the repository rather than its root
+    // (TEST-001 review fix). Falls back to `cwd` itself when discovery
+    // fails (no repo there, or a bare one), so a genuinely broken `cwd`
+    // still reaches `run_with`'s own error instead of a different one
+    // raised here.
+    let source_root = Repository::discover(cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let resolved_config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        source_root.join(config_path)
+    };
+    let secrets = crate::commands::FixedSecrets::for_fixture(
+        &resolved_config_path,
+        &source_root.join(exclude::FILENAME),
+    );
+    run_with(cwd, config_path, &secrets)
+}
+
+pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSource) -> Result<()> {
     // Repository discovery first, so a wrong cwd reports that, not a
     // missing/malformed state key (F-14) — the pair secret is still
     // validated before fetching or constructing any commits either way.
@@ -213,7 +242,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
             cwd.display()
         )
     })?;
-    let state_key = marker::load_key()?;
+    let state_key = secrets.state_key()?;
     let source_root = repo
         .workdir()
         .context("gitprism sync requires a repo with a working tree, not a bare repo")?
@@ -224,7 +253,7 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     } else {
         source_root.join(config_path)
     };
-    let verified_policy = load_run_policy(&config_path, &source_root)?;
+    let verified_policy = load_run_policy(&config_path, &source_root, secrets)?;
     let config = verified_policy.config;
     let exclude_list = verified_policy.exclude_list;
     // Threaded into the source→dest loop below for decisions/0037's
@@ -277,6 +306,15 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
         );
     }
 
+    // decisions/0049: every dest branch this run could need a tip for is
+    // listed and fetched into a transient namespace exactly once, before
+    // either sync phase — dest→source's own existence/tip lookups just below
+    // and reconstruction's mapping index further down both read this same
+    // listing/namespace pair instead of each doing their own.
+    let dest_url = config.dest_url()?;
+    let dest_listing = git::remote_branch_names(&source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(&source_root, &dest_url, &dest_listing.names)?;
+
     // dest→source first, for every explicitly configured branch: any content
     // dest carries that gitprism didn't itself put there (e.g. a merged PR)
     // must be reflected into source before source→dest's own refusal check
@@ -288,8 +326,16 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // (decisions/0017, decisions/0020).
     let mut run_cache = RunCache::default();
     for branch in &config.branches {
-        sync_pair_from_dest_with_key(&repo, &source_root, &config, branch, &reporter, &state_key)
-            .with_context(|| format!("syncing {branch:?} dest -> source"))?;
+        sync_pair_from_dest_with_key(
+            &repo,
+            &source_root,
+            &config,
+            branch,
+            &reporter,
+            &state_key,
+            &dest_listing,
+        )
+        .with_context(|| format!("syncing {branch:?} dest -> source"))?;
     }
 
     // source→dest discovers every branch that exists on source at run time
@@ -308,13 +354,13 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     // branch for a clean run.
     let mut any_branch_halted = false;
     // decisions/0046: reconstruct exact authenticated mappings after
-    // dest→source has advanced local source histories. Destination heads are
-    // fetched once and retained in the same per-run cache used below.
-    let dest_url = config.dest_url()?;
+    // dest→source has advanced local source histories, from the same
+    // listing/namespace decisions/0049 already fetched above.
     let mapping_index = anchor::reconstruct_mapping_index(
         &repo,
         &source_root,
         &dest_url,
+        &dest_listing,
         &source_branches,
         &state_key,
         &mut run_cache,
@@ -396,8 +442,17 @@ pub fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_run_policy(config_path: &Path, source_root: &Path) -> Result<policy::VerifiedPolicy> {
-    policy::load(config_path, &source_root.join(exclude::FILENAME))
+fn load_run_policy(
+    config_path: &Path,
+    source_root: &Path,
+    secrets: &dyn SecretSource,
+) -> Result<policy::VerifiedPolicy> {
+    let expected_digest = secrets.expected_policy_digest()?;
+    policy::load(
+        config_path,
+        &source_root.join(exclude::FILENAME),
+        &expected_digest,
+    )
 }
 
 /// A local branch [`list_source_branches`] could not read as a mirror
@@ -517,12 +572,15 @@ fn sync_pair_to_dest_with_key(
         // per-run cache decisions/0046's anchor lookup shares (see
         // `dest_ref_exists_cached`).
         let dest_ref_exists = dest_ref_exists_cached(source_root, &dest_url, branch, run_cache)?;
-        // decisions/0038, decisions/0039: force is requested only once this
-        // very run has established both that `branch` is mirror-only and
-        // that it positively identified a source-side rewrite below — the
-        // one narrow authority this project's operator-intervention default
-        // (AGENTS.md) permits gitprism to override on its own. Every other
-        // path through this loop leaves it at the fast-forward-only default.
+        // decisions/0038, decisions/0039, decisions/0050: force is requested
+        // only once this very run has established that `branch` is
+        // mirror-only, positively identified a source-side rewrite below,
+        // and — decisions/0050's condition 5 — confirmed this clone's
+        // source tip is what the source remote itself currently advertises
+        // for `branch`. That's the one narrow authority this project's
+        // operator-intervention default (AGENTS.md) permits gitprism to
+        // override on its own. Every other path through this loop leaves it
+        // at the fast-forward-only default.
         let mut push_mode = PushMode::FastForwardOnly;
 
         let (dest_tip, boundary) = if dest_ref_exists {
@@ -599,6 +657,84 @@ fn sync_pair_to_dest_with_key(
                         state_key,
                     )? =>
                 {
+                    // decisions/0050 condition 5: a non-descendant local tip
+                    // is only evidence source itself was rewritten when this
+                    // clone's `source_tip` *is* what the source remote
+                    // currently advertises for `branch` — otherwise this
+                    // clone is merely behind, ahead, or diverged, and has no
+                    // standing to force dest on source's behalf. Queried
+                    // fresh on every attempt through this retry loop (never
+                    // cached across attempts or branches), so a
+                    // `RejectedRefMoved` retry re-evaluates it against
+                    // whatever the source remote says right now.
+                    // `config.source_url()` failing counts as the query
+                    // failing too (decisions/0050's Consequences): a
+                    // source→dest-only deployment with no reachable source
+                    // URL halts here exactly like a failed `ls-remote` would,
+                    // never silently as "no rewrite" or "rewrite".
+                    let source_remote_tip = config.source_url().and_then(|source_url| {
+                        git::remote_branch_tip(source_root, &source_url, branch)
+                    });
+                    let boundary_for_halt = || {
+                        newest_source_marker(repo, fetched_dest_tip, branch, state_key)
+                            .ok()
+                            .flatten()
+                            .map(|oid| oid.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    };
+                    match source_remote_tip {
+                        Ok(Some(remote_tip)) if remote_tip == source_tip => {}
+                        Ok(Some(remote_tip)) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&stale_source_checkout_message(
+                                    branch,
+                                    source_tip,
+                                    &boundary_for_halt(),
+                                    &format!(
+                                        "the source remote advertises {remote_tip} for {branch:?}, not this clone's {source_tip}"
+                                    ),
+                                )),
+                            );
+                            return Ok(true);
+                        }
+                        Ok(None) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&stale_source_checkout_message(
+                                    branch,
+                                    source_tip,
+                                    &boundary_for_halt(),
+                                    &format!("the source remote has no {branch:?} branch"),
+                                )),
+                            );
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&stale_source_checkout_message(
+                                    branch,
+                                    source_tip,
+                                    &boundary_for_halt(),
+                                    &format!(
+                                        "querying the source remote for {branch:?} failed: {error:#}"
+                                    ),
+                                )),
+                            );
+                            return Ok(true);
+                        }
+                    }
+
                     reporter.step(
                         branch,
                         Direction::SourceToDest,
@@ -843,11 +979,12 @@ fn sync_pair_to_dest_with_key(
                     // The destination ref is visible to later branch anchor
                     // lookups this run, with no re-query.
                     run_cache.dest_ref_exists.insert(branch.to_string(), true);
-                    // decisions/0046, F-A: a `ForceMirrorOnly` push just
-                    // replaced `branch`'s own dest chain wholesale — any
-                    // mapping this run recorded from that replaced chain
-                    // whose dest commit didn't survive into `new_dest_tip`'s
-                    // own ancestry is now a mapping to an orphan. Left alone,
+                    // decisions/0046 Addendum 3, Finding Q: a
+                    // `ForceMirrorOnly` push just replaced `branch`'s own
+                    // dest chain wholesale — any mapping this run recorded
+                    // from that replaced chain whose dest commit didn't
+                    // survive into `new_dest_tip`'s own ancestry is now a
+                    // mapping to an orphan. Left alone,
                     // a branch scheduled later in this same run could anchor
                     // on it and push straight back onto history this run
                     // itself just discarded. A mapping for the same source
@@ -864,8 +1001,8 @@ fn sync_pair_to_dest_with_key(
                                 .expect("force rebuild always planned invalidation"),
                         );
                     }
-                    // F-C: `build_dest_commit` already returned the exact
-                    // (source, dest) pair for each of these — recorded
+                    // Finding S: `build_dest_commit` already returned the
+                    // exact (source, dest) pair for each of these — recorded
                     // straight into the index, with no re-read or
                     // re-HMAC-verify of a commit this very call just
                     // authored.
@@ -990,6 +1127,27 @@ fn unsafe_to_build_on_message(branch: &str) -> String {
     )
 }
 
+/// decisions/0050 condition 5's per-branch halt: this clone's `source_tip`
+/// for `branch` isn't the tip the source remote itself currently advertises,
+/// so a non-descendant local tip is not evidence source was rewritten — this
+/// clone simply has no standing to act in source's name. Deliberately not
+/// `unsafe_to_build_on_message`: that halt means dest's history and this
+/// clone's source history share no ancestry gitprism recognizes; this one
+/// means source itself disagrees with what this clone thinks its own tip is.
+fn stale_source_checkout_message(
+    branch: &str,
+    source_tip: Oid,
+    boundary: &str,
+    remote_state: &str,
+) -> String {
+    format!(
+        "{branch:?} halted — this clone's source tip ({source_tip}) doesn't descend from the \
+         prior boundary ({boundary}), and {remote_state}, so gitprism has no standing to rebuild \
+         and force-update dest on source's behalf (decisions/0050); see \
+         design/playbooks/0003-recover-from-a-stale-source-checkout-refusal.md"
+    )
+}
+
 /// decisions/0018 Case 2's skip note: `already_merged_into_a_landing_branch`
 /// only ever tells us the branch's filtered content is already fully present
 /// in `landing` — it cannot tell a branch genuinely merged via a PR and
@@ -1022,7 +1180,7 @@ pub(crate) struct PendingDestBuild {
     /// `(source oid, dest oid)` for every commit actually built this call —
     /// `build_dest_commit`'s own trusted output, recorded into the mapping
     /// index directly on push acceptance rather than re-read and
-    /// re-verified from the repo (decisions/0046, F-C).
+    /// re-verified from the repo (decisions/0046 Addendum 3, Finding S).
     generated_mappings: Vec<(Oid, Oid)>,
     pub(crate) conflict: Option<Conflict>,
 }
@@ -1427,6 +1585,7 @@ fn sync_pair_from_dest_with_key(
     branch: &str,
     reporter: &Reporter,
     state_key: &marker::StateKey,
+    dest_listing: &git::RemoteBranchListing,
 ) -> Result<()> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating configured branch {branch:?}"))?;
@@ -1439,10 +1598,21 @@ fn sync_pair_from_dest_with_key(
         // `sync_pair_to_dest`'s own `remote_ref_exists` check), there is no
         // legitimate reason for it to have no ref on dest at all — `gitprism
         // setup` (decisions/0006) always grafts every round-tripped branch.
-        // Checked before fetching so a deleted dest ref fails with a clear,
-        // gitprism-authored message (decisions/0018) instead of git's own raw
-        // "couldn't find remote ref" subprocess error aborting the run.
-        if !git::remote_ref_exists(source_root, &dest_url, branch)? {
+        // Checked so a deleted dest ref fails with a clear, gitprism-authored
+        // message (decisions/0018) instead of git's own raw "couldn't find
+        // remote ref" subprocess error aborting the run. decisions/0049:
+        // existence comes from `run`'s own upfront listing whenever it can
+        // establish absence; only when the branch-limit horizon blocks that
+        // claim (decisions/0047) is a live `remote_ref_exists` check made.
+        let listed = dest_listing.names.iter().any(|name| name == branch);
+        let dest_ref_exists = if listed {
+            true
+        } else if dest_listing.completeness.can_establish_absence() {
+            false
+        } else {
+            git::remote_ref_exists(source_root, &dest_url, branch)?
+        };
+        if !dest_ref_exists {
             anyhow::bail!(
                 "gitprism sync: round-tripped branch {branch:?} has no ref on dest anymore — source and dest are out of sync (a round-tripped branch's dest ref should never be deleted); investigate before syncing again"
             );
@@ -1451,16 +1621,32 @@ fn sync_pair_from_dest_with_key(
         reporter.step(
             branch,
             Direction::DestToSource,
-            "fetching dest (checking for independent content to reflect into source)",
+            "checking dest (independent content to reflect into source)",
         );
-        git::fetch(source_root, &dest_url, branch)
-            .with_context(|| format!("fetching dest branch {branch:?} from configured remote"))?;
-        let dest_tip = repo
-            .find_reference("FETCH_HEAD")
-            .context("reading FETCH_HEAD after fetch")?
-            .peel_to_commit()
-            .context("resolving fetched dest branch to a commit")?
-            .id();
+        // decisions/0049: `branch` was part of `run`'s own upfront bulk
+        // fetch whenever it's listed above, so its tip is read from the
+        // transient dest namespace instead of being fetched again here. Only
+        // a branch beyond the branch-limit horizon — confirmed to exist by
+        // the live check just above, but never part of that bulk fetch
+        // either — still needs its own fetch, same as before decisions/0049.
+        let dest_tip = if listed {
+            repo.find_reference(&git::dest_head_namespace_ref(branch))
+                .with_context(|| {
+                    format!("reading destination branch {branch:?}'s fetched head from the dest namespace")
+                })?
+                .peel_to_commit()
+                .with_context(|| format!("resolving destination branch {branch:?}'s fetched head"))?
+                .id()
+        } else {
+            git::fetch(source_root, &dest_url, branch).with_context(|| {
+                format!("fetching dest branch {branch:?} from configured remote")
+            })?;
+            repo.find_reference("FETCH_HEAD")
+                .context("reading FETCH_HEAD after fetch")?
+                .peel_to_commit()
+                .context("resolving fetched dest branch to a commit")?
+                .id()
+        };
 
         // On the first attempt, source's own tip is normally just this
         // checkout's local branch — no fetch needed. But `branch` is a
