@@ -14,6 +14,192 @@ Gates on this tree:
 * `cargo audit` / `cargo deny` — not installed in the review environment; CI
   runs both with pinned actions
 
+## Status update — 2026-09-07
+
+Checked against `HEAD` at `f1794e5`. The findings and verdict below describe
+`7c5fa19`, the original reviewed tree; they are preserved as the historical
+review, not a current production-readiness assessment.
+
+All five original top recommendations have landed:
+
+* **CODE-001:** decision 0048's represented-prefix boundary fixes promoted
+  branches, with regression tests. It supersedes the original remediation's
+  suggestion to derive the boundary from the mapping index.
+* **CODE-002 / ARCH-001:** sync and resolve share the source→dest replay
+  function, with inherited-marker and clean-prefix parity tests.
+* **PERF-001:** decision 0049's bulk dest fetch serves reconstruction and
+  dest→source. Source→dest retains its per-branch lease fetch; a run-wide
+  deadline remains an optional follow-up.
+* **TEST-001:** `SecretSource` removes the security-check compile-time forks;
+  production-env refusal tests and built-binary smoke tests are present.
+* **DOC-001:** decision 0046 Addendum 3 records Findings Q–S and the code
+  references use those names.
+
+CODE-004's documentation step is complete; its current behavior is accepted
+under Finding S, with the alternative still requiring an owner decision.
+TEST-GAPS is partially complete through the promoted-branch resolve regression
+and binary tests. CODE-003, CODE-005–009, DOC-002, OPS-001–002, PERF-002–003,
+and the remaining TEST-GAPS work are still proposed. OPS-003 remains withdrawn.
+See the [plan status overview](plans/2026-09-02/README.md#current-status--2026-09-07)
+for remaining scope and dependencies.
+
+**Additional correction:** PERF-002's original OID-only memo suggestion is
+insufficient. Filtering also depends on the path prefix; its plan uses
+`(Oid, PathBuf)` with a fixed verified exclude list.
+
+Validation: `cargo test --workspace --all-features` passed **400 tests
+(397 unit + 3 binary integration), zero failures**. This status check did not
+rerun the other release gates or repeat the full security review.
+
+## Production-readiness follow-up — 2026-09-07
+
+Reviewed `f1794e5` (0.1.8). **Verdict: blocking for unrestricted unattended
+production use.** The original five recommendations above are implemented,
+but two further defects were reproduced through the compiled CLI in isolated
+repositories. No source, dependency, or configuration changes were made.
+
+The conversational follow-up numbered these CODE-001 and CODE-002 within its
+own report. In this review and its backlog they are **CODE-010 and CODE-011**,
+respectively, to preserve the original findings' identities and completion status.
+The original report below remains historical.
+
+| Area | Verdict | Score | Rationale |
+| --- | --- | ---: | --- |
+| Architecture | Fix first | 6 | Strong boundaries, but stale local state can authorize a rewrite |
+| Code quality | Fix first | 7 | Careful implementation with two reproduced correctness defects |
+| Rust idioms | Ready | 8 | Appropriate ownership and enums; no production unsafe; Clippy clean |
+| Reliability | Blocking | 3 | A stale checkout can regress destination history |
+| Testing | Fix first | 7 | Strong real-Git coverage misses the two combinations below |
+| Maintainability | Ready | 7 | Detailed decisions and useful module boundaries; existing backlog remains |
+| Operations | Fix first | 6 | Good diagnostics and limits, but a successful run can leave problematic state |
+| Production readiness | Blocking | 3 | Fix rewrite authorization before unattended deployment |
+
+### CODE-010 — stale source with newer objects locally can force dest backwards
+
+* **Category:** correctness / rewrite authorization
+* **Severity:** HIGH
+* **Confidence:** High
+* **Verification:** Executed
+* **Affected files / symbols:** `src/commands/sync/anchor.rs:492-530`,
+  `mirror_only_rewrite_detected`; `src/commands/sync/mod.rs`,
+  `sync_pair_to_dest_with_key`'s `ForceMirrorOnly` arm.
+
+When the previous source boundary exists locally, detection returns
+`Ok(!descends)`. A local branch simply behind that boundary satisfies the same
+predicate as an intentional reset. Object availability does not prove intent.
+
+**Executed reproduction:** mirror task at S1; clone source at S1; advance
+source normally to S2 and mirror it; in the stale clone, `git fetch origin`
+obtains S2 without advancing local task; run `gitprism sync`. It exits 0,
+reports “source branch was rewritten,” and changes dest's file from `s2` to
+`s1`. Source's remote remains at S2; `git merge-base --is-ancestor task
+origin/task` exits 0 in the stale clone.
+
+**Impact / realistic scenario:** fetched-but-unpulled workstations or reused
+CI checkouts can regress an active destination PR branch without any source
+rewrite. Source retains the newer content, but destination published history
+is replaced and competing runners may alternate projections. The correct
+explicit destination lease passes: it guards the fetched destination value,
+not source freshness or intent ([Git push documentation](https://git-scm.com/docs/git-push)).
+
+**Prior-review relationship:** August 27 F-01 was fixed only for a missing
+newer object; its regression does not fetch that object into the stale clone.
+This is an inadequate mitigation, not a newly prohibited intentional-reset case.
+
+**Recommendation:** decide and record a conservative authorization rule before
+implementation. Ambiguous ancestry should stop for operator intervention;
+retaining the destination lease alone cannot fix this. Test missing and present
+objects, stale ancestors, divergent local work, and intentional resets.
+[Plan CODE-010](plans/2026-09-02/CODE-010-stale-source-rewrite-authorization.md).
+
+### CODE-011 — generated markers can exceed their reader's message limit
+
+* **Category:** correctness / persisted-state compatibility
+* **Severity:** MEDIUM
+* **Confidence:** High
+* **Verification:** Executed
+* **Affected files / symbols:** `src/commands/sync/mod.rs:1376`,
+  `validated_commit_message`, `build_dest_commit`, `build_source_commit`;
+  `src/marker.rs:213`, `build_message`; `src/marker.rs:350`, `verify_parsed`.
+
+Input messages up to 1 MiB pass validation. Appending the authenticated block
+can make the generated message exceed the same 1 MiB reader limit. Construction
+and publication do not check the final size.
+
+**Executed reproduction:** commit an ordinary public file change on configured
+main with a 1,048,575-byte message. First sync exits 0 and publishes a
+1,048,860-byte destination message. The next sync exits 1 with
+`commit d5246d2… message exceeds the 1048576 byte limit`. Marker verification
+rejects the generated message before authentication, so the import path treats
+it as unrecognized content and then rejects its size.
+
+**Impact / realistic scenario:** a generated or accidentally pasted large
+message passes the input gate but strands subsequent synchronization. Ordinary
+reruns do not repair the published state. Existing oversized-input tests do not
+verify that accepted input produces readable output; the same builder pattern
+exists in both directions.
+
+**Recommendation:** check the complete generated message before creating or
+publishing it, without truncating user content. Keep reader and writer limits
+consistent, test exact boundaries and successful reruns in both directions,
+and decide recovery for already-published oversized markers separately.
+[Plan CODE-011](plans/2026-09-02/CODE-011-generated-marker-message-limit.md).
+
+### Owner decisions — 2026-09-07
+
+* CODE-010: [decision 0050](../design/decisions/0050-mirror-only-force-requires-the-local-tip-to-match-the-source-remote.md)
+  keeps mirror-only branches source-authoritative (requirements 0001 step 3,
+  decisions 0038/0039/0040) and adds a fifth rewrite condition: the local tip
+  must equal the tip the source remote advertises for the branch, read by
+  `git ls-remote` in the same push attempt. A stale checkout halts per branch
+  instead of forcing. The recommendation above to "stop for operator
+  intervention" on all ambiguous ancestry was considered as a first draft and
+  withdrawn: it contradicted the requirement and made every feature-branch
+  rebase an operator task. The
+  [operator playbook](../design/playbooks/0003-recover-from-a-stale-source-checkout-refusal.md)
+  covers the stale-checkout recovery. Implemented; the CODE-010 reproduction
+  above now halts instead of force-updating dest.
+* CODE-011: the decision 0032 addendum limits the task to preventing new
+  oversized generated messages and documenting the existing-state limitation.
+  No migration or recovery mechanism is required. Implementation remains pending.
+
+### Verification and coverage
+
+* Formatting, frozen workspace/all-target/all-feature check, and Clippy with
+  `-D warnings` passed on Rust 1.98.0.
+* Frozen workspace/all-target/all-feature tests passed on Rust 1.98.0 and
+  installed MSRV 1.89.0: **397 unit + 3 binary integration tests** on each.
+  MSRV check also passed. Git was 2.50.1 on Apple Silicon macOS.
+* Both findings were executed with the compiled CLI and local bare remotes.
+* Lockfile: 99 dependency packages, registry-sourced. No host dependency
+  duplicates; the all-target graph includes two `syn` versions.
+* No production unsafe was found. Test-only environment mutations and libc
+  umask were identified; parallel native environment-access soundness was not
+  fully established.
+* Test bodies and historical design/review/plan details were sampled, not
+  exhaustively reread. Third-party implementations and build scripts were not
+  audited. `.claude/agents/*` was inventoried only.
+* `cargo audit` and `cargo deny` were unavailable; neither was installed.
+  Linux, Windows and Intel macOS execution, release build/publication, live CI,
+  hosted transport/authentication, exhaustive crash/disk-full testing and
+  capacity benchmarks were not performed. No full security audit was conducted.
+
+### Remaining action order
+
+1. **P0 — CODE-010:** implemented; decision 0050 and its recovery regressions
+   have landed (High impact, Medium effort).
+2. **P1 — CODE-011:** generated-message validation, regression/fix and existing-state
+   limitation documentation (Medium impact, Medium effort).
+3. **P2:** existing TEST-GAPS, committer validation, path-aware filtering memo,
+   typed mapping causes, stable lookup memo and worktree-lifetime plans.
+4. **P3:** existing diagnostic/documentation cleanup. CODE-004's optional
+   behavior change still requires an owner decision; OPS-003 remains withdrawn
+   and CODE-005 remains defensive cleanup.
+
+See the [remaining-work queue](plans/2026-09-02/README.md#remaining-work-queue)
+for dependencies and status. The two new regressions belong to their respective
+CODE plans rather than being deferred to the general test backlog.
+
 ## 1. Executive summary
 
 gitprism is a well-engineered, deliberately conservative Git synchronization

@@ -705,7 +705,12 @@ fn mirror_only_feature_branch_synced_once() -> (
     );
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -794,7 +799,12 @@ fn authority_invariant_fixture(
         &["main"]
     };
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), branches).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            branches,
+        )
+        .path(),
     )
     .unwrap();
 

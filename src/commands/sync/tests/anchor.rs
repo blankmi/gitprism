@@ -359,7 +359,12 @@ fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_rewritten_by_a_rebase() {
     add_commit(&source_repo, "feature-x", &[("feature.txt", "original\n")]);
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -716,6 +721,576 @@ fn sync_pair_to_dest_refuses_to_force_push_dest_backwards_from_a_stale_non_shall
 }
 
 #[test]
+// decisions/0050 (CODE-010): the F-01 fix above only refuses when the
+// boundary object is *missing* from this clone's odb. Once a `git fetch`
+// has brought the newer object in — this clone's local branch just wasn't
+// moved onto it — `find_commit(boundary)` trivially succeeds and the
+// ancestry check alone can no longer tell a behind checkout from a genuine
+// rewrite; `mirror_only_rewrite_detected` returns `true` either way. This
+// test fails before condition 5 exists: the stale clone force-pushes dest
+// backwards, exits `Ok(true)` with "source branch was rewritten" reported,
+// instead of halting.
+fn sync_pair_to_dest_refuses_to_force_push_dest_backwards_from_a_stale_clone_that_fetched_the_newer_tip_without_pulling()
+ {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    add_commit(&source_repo, "task", &[("t1.txt", "1\n")]);
+
+    let config = Config::load(
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+
+    // Clone A syncs task at T1.
+    sync_pair_to_dest(
+        &source_repo,
+        source_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .unwrap();
+    let dest_tip_at_t1 = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // Stale clone B, taken now — a full, non-shallow clone at T1.
+    let (b_dir, b_repo) = fresh_clone_of_branch(&source_repo, "task", false);
+    let b_local_tip_at_clone = b_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // Clone A advances task to T2 (fast-forward, no rewrite) and syncs.
+    add_commit(&source_repo, "task", &[("t2.txt", "2\n")]);
+    sync_pair_to_dest(
+        &source_repo,
+        source_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .unwrap();
+    let dest_tip_at_t2 = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_ne!(dest_tip_at_t1, dest_tip_at_t2);
+    let source_tip_at_t2 = source_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // Stale clone B fetches T2 into its own odb — the exact CODE-010 shape,
+    // as opposed to F-01's clone that never fetched at all — but its local
+    // `task` branch is deliberately left at T1, exactly like a workstation
+    // or reused CI checkout that ran `git fetch` without `pull`/`merge`.
+    git::fetch(
+        b_dir.path(),
+        &source_dir.path().display().to_string(),
+        "task",
+    )
+    .unwrap();
+    assert!(
+        b_repo.find_commit(source_tip_at_t2).is_ok(),
+        "the fetch must land T2's object in clone B's odb"
+    );
+    assert_eq!(
+        b_repo
+            .find_branch("task", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id(),
+        b_local_tip_at_clone,
+        "the fetch must never move clone B's local task branch"
+    );
+
+    let halted = sync_pair_to_dest(
+        &b_repo,
+        b_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .expect(
+        "a stale clone that merely fetched the newer tip must halt this branch, not error \
+         the whole invocation",
+    );
+    assert!(
+        halted,
+        "a stale clone that fetched but did not pull must halt, never force-push"
+    );
+
+    let dest_tip_after_stale_clone = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        dest_tip_after_stale_clone, dest_tip_at_t2,
+        "a stale clone that only fetched must never move dest's task ref backwards"
+    );
+}
+
+#[test]
+// decisions/0050: an unpushed local rebase is the mirror image of the
+// stale-behind clone above — this clone's rewritten tip is *ahead of* (or
+// diverged from) the source remote's own tip, not stale relative to it, but
+// condition 5 still refuses: gitprism has no standing to act on a tip
+// source itself doesn't have yet.
+fn sync_pair_to_dest_halts_a_mirror_only_rewrite_whose_local_tip_is_ahead_of_the_source_remote() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    let source_remote_dir = tempdir().unwrap();
+    Repository::init_bare(source_remote_dir.path()).unwrap();
+    let source_url = source_remote_dir.path().display().to_string();
+
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    let t1 = add_commit(&source_repo, "task", &[("t1.txt", "1\n")]);
+    assert_eq!(
+        git::push(
+            source_dir.path(),
+            &source_url,
+            t1,
+            "task",
+            PushMode::FastForwardOnly,
+        )
+        .unwrap(),
+        git::PushOutcome::Accepted,
+        "seeding the source remote's task branch must succeed"
+    );
+
+    let config = Config::load(
+        write_config(
+            &source_url,
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+    sync_pair_to_dest(
+        &source_repo,
+        source_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .expect("first sync should mirror task to dest");
+    let dest_tip_before = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // A rebase-shaped local rewrite — but never pushed to `source_remote_dir`,
+    // exactly the operator mistake playbook 0003 covers ("push them to
+    // source first").
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), true)
+        .unwrap();
+    add_commit(
+        &source_repo,
+        "task",
+        &[("t1.txt", "rebased locally, not pushed\n")],
+    );
+
+    let halted = sync_pair_to_dest(
+        &source_repo,
+        source_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .expect("an unpushed local rewrite must halt this branch, not error the whole invocation");
+    assert!(
+        halted,
+        "a local tip the source remote hasn't seen yet must halt, never force-push"
+    );
+
+    let dest_tip_after = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        dest_tip_after, dest_tip_before,
+        "an unpushed local rewrite must never move dest's task ref"
+    );
+}
+
+#[test]
+// decisions/0050: the source remote genuinely deleting `branch` while
+// dest's ref still exists must halt too — there's nothing left on source to
+// authorize a rebuild on behalf of.
+fn sync_pair_to_dest_halts_a_mirror_only_rewrite_when_source_has_deleted_the_branch() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    let source_remote_dir = tempdir().unwrap();
+    Repository::init_bare(source_remote_dir.path()).unwrap();
+    let source_url = source_remote_dir.path().display().to_string();
+
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    let t1 = add_commit(&source_repo, "task", &[("t1.txt", "1\n")]);
+    assert_eq!(
+        git::push(
+            source_dir.path(),
+            &source_url,
+            t1,
+            "task",
+            PushMode::FastForwardOnly,
+        )
+        .unwrap(),
+        git::PushOutcome::Accepted
+    );
+
+    let config = Config::load(
+        write_config(
+            &source_url,
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+    sync_pair_to_dest(
+        &source_repo,
+        source_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .expect("first sync should mirror task to dest");
+    let dest_tip_before = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // Amend task locally...
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), true)
+        .unwrap();
+    add_commit_with_message(
+        &source_repo,
+        "task",
+        &[("t1.txt", "amended\n")],
+        "amend (task deleted on source meanwhile)",
+    );
+    // ...while source itself deletes the branch entirely.
+    Repository::open(source_remote_dir.path())
+        .unwrap()
+        .find_reference("refs/heads/task")
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    let halted = sync_pair_to_dest(
+        &source_repo,
+        source_dir.path(),
+        &config,
+        "task",
+        &reporter,
+        &mut RunCache::default(),
+    )
+    .expect("a branch deleted on source must halt this branch, not error the whole invocation");
+    assert!(
+        halted,
+        "a branch source no longer has must halt, never force-push on its behalf"
+    );
+
+    let dest_tip_after = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        dest_tip_after, dest_tip_before,
+        "a branch deleted on source must never move dest's task ref"
+    );
+}
+
+#[test]
+// decisions/0050's Consequences: a source→dest-only deployment with no
+// reachable source URL sees the force path halt exactly like a failed
+// `ls-remote` would — the query failure is reported, never guessed as "no
+// rewrite" or "rewrite".
+fn sync_pair_to_dest_halts_a_mirror_only_rewrite_when_the_source_remote_is_unreachable() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    source_repo
+        .branch("feature-x", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    add_commit(&source_repo, "feature-x", &[("feature.txt", "original\n")]);
+
+    let unreachable_source_url = source_dir
+        .path()
+        .join("does-not-exist")
+        .display()
+        .to_string();
+    let config = Config::load(
+        write_config(
+            &unreachable_source_url,
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let repo = Repository::open(source_dir.path()).unwrap();
+    let reporter = Reporter::new(1, std::iter::empty());
+
+    let mut dest_ref_cache = RunCache::default();
+    sync_pair_to_dest(
+        &repo,
+        source_dir.path(),
+        &config,
+        "feature-x",
+        &reporter,
+        &mut dest_ref_cache,
+    )
+    .expect("first sync should mirror feature-x to dest");
+    let dest_tip_before = dest_repo
+        .find_branch("feature-x", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // A rebase-shaped rewrite — but the source remote this clone's own
+    // config points at doesn't exist at all.
+    source_repo
+        .branch("feature-x", &source_repo.find_commit(graft).unwrap(), true)
+        .unwrap();
+    add_commit(&source_repo, "feature-x", &[("feature.txt", "rebased\n")]);
+
+    let error = sync_pair_to_dest(
+        &repo,
+        source_dir.path(),
+        &config,
+        "feature-x",
+        &reporter,
+        &mut dest_ref_cache,
+    );
+    // An unreachable source remote is still `Ok(true)` (decisions/0045's
+    // per-branch halt) — the error is *reported*, not propagated as a hard
+    // stop that aborts every other branch.
+    let halted = error.expect(
+        "an unreachable source remote must halt this branch, not error the whole invocation",
+    );
+    assert!(
+        halted,
+        "an unreachable source remote must halt, never force-push"
+    );
+
+    let dest_tip_after = dest_repo
+        .find_branch("feature-x", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        dest_tip_after, dest_tip_before,
+        "an unreachable source remote must never move dest's feature-x ref"
+    );
+}
+
+#[test]
+// decisions/0045: condition 5's halt is per-branch, not per-run — a sibling
+// mirror-only branch with no rewrite in play must still sync normally in
+// the same `run` invocation.
+fn run_still_syncs_an_unaffected_mirror_only_branch_when_a_sibling_halts_on_an_unpushed_rewrite() {
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    let source_remote_dir = tempdir().unwrap();
+    Repository::init_bare(source_remote_dir.path()).unwrap();
+    let source_url = source_remote_dir.path().display().to_string();
+
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    let t1 = add_commit(&source_repo, "task", &[("t1.txt", "1\n")]);
+    source_repo
+        .branch("other", &source_repo.find_commit(graft).unwrap(), false)
+        .unwrap();
+    let o1 = add_commit(&source_repo, "other", &[("o1.txt", "1\n")]);
+    for (branch, tip) in [("task", t1), ("other", o1)] {
+        assert_eq!(
+            git::push(
+                source_dir.path(),
+                &source_url,
+                tip,
+                branch,
+                PushMode::FastForwardOnly,
+            )
+            .unwrap(),
+            git::PushOutcome::Accepted
+        );
+    }
+
+    let config = write_config(
+        &source_url,
+        &dest_dir.path().display().to_string(),
+        &["main"],
+    );
+    run(source_dir.path(), config.path()).expect("the initial mirror of both branches must sync");
+    let task_dest_tip_before = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+
+    // task is rewritten locally but never pushed to `source_remote_dir` —
+    // condition 5 must halt it. other is advanced normally (an ordinary
+    // fast-forward, no rewrite, no push needed) — it must still sync.
+    source_repo
+        .branch("task", &source_repo.find_commit(graft).unwrap(), true)
+        .unwrap();
+    add_commit(
+        &source_repo,
+        "task",
+        &[("t1.txt", "rebased locally, not pushed\n")],
+    );
+    add_commit(&source_repo, "other", &[("o2.txt", "2\n")]);
+
+    let error = run(source_dir.path(), config.path())
+        .expect_err("a halted sibling branch must still fail the overall run");
+    assert!(
+        error.to_string().contains("halted"),
+        "the overall run error must say a branch halted: {error}"
+    );
+
+    let task_dest_tip_after = dest_repo
+        .find_branch("task", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    assert_eq!(
+        task_dest_tip_after, task_dest_tip_before,
+        "the halted branch's dest ref must be untouched"
+    );
+
+    let other_tip = dest_repo
+        .find_branch("other", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap();
+    let other_tree = other_tip.tree().unwrap();
+    assert!(
+        other_tree.get_name("o2.txt").is_some(),
+        "the unaffected sibling branch must still sync in the same run"
+    );
+}
+
+#[test]
 fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_reset_to_an_earlier_commit_plus_a_new_commit() {
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
@@ -742,7 +1317,12 @@ fn sync_pair_to_dest_rebuilds_a_mirror_only_branch_reset_to_an_earlier_commit_pl
     );
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -834,7 +1414,12 @@ fn sync_pair_to_dest_rewinds_a_mirror_only_branch_reset_all_the_way_back_to_the_
     add_commit(&source_repo, "feature-x", &[("feature.txt", "two\n")]);
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -928,7 +1513,12 @@ fn sync_pair_to_dest_rewinds_a_mirror_only_branch_when_the_rewrite_filters_to_no
     add_commit(&source_repo, "feature-x", &[("feature.txt", "original\n")]);
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -1985,7 +2575,12 @@ fn sync_pair_to_dest_rewrite_rebuild_anchors_on_a_sibling_mirror_only_branch_too
     add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();
@@ -2495,7 +3090,11 @@ fn run_does_not_resurrect_an_orphaned_dest_commit_after_a_same_run_amend() {
     add_commit(&source_repo, "feature", &[("feature.txt", "v1\n")]);
     let s2 = add_commit(&source_repo, "feature", &[("feature.txt", "v2\n")]);
 
-    let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
+    let config = write_config(
+        &source_dir.path().display().to_string(),
+        &dest_dir.path().display().to_string(),
+        &["main"],
+    );
     run(source_dir.path(), config.path()).expect("the initial two-commit mirror must sync");
 
     let d2 = dest_repo
@@ -2779,7 +3378,24 @@ fn run_anchors_a_round_tripped_feature_rebase_on_its_exact_mapping_instead_of_ha
             &[&feature_commit, &develop_commit],
         )
         .unwrap();
-    add_commit(&source_repo, task, &[("task.txt", "after rebase\n")]);
+    let task_tip = add_commit(&source_repo, task, &[("task.txt", "after rebase\n")]);
+
+    // decisions/0050 condition 5: this clone's rebased `task` tip must be
+    // what the configured source remote itself advertises before the force
+    // arm may rebuild dest's projection from it — the same real push the
+    // round-tripped branches above already made to `source_remote_dir`,
+    // extended to this mirror-only rewrite too.
+    assert_eq!(
+        git::push(
+            source_dir.path(),
+            &source_url,
+            task_tip,
+            task,
+            PushMode::FastForwardOnly,
+        )
+        .unwrap(),
+        git::PushOutcome::Accepted
+    );
 
     run(source_dir.path(), config.path())
         .expect("a routine mirror-only rebase must use the exact branch-local mapping");
@@ -3307,7 +3923,12 @@ fn sync_pair_to_dest_wrong_order_rewrite_of_task_picks_up_feature_as_the_anchor(
     add_commit(&source_repo, "task", &[("task.txt", "line1\n")]);
 
     let config = Config::load(
-        write_config("unused", &dest_dir.path().display().to_string(), &["main"]).path(),
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
     )
     .unwrap();
     let repo = Repository::open(source_dir.path()).unwrap();

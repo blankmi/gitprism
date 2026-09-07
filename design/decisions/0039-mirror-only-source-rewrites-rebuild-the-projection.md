@@ -7,6 +7,8 @@ status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-08-21T00:00:00Z }
 ---
 
+> **Amended by [decisions/0050](0050-mirror-only-force-requires-the-local-tip-to-match-the-source-remote.md)** (CODE-010, 2026-09-07): the four conditions below gain a fifth — `source_tip` must equal the tip the source remote advertises for `refs/heads/<branch>`, read by `git ls-remote` in the same push attempt. Condition 4 compares a *local* tip against the boundary, and a clone that fetched the newer source object without pulling satisfies it exactly as a genuine rewrite does; only the source remote can tell the two apart. Any mismatch, missing branch or query failure is decisions/0045's per-branch halt. Everything else in this decision — the rebuild, the authority invariant, who may force — stands. Implementation pending CODE-010.
+
 # Context
 
 [decisions/0038](0038-branch-authority-determines-whether-history-may-be-rewritten.md)

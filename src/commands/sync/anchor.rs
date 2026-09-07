@@ -461,14 +461,14 @@ pub(super) fn dest_resume_point(
     dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)
 }
 
-/// decisions/0039: positively identifies a rewritten mirror-only source
-/// branch — a state checked directly by four conditions, not inferred from
-/// exhausted retries. Callable only once [`dest_resume_point_for_branch`]
-/// has already refused (returned `Ok(None)`) for this `(source_tip,
-/// dest_tip)` pair; the caller is also responsible for condition 1
-/// (mirror-only — absent from `config.branches`) and condition 2
-/// (`dest_ref_exists`), since both are already known at the one call site
-/// this is used from. This function checks the remaining two:
+/// decisions/0039 (amended by decisions/0050): positively identifies a
+/// rewritten mirror-only source branch — a state checked directly by four
+/// conditions here, not inferred from exhausted retries. Callable only once
+/// [`dest_resume_point_for_branch`] has already refused (returned
+/// `Ok(None)`) for this `(source_tip, dest_tip)` pair; the caller is also
+/// responsible for condition 1 (mirror-only — absent from `config.branches`)
+/// and condition 2 (`dest_ref_exists`), since both are already known at the
+/// one call site this is used from. This function checks the remaining two:
 ///
 /// 3. a previous gitprism marker is found on dest's own history — Case 1 or
 ///    Case 3 of [`dest_tip_accounted_for`] ("a prior sync genuinely
@@ -489,6 +489,14 @@ pub(super) fn dest_resume_point(
 /// *complete* — see the amendment for why `Repository::is_shallow` doesn't
 /// prove otherwise). Any other `find_commit` failure is a real error and
 /// propagates as `Err`, never guessed either way.
+///
+/// A `true` result here is still not authorization to force: decisions/0050
+/// adds a fifth condition — this clone's `source_tip` must also equal the
+/// OID the *source remote* currently advertises for `branch` — checked by
+/// the caller (`sync::mod`'s `ForceMirrorOnly` arm) against
+/// [`crate::git::remote_branch_tip`], since it needs the retry loop's
+/// per-attempt dest tip and a live network read this function deliberately
+/// stays free of.
 pub(super) fn mirror_only_rewrite_detected(
     repo: &Repository,
     source_tip: Oid,

@@ -64,3 +64,17 @@ exceeded budget and can resolve the repository state outside gitprism. Tests
 cover oversized regular files, configuration branch limits, marker-message
 limits, and traversal depth/entry boundaries; normal repository and conflict
 behavior remains covered by the existing integration suite.
+
+## CODE-011 decision — 2026-09-07
+
+The 1 MiB message limit applies to the complete generated message, including
+mapping trailers and authenticated state. Validate its actual serialized byte
+length before commit creation. Do not truncate content or raise reader limits.
+Apply the invariant to all message construction callers, including resolve state.
+
+The owner approved preventing new occurrences and documenting existing-state
+limitations only. Already-published oversized markers may still block sync;
+ordinary reruns do not repair them. Automated repair, migration and a general
+recovery mechanism are out of scope. Preserve affected history for individual
+operator investigation rather than weakening verification or force-rewriting
+round-tripped history. Implementation remains pending CODE-011.

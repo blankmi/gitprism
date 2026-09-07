@@ -3207,3 +3207,123 @@ Full suite: 398 passed (395 unit + 3 `tests/cli.rs`); `cargo fmt --all --
 warnings` clean; `cargo build --release --locked` succeeds. PERF-001 is
 implemented in full except step 8 (a run-wide deadline), which the plan
 scopes out as a separate, optional follow-up.
+
+
+## 2026-09-07 — reconcile the 2026-09-02 review and plan statuses
+
+Checked the review backlog against `f1794e5`. Added a dated status update to
+`docs/2026-09-02_REPOSITORY_REVIEW.md` and a completion table to its plan index;
+marked CODE-002, DOC-001, and TEST-001 implemented, CODE-004's documentation
+step complete, and TEST-GAPS partially complete. Corrected PERF-002's reference
+to superseded branch-additive exclusions and TEST-001's blanket claim of
+unchanged error precedence. No architecture or code changes.
+
+`cargo test --workspace --all-features` passed 400 tests (397 unit + 3 binary
+integration), zero failures, during the status review. Other release gates
+were not rerun for this documentation update.
+
+## 2026-09-07 — incorporate production-readiness follow-up
+
+Added CODE-010 (stale source with newer objects present can force dest backwards)
+and CODE-011 (generated marker messages exceed the reader's limit) to the
+September 2 review as a dated follow-up. These preserve the identities of the
+completed CODE-001/002 tasks. Both were reproduced through the compiled CLI
+during the review at `f1794e5`; no implementation changes made.
+
+Added proposed plans and a remaining-work queue, retaining completed, accepted
+and withdrawn statuses. CODE-010 requires owner discussion and a recorded
+authorization decision before implementation. CODE-011 includes existing-state
+recovery assessment. Corrected TEST-GAPS expectations for locally committed
+resolutions after rejected pushes and synthetic versus real merge picks; made
+its module split optional. CODE-004's optional optimization follows CODE-010.
+
+Review evidence: 400 tests passed on Rust 1.98 and 1.89, checks passed on both,
+formatting and Clippy passed on 1.98. This documentation-only incorporation
+checks local Markdown links and diff whitespace; it does not rerun Rust tests.
+
+## 2026-09-07 — decide CODE-010 and CODE-011 scope
+
+CODE-010 was first drafted as decision 0050 "ambiguous source rewrites
+require operator reconciliation": halt every non-descendant mirror-only case
+and route rewrites to a revert-based operator playbook. Reviewing that draft
+against the bundle showed it contradicted requirements/0001 step 3 (as
+amended in `cdac783`), decisions 0038 and 0039 — all of which grant
+mirror-only force on a deliberate source rewrite — left 0040's lease with
+nothing to guard, and turned every routine feature-branch rebase into a
+permanent per-branch halt. The owner reaffirmed source authority for
+mirror-only branches; the draft was withdrawn before commit.
+
+Decision 0050 as accepted, "mirror-only force requires the local tip to
+match the source remote's tip", locates the defect in *which tip is trusted*:
+0039's condition 4 compares this clone's local branch against the boundary,
+and only the source remote can tell a behind checkout from a real rewrite. A
+fifth condition is added — `source_tip` must equal the OID `git ls-remote`
+reports for `refs/heads/<branch>` on decisions/0013's source URL, queried in
+the same push attempt and re-queried on each 0040 retry. Mismatch, missing
+branch or query failure is decisions/0045's per-branch halt; the fast-forward
+path is untouched. 0039 carries an amendment banner; 0038, 0040 and the
+requirement are unchanged. Playbook 0003 covers the stale-checkout recovery
+(`merge --ff-only`, push or drop local-only commits, fix the query) and was
+executed against a local bare remote. Plan CODE-010 rewritten around the
+five-condition rule with the regression list 0050 requires.
+
+The 0032 addendum records CODE-011 as prevention plus existing-state
+limitation documentation, with no repair or migration requirement.
+
+Updated review and plan statuses; both implementations remain pending.
+Documentation only; local links checked.
+
+## 2026-09-07 — implement CODE-010 (decision 0050's fifth condition)
+
+Added `git::remote_branch_tip`, a sibling of `remote_ref_exists` that returns
+the OID a URL advertises for `refs/heads/<branch>` via `git ls-remote
+--exit-code`. Its parser trusts only the output line whose refname field is
+an *exact* match for the query — `ls-remote` matches refnames at the tail on
+a slash boundary, so a decoy ref (e.g. `refs/heads/a/refs/heads/task`) can
+share a query with the real branch and would otherwise be able to supply the
+OID condition 5 compares against. Caught by review (see below) before
+landing, not by the first draft.
+
+Wired condition 5 into `sync_pair_to_dest_with_key`'s `ForceMirrorOnly` arm
+in `sync/mod.rs`: once `mirror_only_rewrite_detected` holds, the source
+remote's advertised tip for the branch is queried fresh on every retry
+attempt (never cached across attempts or branches) and compared to the
+local tip. Equal proceeds exactly as before. Any mismatch, missing branch,
+or query failure is decisions/0045's per-branch halt (`Outcome::Error`,
+`Ok(true)`), with a new message naming the branch, local tip, source-remote
+state, prior boundary and playbook 0003 — `unsafe_to_build_on_message` is
+not reused, this halt has a different cause. The fast-forward and
+round-tripped paths are unchanged; condition 5 is unreachable from them.
+
+Regression-first per AGENTS.md: extended the F-01 stale-clone fixture in
+`sync/tests/anchor.rs` for the fetch-without-pull shape and added a
+`tests/cli.rs` fixture with real bare source/dest remotes, both confirmed
+failing against `f1794e5` before the fix (verified independently in review
+by reverting the three changed source files and rerunning). Added coverage
+for local-ahead-of-source, branch-deleted-on-source, unreachable-source-URL,
+per-branch isolation, and the `merge --ff-only` recovery/no-op-rerun path.
+Existing genuine-reset/rebase/amend/round-tripped fixtures needed their
+placeholder `"unused"` source URLs replaced with a real self-pointing URL,
+since condition 5 now actually queries it; their original expectations are
+unchanged (confirmed by the same revert-and-rerun check).
+
+Code review (code-reviewer agent) returned APPROVE WITH CHANGES: the
+tail-matching decoy-ref gap above (CODE-001, MEDIUM — the one check the
+whole change rests on), a missing assertion that the halt names both tips
+and omits "source branch was rewritten" (TEST-002), an unbounded
+malformed-OID diagnostic inconsistent with the rest of `git.rs`'s
+`git_diagnostic` framing (CODE-003), and a doc comment overstating SHA-256
+support (INFO-004). All four fixed: the parser now requires an exact
+refname match with a regression test reproducing the decoy-line output
+against a real bare remote; `tests/cli.rs` asserts both tips appear and the
+rewrite line does not; the malformed-OID field is now routed through
+`git_diagnostic`; the doc comment corrected. INFO-005 (self-remote fixtures
+substitute for a literal third-remote fixture) and INFO-006 (diagnostic-only
+error swallow in `boundary_for_halt`) were left as informational, no code
+change.
+
+`cargo test --workspace --all-features --locked`: 412 tests passed (408
+unit + 4 `tests/cli.rs`), zero failures. `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --all-features --locked -- -D
+warnings` clean. CODE-010 is implemented; decision 0050 and playbook 0003 no
+longer describe pending work.

@@ -767,6 +767,92 @@ pub fn remote_ref_exists(repo_dir: &Path, url: &str, branch: &str) -> Result<boo
     }
 }
 
+/// The OID `url` currently advertises for `refs/heads/<branch>` —
+/// decisions/0050's condition 5. Same `ls-remote --exit-code` shape as
+/// [`remote_ref_exists`], but the advertised object id itself is the answer,
+/// not just whether the ref exists: `Some(oid)` on exit 0 with a parseable
+/// object id, `None` on exit 2 (queried, matched nothing — the branch isn't
+/// on `url`), `Err` for every other failure, including output that doesn't
+/// parse as an object id. A parse failure is never read as "no such branch"
+/// or as a match; both would let a query gitprism can't make sense of
+/// authorize a force it has no evidence for.
+pub fn remote_branch_tip(repo_dir: &Path, url: &str, branch: &str) -> Result<Option<git2::Oid>> {
+    validate_remote(url)?;
+    validate_branch_name(branch)?;
+    let refname = format!("refs/heads/{branch}");
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("ls-remote")
+        .arg("--exit-code")
+        .arg("--")
+        .arg(url)
+        .arg(&refname)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_git_output(command, SMALL_OUTPUT)
+        .context("running git ls-remote against configured remote")?;
+
+    match output.status.code() {
+        Some(0) => Ok(Some(parse_remote_branch_tip(&output.stdout, &refname)?)),
+        // git's own convention for `--exit-code`: 2 means the query
+        // succeeded but matched nothing, distinct from any other failure
+        // (bad URL, network, auth, ...).
+        Some(2) => Ok(None),
+        _ => {
+            let diagnostic = git_diagnostic(&output.stderr, Some(url));
+            anyhow::bail!(
+                "git ls-remote for branch {branch:?} against configured remote failed ({}): {diagnostic}",
+                output.status
+            )
+        }
+    }
+}
+
+/// Parses `git ls-remote`'s output for `refname`'s object id. `ls-remote
+/// <url> refs/heads/<branch>` matches that pattern at the *tail*, on a
+/// slash boundary — `refs/heads/task` also matches a ref literally named
+/// `refs/heads/a/refs/heads/task` — so a single query can return more than
+/// one line, and a remote under source's control could otherwise supply a
+/// decoy line ahead of the real one to steer decisions/0050's condition 5.
+/// This only ever trusts the line whose second, tab-separated field is
+/// *exactly* `refname`; every other line is ignored, and no exact match at
+/// all is `Err`, never a fallback to the first or only line. The object-id
+/// field is required to be a full 40-hex-character SHA-1 object id — the
+/// only length `git2::Oid::from_str` (called below) actually accepts; a
+/// 64-character SHA-256-shaped field passes this length/hex-digit gate but
+/// still fails there, surfacing as `Err`, not a match. That gate still
+/// matters on its own: it rejects a short or zero-padded hex field before
+/// it ever reaches `git2::Oid::from_str`, which would otherwise accept it.
+/// [`remote_branch_tip`]'s exit-0 case has already established the query
+/// matched something, so no matching line, or a malformed field on the
+/// matching line, is a malformed answer, not an absence.
+fn parse_remote_branch_tip(stdout: &[u8], refname: &str) -> Result<git2::Oid> {
+    let refname_bytes = refname.as_bytes();
+    let matching_line = stdout.split(|&byte| byte == b'\n').find(|line| {
+        let mut fields = line
+            .split(|byte: &u8| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        fields.next();
+        fields.next() == Some(refname_bytes)
+    });
+    let Some(line) = matching_line else {
+        anyhow::bail!("git ls-remote returned no line matching refname {refname:?}");
+    };
+    let field = line
+        .split(|byte: &u8| byte.is_ascii_whitespace())
+        .find(|field| !field.is_empty());
+    let Some(field) = field else {
+        anyhow::bail!("git ls-remote returned no advertised object id");
+    };
+    let hex = std::str::from_utf8(field).context("git ls-remote output is not valid UTF-8")?;
+    if !matches!(hex.len(), 40 | 64) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let diagnostic = git_diagnostic(field, None);
+        anyhow::bail!("git ls-remote returned an unparseable object id: {diagnostic}");
+    }
+    git2::Oid::from_str(hex).with_context(|| format!("parsing advertised object id {hex:?}"))
+}
+
 /// Every branch name currently on `url` — a real `git ls-remote --heads`
 /// subprocess, parsed by [`parse_ls_remote_heads`]. decisions/0046 Addendum
 /// 3, Finding Q: mapping-index reconstruction must see a mirror-only
@@ -1843,6 +1929,111 @@ mod tests {
                 "no-such-branch",
             )
             .expect("checking a missing branch should succeed, just report false")
+        );
+    }
+
+    #[test]
+    fn remote_branch_tip_reports_the_advertised_oid_for_a_branch_that_exists() {
+        let dest_dir = tempdir().unwrap();
+        let expected = repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        assert_eq!(
+            remote_branch_tip(
+                source_dir.path(),
+                &dest_dir.path().display().to_string(),
+                "main",
+            )
+            .expect("checking an existing branch should succeed"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn remote_branch_tip_reports_none_for_a_branch_that_does_not_exist() {
+        let dest_dir = tempdir().unwrap();
+        repo_with_a_commit_on(dest_dir.path(), "main");
+
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+
+        assert_eq!(
+            remote_branch_tip(
+                source_dir.path(),
+                &dest_dir.path().display().to_string(),
+                "no-such-branch",
+            )
+            .expect("checking a missing branch should succeed, just report None"),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_branch_tip_fails_loudly_against_an_unreachable_remote() {
+        let source_dir = tempdir().unwrap();
+        Repository::init(source_dir.path()).unwrap();
+        let missing = source_dir.path().join("does-not-exist");
+
+        let error = remote_branch_tip(source_dir.path(), &missing.display().to_string(), "main")
+            .expect_err("an unreachable remote must be Err, never None or a guessed OID");
+        assert!(
+            !error.to_string().contains("no such branch"),
+            "an unreachable remote must never be read as \"no such branch\": {error}"
+        );
+    }
+
+    #[test]
+    fn parse_remote_branch_tip_rejects_output_that_does_not_parse_as_an_object_id() {
+        assert!(
+            parse_remote_branch_tip(b"", "refs/heads/main").is_err(),
+            "empty output must be Err"
+        );
+        assert!(
+            parse_remote_branch_tip(b"not-an-oid\trefs/heads/main\n", "refs/heads/main").is_err(),
+            "non-hex output must be Err"
+        );
+        assert!(
+            parse_remote_branch_tip(b"deadbeef\trefs/heads/main\n", "refs/heads/main").is_err(),
+            "a short hex field must be Err, not truncated into a real OID"
+        );
+    }
+
+    #[test]
+    fn parse_remote_branch_tip_accepts_a_well_formed_ls_remote_line() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            parse_remote_branch_tip(
+                format!("{sha1}\trefs/heads/main\n").as_bytes(),
+                "refs/heads/main"
+            )
+            .unwrap(),
+            git2::Oid::from_str(sha1).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_remote_branch_tip_ignores_a_decoy_line_matching_the_query_only_at_the_tail() {
+        // `git ls-remote <url> refs/heads/task` matches refname patterns at
+        // the tail, on a slash boundary, so a ref literally named
+        // `refs/heads/a/refs/heads/task` also matches and can be returned
+        // ahead of the real `refs/heads/task` line — reproduced for real
+        // against a local bare remote with both refs pushed:
+        //
+        //   e042d1e...  refs/heads/a/refs/heads/task
+        //   5b8b2a3...  refs/heads/task
+        //
+        // Only the line whose refname field is the exact query may supply
+        // the OID.
+        let decoy = "4e571a683ee217067e44089f64b64a8d890c395b";
+        let real = "5b8b2a3d418d31373725f8c436300a0b07dd4306";
+        let stdout = format!("{decoy}\trefs/heads/a/refs/heads/task\n{real}\trefs/heads/task\n");
+
+        assert_eq!(
+            parse_remote_branch_tip(stdout.as_bytes(), "refs/heads/task").unwrap(),
+            git2::Oid::from_str(real).unwrap(),
+            "a decoy line matching only at the tail must never supply the OID"
         );
     }
 

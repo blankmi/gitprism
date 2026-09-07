@@ -110,7 +110,7 @@ use anchor::{
 };
 use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
-use marker_scan::dest_to_source_boundary;
+use marker_scan::{dest_to_source_boundary, newest_source_marker};
 use policy_check::{find_control_file_policy_mismatch, policy_mismatch_message};
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
@@ -572,12 +572,15 @@ fn sync_pair_to_dest_with_key(
         // per-run cache decisions/0046's anchor lookup shares (see
         // `dest_ref_exists_cached`).
         let dest_ref_exists = dest_ref_exists_cached(source_root, &dest_url, branch, run_cache)?;
-        // decisions/0038, decisions/0039: force is requested only once this
-        // very run has established both that `branch` is mirror-only and
-        // that it positively identified a source-side rewrite below — the
-        // one narrow authority this project's operator-intervention default
-        // (AGENTS.md) permits gitprism to override on its own. Every other
-        // path through this loop leaves it at the fast-forward-only default.
+        // decisions/0038, decisions/0039, decisions/0050: force is requested
+        // only once this very run has established that `branch` is
+        // mirror-only, positively identified a source-side rewrite below,
+        // and — decisions/0050's condition 5 — confirmed this clone's
+        // source tip is what the source remote itself currently advertises
+        // for `branch`. That's the one narrow authority this project's
+        // operator-intervention default (AGENTS.md) permits gitprism to
+        // override on its own. Every other path through this loop leaves it
+        // at the fast-forward-only default.
         let mut push_mode = PushMode::FastForwardOnly;
 
         let (dest_tip, boundary) = if dest_ref_exists {
@@ -654,6 +657,84 @@ fn sync_pair_to_dest_with_key(
                         state_key,
                     )? =>
                 {
+                    // decisions/0050 condition 5: a non-descendant local tip
+                    // is only evidence source itself was rewritten when this
+                    // clone's `source_tip` *is* what the source remote
+                    // currently advertises for `branch` — otherwise this
+                    // clone is merely behind, ahead, or diverged, and has no
+                    // standing to force dest on source's behalf. Queried
+                    // fresh on every attempt through this retry loop (never
+                    // cached across attempts or branches), so a
+                    // `RejectedRefMoved` retry re-evaluates it against
+                    // whatever the source remote says right now.
+                    // `config.source_url()` failing counts as the query
+                    // failing too (decisions/0050's Consequences): a
+                    // source→dest-only deployment with no reachable source
+                    // URL halts here exactly like a failed `ls-remote` would,
+                    // never silently as "no rewrite" or "rewrite".
+                    let source_remote_tip = config.source_url().and_then(|source_url| {
+                        git::remote_branch_tip(source_root, &source_url, branch)
+                    });
+                    let boundary_for_halt = || {
+                        newest_source_marker(repo, fetched_dest_tip, branch, state_key)
+                            .ok()
+                            .flatten()
+                            .map(|oid| oid.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    };
+                    match source_remote_tip {
+                        Ok(Some(remote_tip)) if remote_tip == source_tip => {}
+                        Ok(Some(remote_tip)) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&stale_source_checkout_message(
+                                    branch,
+                                    source_tip,
+                                    &boundary_for_halt(),
+                                    &format!(
+                                        "the source remote advertises {remote_tip} for {branch:?}, not this clone's {source_tip}"
+                                    ),
+                                )),
+                            );
+                            return Ok(true);
+                        }
+                        Ok(None) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&stale_source_checkout_message(
+                                    branch,
+                                    source_tip,
+                                    &boundary_for_halt(),
+                                    &format!("the source remote has no {branch:?} branch"),
+                                )),
+                            );
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            reporter.complete(
+                                Outcome::Error,
+                                branch,
+                                Direction::SourceToDest,
+                                round_tripped,
+                                Some(&stale_source_checkout_message(
+                                    branch,
+                                    source_tip,
+                                    &boundary_for_halt(),
+                                    &format!(
+                                        "querying the source remote for {branch:?} failed: {error:#}"
+                                    ),
+                                )),
+                            );
+                            return Ok(true);
+                        }
+                    }
+
                     reporter.step(
                         branch,
                         Direction::SourceToDest,
@@ -1043,6 +1124,27 @@ fn unsafe_to_build_on_message(branch: &str) -> String {
          (a dest-native branch of the same name with genuinely unrelated history, or this \
          clone is behind); fetch/pull the latest source history first, or reconcile the \
          branches manually if their histories are genuinely unrelated"
+    )
+}
+
+/// decisions/0050 condition 5's per-branch halt: this clone's `source_tip`
+/// for `branch` isn't the tip the source remote itself currently advertises,
+/// so a non-descendant local tip is not evidence source was rewritten — this
+/// clone simply has no standing to act in source's name. Deliberately not
+/// `unsafe_to_build_on_message`: that halt means dest's history and this
+/// clone's source history share no ancestry gitprism recognizes; this one
+/// means source itself disagrees with what this clone thinks its own tip is.
+fn stale_source_checkout_message(
+    branch: &str,
+    source_tip: Oid,
+    boundary: &str,
+    remote_state: &str,
+) -> String {
+    format!(
+        "{branch:?} halted — this clone's source tip ({source_tip}) doesn't descend from the \
+         prior boundary ({boundary}), and {remote_state}, so gitprism has no standing to rebuild \
+         and force-update dest on source's behalf (decisions/0050); see \
+         design/playbooks/0003-recover-from-a-stale-source-checkout-refusal.md"
     )
 }
 
