@@ -1223,9 +1223,7 @@ fn resolve_start(
     // pending.first() per invocation (decisions/0015), so there's nothing
     // to unify here.
     let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
-        .with_context(|| {
-            format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
-        })?;
+        .with_context(|| format!("finding dest commits pending for branch {branch:?}"))?;
     let Some(&dest_oid) = pending.first() else {
         anyhow::bail!(
             "gitprism resolve: {branch:?} <- {branch:?} has nothing pending from dest — nothing to resolve"
@@ -1310,9 +1308,7 @@ fn resolve_continue(
     // Same as resolve_start — resolve deliberately takes only
     // pending.first(), so nothing here duplicates sync's prefix-replay loop.
     let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
-        .with_context(|| {
-            format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
-        })?;
+        .with_context(|| format!("finding dest commits pending for branch {branch:?}"))?;
     if pending.first() != Some(&dest_oid) {
         anyhow::bail!(
             "gitprism resolve: the in-progress cherry-pick (CHERRY_PICK_HEAD names {dest_oid}) doesn't match {branch:?}'s expected next pending dest commit ({:?}) — this doesn't look like a cherry-pick `gitprism resolve` itself started; finish or abort it manually with plain `git cherry-pick --continue`/`--abort` instead of through gitprism",

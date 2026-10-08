@@ -11,6 +11,55 @@ use git2::{Oid, Repository};
 use crate::limits;
 use crate::marker::{self, Direction as MarkerDirection};
 
+/// `tip`, then each commit's first parent, until a root (decisions/0019).
+/// A commit is loaded only when the caller asks for the one after it, so a
+/// scan's own limit and early exits run before anything older is read —
+/// unlike a sorted `Revwalk`, which loads the whole reachable history before
+/// yielding anything (decisions/0051). A yielded OID is not itself loaded:
+/// a caller that uses it must load it. Stops after the first error.
+pub(super) fn first_parent_chain(repo: &Repository, tip: Oid) -> FirstParentChain<'_> {
+    FirstParentChain {
+        repo,
+        next: Some(tip),
+        previous: None,
+    }
+}
+
+pub(super) struct FirstParentChain<'repo> {
+    repo: &'repo Repository,
+    next: Option<Oid>,
+    previous: Option<Oid>,
+}
+
+impl Iterator for FirstParentChain<'_> {
+    type Item = Result<Oid>;
+
+    fn next(&mut self) -> Option<Result<Oid>> {
+        if let Some(previous) = self.previous.take() {
+            let parent = self
+                .repo
+                .find_commit(previous)
+                .with_context(|| format!("resolving first-parent commit {previous}"))
+                .and_then(|commit| {
+                    if commit.parent_count() == 0 {
+                        return Ok(None);
+                    }
+                    commit
+                        .parent_id(0)
+                        .map(Some)
+                        .with_context(|| format!("reading the first parent of {previous}"))
+                });
+            match parent {
+                Ok(parent) => self.next = parent,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        let oid = self.next.take()?;
+        self.previous = Some(oid);
+        Some(Ok(oid))
+    }
+}
+
 /// Every commit reachable from `source_tip` via first-parent history
 /// (decisions/0019, `Revwalk::simplify_first_parent()`), newest first,
 /// scanned for the newest commit carrying a `Gitprism-Dest-Commit` trailer
@@ -47,20 +96,7 @@ pub(super) fn scan_for_dest_marker(
     branch: &str,
     key: &marker::StateKey,
 ) -> Result<Option<(Oid, Oid)>> {
-    let mut revwalk = repo
-        .revwalk()
-        .context("starting source's resume-point scan")?;
-    revwalk
-        .push(source_tip)
-        .context("seeding source's resume-point scan")?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .context("ordering source's resume-point scan newest-first")?;
-    revwalk.simplify_first_parent().context(
-        "restricting source's resume-point scan to first-parent history (decisions/0019)",
-    )?;
-
-    for (scanned, oid) in revwalk.enumerate() {
+    for (scanned, oid) in first_parent_chain(repo, source_tip).enumerate() {
         if scanned >= limits::MAX_MARKER_SCAN_COMMITS {
             anyhow::bail!(
                 "source resume-point scan exceeds the {} commit limit",
@@ -145,20 +181,7 @@ pub(super) fn newest_source_marker(
     branch: &str,
     key: &marker::StateKey,
 ) -> Result<Option<Oid>> {
-    let mut revwalk = repo
-        .revwalk()
-        .context("starting dest's resume-point scan")?;
-    revwalk
-        .push(dest_tip)
-        .context("seeding dest's resume-point scan")?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .context("ordering dest's resume-point scan newest-first")?;
-    revwalk
-        .simplify_first_parent()
-        .context("restricting dest's resume-point scan to first-parent history (decisions/0019)")?;
-
-    for (scanned, oid) in revwalk.enumerate() {
+    for (scanned, oid) in first_parent_chain(repo, dest_tip).enumerate() {
         if scanned >= limits::MAX_MARKER_SCAN_COMMITS {
             anyhow::bail!(
                 "dest resume-point scan exceeds the {} commit limit",
@@ -399,21 +422,8 @@ fn dest_to_source_marker_targets(
     key: &marker::StateKey,
     scan_limit: usize,
 ) -> Result<HashSet<Oid>> {
-    let mut revwalk = repo
-        .revwalk()
-        .context("starting source's case-2 marker scan")?;
-    revwalk
-        .push(source_tip)
-        .context("seeding source's case-2 marker scan")?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .context("ordering source's case-2 marker scan")?;
-    revwalk.simplify_first_parent().context(
-        "restricting source's case-2 marker scan to first-parent history (decisions/0019)",
-    )?;
-
     let mut targets = HashSet::new();
-    for (scanned, oid) in revwalk.enumerate() {
+    for (scanned, oid) in first_parent_chain(repo, source_tip).enumerate() {
         if scanned >= scan_limit {
             anyhow::bail!(
                 "dest-to-source boundary's case-2 source scan exceeds the {scan_limit} commit limit"
@@ -548,6 +558,82 @@ mod tests {
         let tree = repo.treebuilder(None).unwrap().write().unwrap();
         let root = commit(&repo, "refs/heads/root", &[], tree, "root");
         (dir, repo, root)
+    }
+
+    /// Reopens `repo` afterwards: libgit2's object cache would otherwise
+    /// still serve the deleted commit.
+    fn delete_loose_object(repo: &Repository, oid: Oid) -> Repository {
+        let hex = oid.to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+        let reopened = Repository::open(repo.path()).unwrap();
+        assert!(reopened.find_commit(oid).is_err());
+        reopened
+    }
+
+    /// decisions/0051: a scan that stops at a marker never reads the history
+    /// beneath it.
+    #[test]
+    fn source_resume_scan_does_not_read_history_below_the_marker_it_stops_at() {
+        let (_dir, repo, root) = empty_repo();
+        let old_tree = tree_with_file(&repo, Some(root), "old.txt", b"old");
+        let old = commit(&repo, "refs/heads/source", &[root], old_tree, "old");
+        let marker_tree = tree_with_file(&repo, Some(old), "marker.txt", b"marker");
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let marker_message = dest_marker_message("main", root, &[old], marker_tree, &signature);
+        let marker = commit_with_signature(
+            &repo,
+            "refs/heads/source",
+            &[old],
+            marker_tree,
+            &marker_message,
+            &signature,
+        );
+        let tip_tree = tree_with_file(&repo, Some(marker), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/source", &[marker], tip_tree, "tip");
+        let repo = delete_loose_object(&repo, old);
+
+        let found = scan_for_dest_marker(&repo, tip, "main", &marker::test_key()).unwrap();
+        assert_eq!(found, Some((marker, root)));
+    }
+
+    /// decisions/0051: same property for dest's resume-point scan.
+    #[test]
+    fn dest_resume_scan_does_not_read_history_below_the_marker_it_stops_at() {
+        let (_dir, repo, root) = empty_repo();
+        let old_tree = tree_with_file(&repo, Some(root), "old.txt", b"old");
+        let old = commit(&repo, "refs/heads/dest", &[root], old_tree, "old");
+        let marker_tree = tree_with_file(&repo, Some(old), "marker.txt", b"marker");
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let marker_message = source_marker_message("main", root, &[old], marker_tree, &signature);
+        let marker = commit_with_signature(
+            &repo,
+            "refs/heads/dest",
+            &[old],
+            marker_tree,
+            &marker_message,
+            &signature,
+        );
+        let tip_tree = tree_with_file(&repo, Some(marker), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/dest", &[marker], tip_tree, "tip");
+        let repo = delete_loose_object(&repo, old);
+
+        let found = newest_source_marker(&repo, tip, "main", &marker::test_key()).unwrap();
+        assert_eq!(found, Some(root));
+    }
+
+    /// decisions/0051: a commit the scan actually reaches must still fail
+    /// when it's missing.
+    #[test]
+    fn source_resume_scan_fails_on_a_missing_commit_it_must_inspect() {
+        let (_dir, repo, root) = empty_repo();
+        let missing_tree = tree_with_file(&repo, Some(root), "missing.txt", b"missing");
+        let missing = commit(&repo, "refs/heads/source", &[root], missing_tree, "missing");
+        let tip_tree = tree_with_file(&repo, Some(missing), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/source", &[missing], tip_tree, "tip");
+        let repo = delete_loose_object(&repo, missing);
+
+        assert!(scan_for_dest_marker(&repo, tip, "main", &marker::test_key()).is_err());
+        assert!(newest_source_marker(&repo, tip, "main", &marker::test_key()).is_err());
     }
 
     /// Unit-level counterpart of scenario 6a

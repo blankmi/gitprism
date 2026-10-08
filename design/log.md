@@ -3327,3 +3327,35 @@ unit + 4 `tests/cli.rs`), zero failures. `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets --all-features --locked -- -D
 warnings` clean. CODE-010 is implemented; decision 0050 and playbook 0003 no
 longer describe pending work.
+
+## 2026-09-24 — playbook 0001: stale local branches on a reused GitLab checkout
+
+A branch deleted on source kept syncing from a shell-executor runner using
+`GIT_STRATEGY: fetch`: the job's `git branch -f "$CI_COMMIT_BRANCH" HEAD`
+left a local branch behind that GitLab's fetch never prunes, and gitprism
+discovers branches from local `refs/heads/*` (decisions/0017). Added the
+"Deleted source branches keep syncing" known problem to playbook 0001,
+recommending `git checkout --detach` plus
+`git fetch --prune origin '+refs/heads/*:refs/heads/*'` before `sync`, and
+replaced the policy section's `git branch -f` advice with a pointer to it.
+Confirmed working on the affected runner. No tool change.
+
+## 2026-10-08 — decision 0051: first-parent scans follow parent links directly
+
+Pre-upgrade review of v0.1.7 → `50bdcc3` found a no-op sync of 46 branches
+over 11.5k commits taking 51 s (v0.1.7: ~3.5 s). Cause: libgit2 pre-walks the
+whole reachable history before a sorted `Revwalk` yields anything, and
+decisions/0046's scheduling runs a distance walk per remaining branch per
+round. Decided [decisions/0051](decisions/0051-first-parent-scans-follow-parent-links-directly.md):
+`marker_scan::first_parent_chain` (a `parent_id(0)` iterator that loads a
+commit only when the next one is asked for) replaces the sorted revwalk in
+`mapping_index` (reconstruction, distance lookup) and `marker_scan`'s three
+scans. `pending_dest_commits`' three callers drop the "rewritten outside
+gitprism?" context. The ~100k complete-scan ceiling is recorded and added
+to requirements/0001's open questions. After the change: 51 s → 2.2 s
+(11.5k/46 branches), 205 s → 2.3 s (99k/31 branches). Tests first: seven new
+(scans don't read below where they stop; missing inspected commits still
+fail, including a mapped commit that is itself missing; reconstruction
+truncates at its horizon before loading a missing commit beyond it — the
+last two from Jack's review), one strengthened. Full suite 415 + 4 passing; fmt and clippy clean.
+v0.1.7 → this build upgrade fixture re-run: clean. Design reviewed by Jack.

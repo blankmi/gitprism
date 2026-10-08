@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use git2::{Oid, Repository};
 
+use super::marker_scan::first_parent_chain;
 use crate::marker::{self, Direction as MarkerDirection, StateKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,12 +377,11 @@ impl MappingIndex {
         tip: Oid,
         exclude_branch: Option<&str>,
     ) -> Result<Option<(usize, MappingLookup)>> {
-        let mut revwalk = first_parent_walk(repo, tip, "source")?;
         let mut scanned = 0usize;
         // `enumerate()` doesn't fit here: `scanned`'s final value is also
         // read after the loop for the truncation-taint case below.
         #[allow(clippy::explicit_counter_loop)]
-        for oid in &mut revwalk {
+        for oid in first_parent_chain(repo, tip) {
             if scanned >= self.scan_limit {
                 return Ok(Some((
                     scanned,
@@ -393,6 +393,9 @@ impl MappingIndex {
                 )));
             }
             let oid = oid.context("walking source history for an exact mapping")?;
+            // first_parent_chain doesn't load what it yields (decisions/0051).
+            repo.find_commit(oid)
+                .with_context(|| format!("resolving source commit {oid} for an exact mapping"))?;
             match self.resolve_for_anchor(repo, oid, exclude_branch)? {
                 MappingLookup::None => {}
                 mapping => return Ok(Some((scanned, mapping))),
@@ -517,8 +520,7 @@ impl MappingIndex {
         key: &StateKey,
         visited: &mut HashSet<Oid>,
     ) -> Result<()> {
-        let mut revwalk = first_parent_walk(repo, head, "source")?;
-        for (scanned, oid) in (&mut revwalk).enumerate() {
+        for (scanned, oid) in first_parent_chain(repo, head).enumerate() {
             let oid = oid.context("walking source history for authenticated mappings")?;
             if visited.contains(&oid) {
                 // Shared first-parent history already indexed by an
@@ -559,8 +561,7 @@ impl MappingIndex {
         key: &StateKey,
         visited: &mut HashSet<Oid>,
     ) -> Result<()> {
-        let mut revwalk = first_parent_walk(repo, head, "dest")?;
-        for (scanned, oid) in (&mut revwalk).enumerate() {
+        for (scanned, oid) in first_parent_chain(repo, head).enumerate() {
             let oid = oid.context("walking dest history for authenticated mappings")?;
             if visited.contains(&oid) {
                 break;
@@ -799,26 +800,6 @@ fn dest_commit_mapping(
         oid
     };
     Ok(Some((parsed.counterpart, parsed.branch, canonical_dest)))
-}
-
-fn first_parent_walk<'repo>(
-    repo: &'repo Repository,
-    head: Oid,
-    side: &str,
-) -> Result<git2::Revwalk<'repo>> {
-    let mut revwalk = repo
-        .revwalk()
-        .with_context(|| format!("starting {side} mapping history scan"))?;
-    revwalk
-        .push(head)
-        .with_context(|| format!("seeding {side} mapping history scan"))?;
-    revwalk
-        .set_sorting(git2::Sort::TOPOLOGICAL)
-        .with_context(|| format!("ordering {side} mapping history scan"))?;
-    revwalk
-        .simplify_first_parent()
-        .with_context(|| format!("restricting {side} mapping history scan to first-parent"))?;
-    Ok(revwalk)
 }
 
 fn source_to_dest_alias(commit: &git2::Commit<'_>) -> bool {
@@ -1371,6 +1352,109 @@ mod tests {
                 .iter()
                 .all(|record| record.branch == "main")
         );
+    }
+
+    /// Reopens `repo` afterwards: libgit2's object cache would otherwise
+    /// still serve the deleted commit.
+    fn delete_loose_object(repo: &Repository, oid: Oid) -> Repository {
+        let hex = oid.to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+        let reopened = Repository::open(repo.path()).unwrap();
+        assert!(reopened.find_commit(oid).is_err());
+        reopened
+    }
+
+    /// decisions/0051: the distance walk stops at the nearest mapping and
+    /// never reads the history beneath it.
+    #[test]
+    fn nearest_mapping_does_not_read_history_below_the_mapping_it_stops_at() {
+        let (_dir, repo, root) = empty_repo();
+        let old_tree = tree_with_file(&repo, Some(root), "old.txt", b"old");
+        let old = commit(&repo, "refs/heads/main", &[root], old_tree, "old");
+        let mapped_tree = tree_with_file(&repo, Some(old), "mapped.txt", b"mapped");
+        let mapped = commit(&repo, "refs/heads/main", &[old], mapped_tree, "mapped");
+        let tip_tree = tree_with_file(&repo, Some(mapped), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/main", &[mapped], tip_tree, "tip");
+        let mut index = MappingIndex::new();
+        index.record_built_mapping("main", mapped, root);
+        let repo = delete_loose_object(&repo, old);
+
+        match index
+            .nearest_first_parent_mapping_with_distance(&repo, tip, None)
+            .unwrap()
+        {
+            Some((1, MappingLookup::Resolved(mapping))) => {
+                assert_eq!((mapping.source, mapping.dest), (mapped, root));
+            }
+            other => panic!("expected the mapping one commit below tip, got {other:?}"),
+        }
+    }
+
+    /// decisions/0051: a missing commit the walk must inspect still fails,
+    /// for the distance walk and for reconstruction's complete scan alike.
+    #[test]
+    fn first_parent_scans_fail_on_a_missing_commit_they_must_inspect() {
+        let (_dir, repo, root) = empty_repo();
+        let missing_tree = tree_with_file(&repo, Some(root), "missing.txt", b"missing");
+        let missing = commit(&repo, "refs/heads/main", &[root], missing_tree, "missing");
+        let tip_tree = tree_with_file(&repo, Some(missing), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/main", &[missing], tip_tree, "tip");
+        let mut index = MappingIndex::new();
+        index.record_built_mapping("main", root, root);
+        let repo = delete_loose_object(&repo, missing);
+
+        assert!(
+            index
+                .nearest_first_parent_mapping_with_distance(&repo, tip, None)
+                .is_err()
+        );
+        assert!(
+            MappingIndex::reconstruct(&repo, &[("main".to_owned(), tip)], &[], &marker::test_key())
+                .is_err()
+        );
+    }
+
+    /// decisions/0051: a mapping recorded for a commit the walk reaches is
+    /// not returned when that commit itself is missing.
+    #[test]
+    fn nearest_mapping_fails_when_the_mapped_commit_it_reaches_is_missing() {
+        let (_dir, repo, root) = empty_repo();
+        let missing_tree = tree_with_file(&repo, Some(root), "missing.txt", b"missing");
+        let missing = commit(&repo, "refs/heads/main", &[root], missing_tree, "missing");
+        let tip_tree = tree_with_file(&repo, Some(missing), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/main", &[missing], tip_tree, "tip");
+        let mut index = MappingIndex::new();
+        index.record_built_mapping("main", missing, root);
+        let repo = delete_loose_object(&repo, missing);
+
+        assert!(
+            index
+                .nearest_first_parent_mapping_with_distance(&repo, tip, None)
+                .is_err()
+        );
+    }
+
+    /// decisions/0051: the scan limit is checked before the next commit is
+    /// loaded, so a missing commit beyond the horizon truncates the scan
+    /// rather than failing it.
+    #[test]
+    fn reconstruction_truncates_before_loading_a_missing_commit_beyond_its_horizon() {
+        let (_dir, repo, root) = empty_repo();
+        let missing_tree = tree_with_file(&repo, Some(root), "missing.txt", b"missing");
+        let missing = commit(&repo, "refs/heads/main", &[root], missing_tree, "missing");
+        let tip_tree = tree_with_file(&repo, Some(missing), "tip.txt", b"tip");
+        let tip = commit(&repo, "refs/heads/main", &[missing], tip_tree, "tip");
+        let repo = delete_loose_object(&repo, missing);
+
+        let index = MappingIndex::reconstruct_with_scan_limit(
+            &repo,
+            &[("main".to_owned(), tip)],
+            &[],
+            &marker::test_key(),
+            1,
+        )
+        .unwrap();
+        assert!(index.is_truncated());
     }
 
     #[test]
