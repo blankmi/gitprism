@@ -71,6 +71,11 @@ finalized — see open questions).
   yes, for a branch already mirrored to dest — `setup` is not involved; add
   the branch and run `sync`, which resumes it from the newest authenticated
   boundary on either side.
+* Can decisions/0046's mapping reconstruction and decisions/0048's case-2
+  scan stop before the root, so a pair stays fully served past the
+  ~100,000 first-parent-commit / 100,000 mapping-entry ceiling? Needs a
+  proven boundary or a checkpoint; see
+  [decisions/0051](../decisions/0051-first-parent-scans-follow-parent-links-directly.md).
 
 # Cited by
 

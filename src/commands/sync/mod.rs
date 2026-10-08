@@ -1733,9 +1733,7 @@ fn sync_pair_from_dest_with_key(
         };
 
         let pending = pending_dest_commits(repo, source_tip, dest_tip, branch, state_key)
-            .with_context(|| {
-                format!("has dest branch {branch:?}'s history been rewritten outside gitprism?")
-            })?;
+            .with_context(|| format!("finding dest commits pending for branch {branch:?}"))?;
         let build = build_pending_source_tip(
             repo,
             config,

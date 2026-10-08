@@ -1992,6 +1992,9 @@ fn dest_to_source_refuses_when_the_boundary_marker_names_an_object_missing_from_
     );
     let message = format!("{err:#}");
     assert!(message.contains("isn't an ancestor of dest's current tip"));
+    // decisions/0051: the caller's context names what failed, not a cause.
+    assert!(message.contains("finding dest commits pending for branch \"main\""));
+    assert!(!message.contains("rewritten outside gitprism"));
 }
 
 #[test]
