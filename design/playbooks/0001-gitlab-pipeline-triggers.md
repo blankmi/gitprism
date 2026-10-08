@@ -46,11 +46,10 @@ for that run, not a per-branch halt like
 Fix this in the job, not by trying to make gitprism per-branch policy-aware:
 after fetching, reset the working tree to the one branch holding the approved
 policy (e.g. `develop`) before invoking gitprism, regardless of which branch
-triggered the pipeline. Pin any branch-discovery ref (e.g. GitLab's
-`git branch -f "$CI_COMMIT_BRANCH" HEAD` workaround for its detached-HEAD
-checkout) to the pushed commit's SHA *before* switching the working tree —
-otherwise the checkout reassigns `HEAD` first and the pinned branch ref ends
-up pointing at the wrong commit.
+triggered the pipeline. Populate the local branches from source first (see
+[Deleted source branches keep syncing](#deleted-source-branches-keep-syncing))
+and then check out the policy branch detached, so that no local branch ref
+depends on where `HEAD` happens to be.
 
 # source → dest
 
@@ -138,6 +137,39 @@ configuration fix, not a reason to move gitprism into separate long-lived
 infrastructure: the persistence a dedicated "always-on sync container" would
 provide is exactly what a shell executor's build directory already gives for
 free.
+
+## Deleted source branches keep syncing
+
+gitprism discovers the branches to mirror from the checkout's local branches
+(`refs/heads/*`), not from the source remote
+([decisions/0017](../decisions/0017-source-to-dest-mirrors-every-branch.md)).
+GitLab's checkout leaves `HEAD` detached and never creates or deletes local
+branches, and its fetch prunes only `refs/remotes/origin/*`. With
+`GIT_STRATEGY: fetch`, any local branch a job creates (e.g.
+`git branch -f "$CI_COMMIT_BRANCH" HEAD`) survives in the reused checkout
+after the branch is deleted on source, and gitprism keeps treating it as a
+source branch. The same workaround also leaves every branch other than the
+one just pushed at its tip from its last push.
+
+Don't create local branches one at a time. Before invoking gitprism, mirror
+source's branches into `refs/heads/*` with Git's own prune:
+
+```yaml
+script:
+  - git -C "$CI_PROJECT_DIR" checkout -q --detach
+  - git -C "$CI_PROJECT_DIR" fetch -q --prune origin '+refs/heads/*:refs/heads/*'
+```
+
+`+` resets each local tip to source's tip (which is also what
+[decisions/0050](../decisions/0050-mirror-only-force-requires-the-local-tip-to-match-the-source-remote.md)
+requires before a force). `--prune` deletes local branches that no longer
+exist on source. `HEAD` must be detached, because Git refuses to fetch into
+the checked-out branch. The fetch uses the `origin` credentials GitLab Runner
+configures for the job.
+
+To clean up a runner that's already affected, the next run with this job
+fixes it. Running `git branch -D <branch>` in the runner's checkout, or
+clearing the runner cache, also works.
 
 # Open
 
