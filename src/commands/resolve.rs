@@ -3738,6 +3738,105 @@ mod tests {
         assert_eq!(counterpart_of(&fx.dest_repo, resolved.id()), fx.conflicting);
     }
 
+    /// decisions/0053: feature configured, its dest ref deleted, and
+    /// `--recreate-dest feature` conflicts on the q-bearing projection.
+    /// With `clean_prefix`, a clean commit precedes the conflicting one.
+    /// Returns the config, the conflicting commit and the expected
+    /// counterpart of the pushed prefix tip.
+    fn recreate_then_conflict(
+        fx: &ReuseConflict,
+        clean_prefix: bool,
+    ) -> (tempfile::NamedTempFile, Oid, Oid) {
+        let (conflicting, prefix_source) = if clean_prefix {
+            fx.source_repo
+                .reference("refs/heads/feature", fx.shared, true, "drop the conflict")
+                .unwrap();
+            checkout_head_exact(&fx.source_repo);
+            let clean = add_commit(&fx.source_repo, "feature", &[("clean.txt", "clean")]);
+            let conflicting = add_commit(&fx.source_repo, "feature", &[("f.txt", "source")]);
+            (conflicting, clean)
+        } else {
+            (fx.conflicting, fx.shared)
+        };
+        let config = write_config(
+            &fx._source_remote.path().display().to_string(),
+            &fx._dest_dir.path().display().to_string(),
+            &["main", "feature"],
+        );
+        fx.dest_repo
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let error = crate::commands::sync::run_recreating(
+            fx.source_dir.path(),
+            config.path(),
+            &["feature"],
+        )
+        .expect_err("the recreated branch's replay must conflict");
+        assert!(
+            format!("{error:#}").contains(&conflicting.to_string()),
+            "{error:#}"
+        );
+        (config, conflicting, prefix_source)
+    }
+
+    fn recreation_conflict_resolves(clean_prefix: bool) {
+        let fx = reuse_then_conflict();
+        let (config, conflicting, prefix_source) = recreate_then_conflict(&fx, clean_prefix);
+        let prefix = tip_of(&fx.dest_repo, "feature");
+        assert_eq!(
+            counterpart_of(&fx.dest_repo, prefix),
+            prefix_source,
+            "the pushed prefix never names the conflicted commit"
+        );
+        assert!(
+            fx.dest_repo
+                .graph_descendant_of(prefix, fx.projection)
+                .unwrap()
+        );
+
+        let error = run_with_direction_test(
+            fx.source_dir.path(),
+            config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("the conflict must open a resolution");
+        assert!(format!("{error:#}").contains("--continue"), "{error:#}");
+        let operation =
+            find_source_to_dest_operation(&fx.source_repo, "feature", &marker::test_key()).unwrap();
+        assert_eq!(operation.source_commit, conflicting);
+        stage_resolution(&operation);
+        run_with_direction_test(
+            fx.source_dir.path(),
+            config.path(),
+            "feature",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect("the resolution must push");
+
+        let resolved = fx
+            .dest_repo
+            .find_commit(tip_of(&fx.dest_repo, "feature"))
+            .unwrap();
+        assert_eq!(resolved.parent_id(0).unwrap(), prefix);
+        assert_eq!(counterpart_of(&fx.dest_repo, resolved.id()), conflicting);
+    }
+
+    #[test]
+    fn a_recreation_conflicting_on_its_first_commit_names_the_anchor_and_resolves() {
+        recreation_conflict_resolves(false);
+    }
+
+    #[test]
+    fn a_recreation_conflicting_after_a_clean_prefix_names_that_prefix_and_resolves() {
+        recreation_conflict_resolves(true);
+    }
+
     #[test]
     fn resolve_finish_refuses_a_commit_another_branch_projected_meanwhile_and_keeps_the_work() {
         let fx = reuse_then_conflict();

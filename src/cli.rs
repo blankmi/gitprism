@@ -47,7 +47,13 @@ pub enum Commands {
     /// Safe to invoke redundantly: resume and no-op detection come from the
     /// trailer-based history scan, not from anything about how this command
     /// was triggered.
-    Sync,
+    Sync {
+        /// Recreate a configured branch's absent dest ref from the nearest
+        /// exact mapping, create-only (decisions/0053). Repeatable; applies
+        /// to this run only.
+        #[arg(long = "recreate-dest", value_name = "BRANCH")]
+        recreate_dest: Vec<String>,
+    },
 
     /// Reproduce a dest<->source conflict and hand off to normal git
     /// conflict-resolution UX.
@@ -123,7 +129,29 @@ mod tests {
     #[test]
     fn sync_is_a_recognized_subcommand_with_no_arguments_of_its_own() {
         let cli = Cli::try_parse_from(["gitprism", "sync"]).unwrap();
-        assert!(matches!(cli.command, Commands::Sync));
+        let Commands::Sync { recreate_dest } = cli.command else {
+            panic!("expected sync command");
+        };
+        assert!(recreate_dest.is_empty());
+    }
+
+    #[test]
+    fn sync_accepts_a_repeatable_recreate_dest_flag() {
+        let cli = Cli::try_parse_from([
+            "gitprism",
+            "sync",
+            "--recreate-dest",
+            "a",
+            "--recreate-dest",
+            "b",
+            "--recreate-dest",
+            "a",
+        ])
+        .unwrap();
+        let Commands::Sync { recreate_dest } = cli.command else {
+            panic!("expected sync command");
+        };
+        assert_eq!(recreate_dest, ["a", "b", "a"]);
     }
 
     #[test]

@@ -284,6 +284,11 @@ fn is_ref_moved_rejection(raw: &[u8]) -> bool {
     })
 }
 
+fn is_up_to_date(raw: &[u8]) -> bool {
+    raw.split(|byte| *byte == b'\n')
+        .any(|line| line.split(|byte| *byte == b'\t').next() == Some(b"="))
+}
+
 fn run_git_output(command: Command, limits: OutputLimits) -> Result<std::process::Output> {
     run_git_output_with_timeout(command, limits, configured_git_timeout()?)
 }
@@ -1032,12 +1037,16 @@ pub enum PushOutcome {
 /// fetched this run, not a stale or recomputed value (decisions/0040's
 /// "Consequences"). Only ever requested by `sync_pair_to_dest` after
 /// positively detecting a rewritten mirror-only source branch
-/// (decisions/0039); every other call site stays `FastForwardOnly`
-/// permanently.
+/// (decisions/0039). `CreateOnly` is decisions/0053's requested recreation
+/// of an absent configured dest ref: `--force-with-lease=refs/heads/<branch>:`
+/// with an empty expected value, so git refuses to touch any existing ref.
+/// Every other call site stays `FastForwardOnly` permanently.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushMode {
     FastForwardOnly,
     ForceMirrorOnly { expected_dest: git2::Oid },
+    CreateOnly,
 }
 
 /// The `<new-tip>:<ref>` refspec [`push`] sends to git — always plain, never
@@ -1057,10 +1066,12 @@ fn push_refspec(commit: git2::Oid, dest_branch: &str) -> String {
 /// would be parsed as a literal refspec instead of an option.
 fn push_args(mode: PushMode, url: &str, commit: git2::Oid, dest_branch: &str) -> Vec<String> {
     let mut args = Vec::new();
-    if let PushMode::ForceMirrorOnly { expected_dest } = mode {
-        args.push(format!(
+    match mode {
+        PushMode::FastForwardOnly => {}
+        PushMode::ForceMirrorOnly { expected_dest } => args.push(format!(
             "--force-with-lease=refs/heads/{dest_branch}:{expected_dest}"
-        ));
+        )),
+        PushMode::CreateOnly => args.push(format!("--force-with-lease=refs/heads/{dest_branch}:")),
     }
     args.push("--".to_string());
     args.push(url.to_string());
@@ -1100,6 +1111,12 @@ pub fn push(
         run_git_output(command, PARSE_OUTPUT).context("running git push to configured remote")?;
 
     if output.status.success() {
+        // decisions/0053: git compares old == new before the lease, so a ref
+        // already at `commit` is reported up to date (`=`), not rejected.
+        // For a create-only push that still means the ref existed.
+        if mode == PushMode::CreateOnly && is_up_to_date(&output.stdout) {
+            return Ok(PushOutcome::RejectedRefMoved);
+        }
         return Ok(PushOutcome::Accepted);
     }
 
@@ -2618,6 +2635,101 @@ mod tests {
             Some(1),
             "the force-with-lease flag must precede `--`, or git parses it as a literal positional refspec instead of an option: {args:?}"
         );
+    }
+
+    #[test]
+    fn push_args_create_only_is_an_empty_lease_with_a_plain_refspec() {
+        let commit = git2::Oid::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let args = push_args(PushMode::CreateOnly, "the-url", commit, "main");
+        assert_eq!(
+            args,
+            vec![
+                "--force-with-lease=refs/heads/main:".to_string(),
+                "--".to_string(),
+                "the-url".to_string(),
+                format!("{commit}:refs/heads/main"),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with('+')));
+    }
+
+    /// decisions/0053: a bare dest with `main` at `existing` (when given)
+    /// and a source repo holding `tip`, a child of `base`.
+    fn create_only_push(
+        existing: impl FnOnce(&Repository, git2::Oid, git2::Oid) -> Option<git2::Oid>,
+    ) -> (PushOutcome, Option<git2::Oid>, Option<git2::Oid>) {
+        let source_dir = tempdir().unwrap();
+        let base = repo_with_a_commit_on(source_dir.path(), "work");
+        let source_repo = Repository::open(source_dir.path()).unwrap();
+        let tip = commit_on(&source_repo, base, ("b.txt", "b"));
+        source_repo
+            .reference("refs/heads/work", tip, true, "advance")
+            .unwrap();
+
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        fetch(
+            dest_dir.path(),
+            &source_dir.path().display().to_string(),
+            "work",
+        )
+        .unwrap();
+        let before = existing(&dest_repo, base, tip);
+        if let Some(oid) = before {
+            dest_repo
+                .reference("refs/heads/main", oid, true, "concurrent writer")
+                .unwrap();
+        }
+
+        let outcome = push(
+            source_dir.path(),
+            &dest_dir.path().display().to_string(),
+            tip,
+            "main",
+            PushMode::CreateOnly,
+        )
+        .expect("a create-only push reports existence, not an error");
+        let after = Repository::open(dest_dir.path())
+            .unwrap()
+            .find_reference("refs/heads/main")
+            .ok()
+            .and_then(|reference| reference.target());
+        (outcome, before, after)
+    }
+
+    #[test]
+    fn push_create_only_creates_an_absent_ref() {
+        let (outcome, _, after) = create_only_push(|_, _, _| None);
+        assert_eq!(outcome, PushOutcome::Accepted);
+        assert!(after.is_some());
+    }
+
+    #[test]
+    fn push_create_only_leaves_an_existing_ancestor_ref_untouched() {
+        let (outcome, before, after) = create_only_push(|_, base, _| Some(base));
+        assert_eq!(outcome, PushOutcome::RejectedRefMoved);
+        assert_eq!(
+            after, before,
+            "a fast-forwardable existing ref must not move"
+        );
+    }
+
+    #[test]
+    fn push_create_only_leaves_an_existing_incompatible_ref_untouched() {
+        let (outcome, before, after) = create_only_push(|dest_repo, base, _| {
+            Some(commit_on(dest_repo, base, ("other.txt", "x")))
+        });
+        assert_eq!(outcome, PushOutcome::RejectedRefMoved);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn push_create_only_treats_an_existing_ref_at_the_exact_tip_as_existing() {
+        // Git compares old == new before the lease and reports `=` up to
+        // date with exit 0; create-only must still report the ref existed.
+        let (outcome, before, after) = create_only_push(|_, _, tip| Some(tip));
+        assert_eq!(outcome, PushOutcome::RejectedRefMoved);
+        assert_eq!(after, before);
     }
 
     #[test]

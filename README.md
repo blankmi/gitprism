@@ -370,6 +370,17 @@ nothing new is a no-op. On a real conflict, it aborts the run: no further
 branches are processed until the operator resolves it with `gitprism
 resolve`. Branches already pushed earlier in the same run are unaffected.
 
+A configured branch whose dest ref is missing halts that branch; the other
+branches still sync and the run exits non-zero. gitprism never deletes a dest
+ref. If the deletion was intended, save any dest content not yet imported into
+source, then recreate the ref from the nearest exact mapping:
+
+```sh
+gitprism sync --recreate-dest <branch>
+```
+
+The flag applies to that run only and never touches an existing ref.
+
 See [`design/playbooks/0001-gitlab-pipeline-triggers.md`](design/playbooks/0001-gitlab-pipeline-triggers.md)
 for a suggested GitLab CI trigger setup (gitprism itself doesn't care what
 triggers it) and known GitLab Runner environment problems.

@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: A branch whose pending source commits are already projected by another branch reuses that projection instead of replaying a second copy; a configured branch's foreign-marker refusal becomes a per-branch halt
-description: Fixes gitprism-bug-report.md (v0.1.9). Two branches advancing in lockstep each replayed the shared source commits onto their own dest tip, producing identical-tree, incomparable projections that halt every later child under decisions/0046 step 4. A branch with an existing dest ref now reuses another branch's exact authenticated projection of its newest observed-mapped pending source commit — fast-forward when its tip is on that projection's first-parent line, otherwise a two-parent adoption merge (own tip first) — but only when a bounded, authenticated lineage proof shows the reused history is exactly the projection of the branch's own pending first-parent range and the branch's own non-shared dest history is content-neutral accounting. An observed shared mapping that can't be proven, or can't be resolved, halts the branch. Amends decisions/0045: a branch refused while its dest line's newest mirror marker belongs to another branch halts per branch with a typed diagnostic, including configured branches, instead of aborting the run.
+description: Fixes a v0.1.9 bug where two branches advancing in lockstep each replayed the shared source commits onto their own dest tip, producing identical-tree, incomparable projections that halt every later child under decisions/0046 step 4. A branch with an existing dest ref now reuses another branch's exact authenticated projection of its newest observed-mapped pending source commit — fast-forward when its tip is on that projection's first-parent line, otherwise a two-parent adoption merge (own tip first) — but only when a bounded, authenticated lineage proof shows the reused history is exactly the projection of the branch's own pending first-parent range and the branch's own non-shared dest history is content-neutral accounting. An observed shared mapping that can't be proven, or can't be resolved, halts the branch. Amends decisions/0045: a branch refused while its dest line's newest mirror marker belongs to another branch halts per branch with a typed diagnostic, including configured branches, instead of aborting the run.
 tags: [architecture, branches, markers, mapping]
 status: stable
 generated: { by: "human:michael.blank@evia.de", at: 2026-10-13T00:00:00Z }
@@ -9,7 +9,7 @@ generated: { by: "human:michael.blank@evia.de", at: 2026-10-13T00:00:00Z }
 
 # Context
 
-`gitprism-bug-report.md` (v0.1.9, `9753a4f`). `develop` (configured) and
+Observed on v0.1.9 (`9753a4f`). `develop` (configured) and
 `feat/x` start at source `S0`; dest has `develop -> D0`, `feat/x -> M -> D0`
 (`M` is feat/x's [decisions/0044](0044-a-branchs-dest-ref-always-carries-its-own-marker.md)
 marker). `S1..S3` are pushed to both branches. Each branch resumes from its own
@@ -31,7 +31,7 @@ the latest source history") does not apply.
 
 Rejected during review with Jack (2026-10-13):
 
-* **Comparing trees (the report's second option, or "adopt if `merge-tree`
+* **Comparing trees (an alternative proposed with the bug, or "adopt if `merge-tree`
   equals the candidate").** A `SourceToDest` marker authenticates a mapping,
   not equality with the filtered source snapshot: `build_pending_dest_tip`
   three-way-merges onto dest's tip and so preserves independent dest content.
@@ -269,7 +269,7 @@ concurrent runs, and it is not closed here.
 
 `resolve` also handles Part 2's typed refusal.
 
-Effect on the report's sequence. `develop` processes first (equal 0046
+Effect on the observed sequence. `develop` processes first (equal 0046
 distance, name tiebreak), producing `D1..D3`. `feat/x` sees `S3 -> D3`. `A =
 {M, D0}` and `G = D0`, so the lineage `D1..D3` passes, and feat/x gets
 `J = merge(M, D3)`. A child of `S3` resolves to `D3`. The next lockstep advance
@@ -373,7 +373,7 @@ Auto-adopting a foreign-marker tip stays out of scope.
 
 # Tests
 
-Only six tests were written first and seen failing: the report sequence in
+Only six tests were written first and seen failing: the observed sequence in
 one run, in separate runs and without a marker (1), two successive advances
 (2), the `q` case (4) and the configured foreign-marker halt (14). `design/log.md`'s 0052 entry lists the tests written
 after the implementation.
@@ -422,7 +422,7 @@ after the implementation.
 13. `resolve` start (no shared mapping) → another branch publishes a projection
     of `operation.source_commit` → `--continue`: refuses, pushes nothing,
     worktree and state ref retained.
-14. Configured branch with a foreign-marker tip (the report's exact recovery
+14. Configured branch with a foreign-marker tip (the operator's attempted recovery
     state, refused by the early accounting check): that branch halts with the
     typed diagnostic, other branches sync, run exits non-zero. Discovered
     variant names ref deletion.

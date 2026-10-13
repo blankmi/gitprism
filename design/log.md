@@ -3362,7 +3362,7 @@ v0.1.7 → this build upgrade fixture re-run: clean. Design reviewed by Jack.
 
 ## 2026-10-13 — decision 0052: lockstep branches reuse an existing projection
 
-`gitprism-bug-report.md` (v0.1.9): `develop` and `feat/x` advancing together
+v0.1.9 bug: `develop` and `feat/x` advancing together
 each replayed the shared commits onto their own dest tip, producing
 identical-tree, incomparable copies; a branch created from a shared commit then
 halted with `contradictory dest mappings`. Recovery by force-moving the
@@ -3386,7 +3386,7 @@ another branch's history, the candidate-bridge restriction, and the
 truncated-index gap. Copybara was checked as prior art. It resumes per
 destination ref from its own label and has no cross-branch reuse; its
 `FAKE_MERGE` is the closest precedent for the bridge's shape. Before the change,
-the six report-scenario and bug-2 tests failed for the reported reasons. Four
+the six observed-scenario and bug-2 tests failed for the reported reasons. Four
 existing foreign-marker tests changed from whole-run error to per-branch halt.
 Not test-first, written after the implementation:
 - proof budget, bridge trust, alias order, prefix naming, policy-before-reuse,
@@ -3409,4 +3409,52 @@ proven cause. Still accepted as limitations:
 - the candidate two-parent restriction;
 - the incomplete-index gap;
 - the cross-branch concurrency boundary.
-Uncommitted.
+
+## 2026-10-13 — decision 0053 (draft): configured dest ref recreation is an explicit opt-in
+
+v0.1.9 deadlock: a configured
+branch whose dest ref carried another branch's marker or was deleted could
+only be recovered by unconfiguring it for one run (two policy commits, two pin
+updates). Drafted
+[decisions/0053](decisions/0053-configured-branch-dest-ref-recreation-is-an-explicit-opt-in.md):
+an absent configured dest ref halts that branch only; `sync --recreate-dest
+<branch>` recreates it through the existing decisions/0046 + 0044 path with a
+create-only push lease.
+Amends decisions/0018 Case 1 and decisions/0052 Part 2's remedy text.
+Automatic adoption of a foreign-marker tip stays out of scope. Jack's first
+review: create-only lease instead of a resume fallback, removal before
+scheduling, no fallback below a missing anchor object, honest scope wording,
+more tests. Second review: Git reports a ref already equal to the proposed
+tip as up to date, not a lease rejection (checked in a fixture by Jack), so
+`CreateOnly` treats porcelain `=` as an appearance halt; import of extra anchor
+history is considered, not guaranteed. Revised; Jack approved the design; the
+operator approved it and it is `stable`.
+
+Implemented test-first. New tests: `sync/tests/recreate.rs` (13), five
+`git::tests` create-only push tests, one CLI parse test. Updated: the two
+decisions/0018 Case 1 tests now expect the per-branch halt. Before the
+implementation, against signature-only stubs, 14 failed. The rest already
+passed: CLI parsing and deduplication (plain data); create-only pushes of an
+absent ref and over an incompatible ref (git refuses the latter either way);
+and the incompatible-concurrent-ref, no-anchor and missing-object sync tests,
+whose expected failure the old resume refusal or whole-run bail produced. Their
+halt reasons were checked in the per-branch output after the implementation. `README.md` documents the flag. Jack's implementation
+review (CODE-0053-01): a recreation whose first replayed commit conflicted
+pushed a marker naming `source_tip`, certifying the conflicted commit as
+synced. 0053 now states decisions/0052 Step 7's invariant for this path. The
+shared `!dest_ref_exists`/rebuild fallback names the resume boundary when a
+conflict precedes any built commit, which also covers a discovered branch's
+first sync and a mirror-only rebuild. Two resolve tests use decisions/0052's
+`q` shape: conflict on the first commit (failed before the fix, naming the
+conflicted commit) and after a clean prefix (already passed; built commits
+keep their counterparts). Both resolve and continue. CODE-0053-02: both new
+remedies put the raw branch name in a suggested shell command; they now show
+`{branch:?}` outside a `gitprism sync --recreate-dest <branch>` placeholder
+(resolve's existing convention). The usage errors name the value as
+`--recreate-dest` value `"<name>"`, not as a command. A hostile valid ref
+test (`feature-$(touch-pwned)`) failed before the change. Jack approved the
+implementation with no remaining findings after independent sequential checks
+on the final files: `cargo test --workspace --all-features --locked` (463 unit
++ 4 CLI), `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings` and `git diff --check`
+all pass.
