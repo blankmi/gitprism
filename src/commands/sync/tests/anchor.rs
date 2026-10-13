@@ -2360,20 +2360,13 @@ fn sync_pair_to_dest_anchors_a_freshly_forked_branch_on_the_exact_imported_desti
 #[test]
 fn loop_prevented_skips_an_inherited_cross_branch_marker_when_the_branchs_own_dest_ref_predates_it()
 {
-    // decisions/0046's exact-mapping anchor only replaces boundary search
-    // for a branch with no dest ref yet, or a detected mirror-only rewrite
-    // (`dest_anchor_for_branch`'s two call sites). An already-synced
-    // branch's ordinary resync still resolves its boundary via
-    // `dest_resume_point_for_branch`, scanning that branch's OWN dest
-    // history — never the mapping index. So a `DestToSource` marker M this
-    // branch inherits from a *different* branch's dest→source import can
-    // still land strictly inside `pending_commits`, and
-    // `build_pending_dest_tip`'s `loop_prevented` must recognize and skip
-    // it via the marker's own recorded branch — the case
-    // `build_pending_dest_tip_loop_prevents_a_dest_to_source_marker_scoped_to_another_branch`
-    // covered before decisions/0046 gave a brand-new branch's own first
-    // sync an exact-mapping anchor that lands directly on the marker
-    // instead (see the rewritten test above this one).
+    // An already-synced branch resyncs past a `DestToSource` marker M it
+    // inherits from main's dest→source import of dest-native X. Since
+    // decisions/0052, release reuses main's original projection of s1, skips
+    // M (an import never triggers reuse and replay loop-prevents it), and
+    // adds only its own commit, so X's content doesn't reach release. This
+    // no longer proves the builder itself encountered M; that skip is
+    // covered by `build_pending_dest_tip_skips_another_branchs_import_marker`.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -2419,7 +2412,7 @@ fn loop_prevented_skips_an_inherited_cross_branch_marker_when_the_branchs_own_de
         .peel_to_commit()
         .unwrap()
         .id();
-    add_independent_dest_commit(
+    let dest_main_tip = add_independent_dest_commit(
         &dest_repo,
         dest_main_before_x,
         ("x.txt", "x\n"),
@@ -2442,6 +2435,8 @@ fn loop_prevented_skips_an_inherited_cross_branch_marker_when_the_branchs_own_de
     source_repo.branch("release", &main_with_m, true).unwrap();
     add_commit(&source_repo, "release", &[("release.txt", "r1\n")]);
 
+    let m = main_with_m.id();
+    let s1 = main_with_m.parent_id(0).unwrap();
     run(source_dir.path(), config.path())
         .expect("release must mirror its own commit, skipping the inherited marker M");
 
@@ -2451,15 +2446,53 @@ fn loop_prevented_skips_an_inherited_cross_branch_marker_when_the_branchs_own_de
         .get()
         .peel_to_commit()
         .unwrap();
+    for (ancestor, what) in [
+        (dest_main_before_x, "main's original projection of s1"),
+        (release_dest_tip_before, "release's old dest tip"),
+    ] {
+        assert!(
+            dest_repo
+                .graph_descendant_of(dest_release_tip.id(), ancestor)
+                .unwrap(),
+            "{what} must be an ancestor of release's new tip"
+        );
+    }
+    assert!(
+        !dest_repo
+            .graph_descendant_of(dest_release_tip.id(), dest_main_tip)
+            .unwrap(),
+        "release must not adopt main's dest-native X"
+    );
+
+    let key = marker::test_key();
     let mut walk = dest_repo.revwalk().unwrap();
     walk.push(dest_release_tip.id()).unwrap();
     walk.hide(release_dest_tip_before).unwrap();
-    let commits_since_release_graft: Vec<_> = walk.collect::<std::result::Result<_, _>>().unwrap();
+    let commits_since_release_graft: Vec<Oid> =
+        walk.collect::<std::result::Result<_, _>>().unwrap();
     assert_eq!(
         commits_since_release_graft.len(),
         2,
         "release's dest chain must add only s1 and its own commit — the inherited marker M, \
-         scoped to \"main\", must be loop-prevented rather than replayed a second time"
+         scoped to \"main\", must not be replayed a second time"
+    );
+    let counterparts: Vec<Oid> = commits_since_release_graft
+        .iter()
+        .filter_map(|oid| {
+            marker::verify_self(
+                &dest_repo.find_commit(*oid).unwrap(),
+                &[MarkerDirection::SourceToDest],
+                None,
+                &key,
+            )
+            .map(|parsed| parsed.counterpart)
+        })
+        .collect();
+    assert!(!counterparts.contains(&m), "M must never be projected");
+    assert_eq!(
+        counterparts.iter().filter(|oid| **oid == s1).count(),
+        1,
+        "s1 must have exactly one projection on release's line"
     );
 
     let tree = dest_release_tip.tree().unwrap();
@@ -2467,6 +2500,98 @@ fn loop_prevented_skips_an_inherited_cross_branch_marker_when_the_branchs_own_de
         tree.get_name("x.txt").is_none(),
         "release's dest tree must not carry x.txt — that content is main's own dest-native \
          import, not release's, and must not be reintroduced by replaying M"
+    );
+}
+
+#[test]
+fn build_pending_dest_tip_skips_another_branchs_import_marker() {
+    // `loop_prevented`'s skip of a `DestToSource` marker recorded for a
+    // different branch, exercised directly on the builder.
+    let dest_dir = tempdir().unwrap();
+    let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+    let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
+    let source_dir = tempdir().unwrap();
+    let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+    let graft = source_repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    // main's import of a dest-native x.txt, carrying real content so only
+    // loop prevention (not an empty filtered change) can skip it.
+    let import_tree = {
+        let base = source_repo.find_commit(graft).unwrap().tree().unwrap();
+        let mut builder = source_repo.treebuilder(Some(&base)).unwrap();
+        let blob = source_repo.blob(b"x\n").unwrap();
+        builder
+            .insert("x.txt", blob, git2::FileMode::Blob.into())
+            .unwrap();
+        source_repo.find_tree(builder.write().unwrap()).unwrap()
+    };
+    let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+    let main_import = source_repo
+        .commit(
+            None,
+            &signature,
+            &signature,
+            &marker::build_message(
+                "gitprism sync: dest -> source",
+                MarkerDirection::DestToSource,
+                "main",
+                dest_tip,
+                "Gitprism-Dest-Commit",
+                &[graft],
+                import_tree.id(),
+                &signature,
+                &signature,
+                &marker::test_key(),
+            ),
+            &import_tree,
+            &[&source_repo.find_commit(graft).unwrap()],
+        )
+        .unwrap();
+    source_repo
+        .branch(
+            "release",
+            &source_repo.find_commit(main_import).unwrap(),
+            false,
+        )
+        .unwrap();
+    let own = add_commit(&source_repo, "release", &[("release.txt", "r1\n")]);
+
+    let config = Config::load(
+        write_config(
+            &source_dir.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        )
+        .path(),
+    )
+    .unwrap();
+    let exclude_list = ExcludeList::from_contents("").unwrap();
+    let build = build_pending_dest_tip(
+        &source_repo,
+        &config,
+        &exclude_list,
+        graft,
+        dest_tip,
+        own,
+        source_dir.path(),
+        "release",
+        &marker::test_key(),
+    )
+    .unwrap();
+    let sources: Vec<Oid> = build
+        .generated_mappings
+        .iter()
+        .map(|(source, _)| *source)
+        .collect();
+    assert_eq!(
+        sources,
+        vec![own],
+        "only release's own commit is built; main's import marker is skipped"
     );
 }
 

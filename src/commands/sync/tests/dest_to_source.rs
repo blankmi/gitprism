@@ -976,7 +976,9 @@ fn sync_pair_to_dest_still_refuses_a_dest_tip_parked_on_a_sibling_branchs_own_mi
     // Source->dest next, same run, same branch: must refuse — D(s2) carries
     // no branch-scoped marker for "hotfix", so there is no safe boundary to
     // resume from, not a green light to replay from the graft.
-    let error = sync_pair_to_dest(
+    // decisions/0052 Part 2: a foreign newest mirror marker is a per-branch
+    // halt, not a run abort, for configured branches too.
+    let halted = sync_pair_to_dest(
         &repo,
         source_dir.path(),
         &config,
@@ -984,13 +986,13 @@ fn sync_pair_to_dest_still_refuses_a_dest_tip_parked_on_a_sibling_branchs_own_mi
         &reporter,
         &mut run_cache,
     )
-    .expect_err(
+    .expect(
         "a dest tip parked on a sibling branch's own mirror, with no branch-scoped marker of \
          its own, must refuse — not replay the sibling's already-mirrored history from the graft",
     );
     assert!(
-        format!("{error:#}").contains("isn't at a point this clone can safely build on"),
-        "expected today's safety refusal, not a conflict from a wrongly granted boundary: {error:#}"
+        halted,
+        "expected today's safety refusal, not a conflict from a wrongly granted boundary"
     );
 }
 
@@ -1109,7 +1111,9 @@ fn sync_pair_to_dest_refuses_when_a_foreign_branded_marker_sits_above_a_stale_br
         .unwrap();
 
     let mut final_run_cache = RunCache::default();
-    let error = sync_pair_to_dest(
+    // decisions/0052 Part 2: a foreign newest mirror marker is a per-branch
+    // halt, not a run abort, for configured branches too.
+    let halted = sync_pair_to_dest(
         &repo,
         source_dir.path(),
         &config_both,
@@ -1117,14 +1121,14 @@ fn sync_pair_to_dest_refuses_when_a_foreign_branded_marker_sits_above_a_stale_br
         &reporter,
         &mut final_run_cache,
     )
-    .expect_err(
+    .expect(
         "a dest_tip represented only via a foreign-branded marker over a stale branch-scoped \
          one must refuse, not replay already-mirrored content as a phantom conflict",
     );
     assert!(
-        format!("{error:#}").contains("isn't at a point this clone can safely build on"),
+        halted,
         "expected today's clean safety refusal, not a phantom conflict from the wrongly \
-         granted stale boundary: {error:#}"
+         granted stale boundary"
     );
 }
 
@@ -1328,7 +1332,9 @@ fn sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_forei
         .unwrap();
 
     let mut final_run_cache = RunCache::default();
-    let error = sync_pair_to_dest(
+    // decisions/0052 Part 2: a foreign newest mirror marker is a per-branch
+    // halt, not a run abort, for configured branches too.
+    let halted = sync_pair_to_dest(
         &repo,
         source_dir.path(),
         &config_both,
@@ -1336,15 +1342,15 @@ fn sync_pair_to_dest_refuses_when_an_imported_dest_native_boundary_hides_a_forei
         &reporter,
         &mut final_run_cache,
     )
-    .expect_err(
+    .expect(
         "a dest_tip represented via case 2 with B1 above a foreign-branded mirror marker beneath \
          it must still refuse — the newest marker anywhere on the whole line, not merely in \
          dest_tip..=B1, decides safety",
     );
     assert!(
-        format!("{error:#}").contains("isn't at a point this clone can safely build on"),
+        halted,
         "expected today's clean safety refusal, not a phantom conflict from a wrongly granted \
-         boundary: {error:#}"
+         boundary"
     );
 }
 
@@ -1478,7 +1484,9 @@ fn sync_pair_to_dest_refuses_a_foreign_mirror_beneath_a_tip_accounted_for_by_an_
         .expect("n2 must import cleanly");
 
     let mut final_run_cache = RunCache::default();
-    let error = sync_pair_to_dest(
+    // decisions/0052 Part 2: a foreign newest mirror marker is a per-branch
+    // halt, not a run abort, for configured branches too.
+    let halted = sync_pair_to_dest(
         &repo,
         source_dir.path(),
         &config_both,
@@ -1486,14 +1494,14 @@ fn sync_pair_to_dest_refuses_a_foreign_mirror_beneath_a_tip_accounted_for_by_an_
         &reporter,
         &mut final_run_cache,
     )
-    .expect_err(
+    .expect(
         "a dest_tip accounted for by an ordinary same-branch import, sitting above a \
          foreign-branded mirror marker, must still refuse — not replay already-mirrored content",
     );
     assert!(
-        format!("{error:#}").contains("isn't at a point this clone can safely build on"),
+        halted,
         "expected today's clean safety refusal, not a phantom conflict from the stale \
-         branch-scoped boundary: {error:#}"
+         branch-scoped boundary"
     );
 }
 

@@ -3359,3 +3359,54 @@ fail, including a mapped commit that is itself missing; reconstruction
 truncates at its horizon before loading a missing commit beyond it — the
 last two from Jack's review), one strengthened. Full suite 415 + 4 passing; fmt and clippy clean.
 v0.1.7 → this build upgrade fixture re-run: clean. Design reviewed by Jack.
+
+## 2026-10-13 — decision 0052: lockstep branches reuse an existing projection
+
+`gitprism-bug-report.md` (v0.1.9): `develop` and `feat/x` advancing together
+each replayed the shared commits onto their own dest tip, producing
+identical-tree, incomparable copies; a branch created from a shared commit then
+halted with `contradictory dest mappings`. Recovery by force-moving the
+configured `feat/x` onto develop's projection aborted the whole run. Decided
+[decisions/0052](decisions/0052-lockstep-branches-reuse-an-existing-projection.md),
+designed and reviewed with Jack:
+- An existing-ref branch reuses another branch's exact projection, by
+  fast-forward or a two-parent bridge with its own tip first, once a bounded
+  lineage proof passes, and halts when the proof fails.
+- The foreign-marker refusal becomes a per-branch halt for configured branches
+  too, amending 0045.
+- `resolve` checks the same rule at start and again before pushing.
+
+Three implementation-time amendments were reviewed by Jack:
+- in-range imports count as represented lineage (single-parent only);
+- Step 1 scans every pending mapping, not just the newest;
+- commits replay loop-prevents never trigger reuse.
+
+The operator accepted the halts for a feature branch fast-forwarded onto
+another branch's history, the candidate-bridge restriction, and the
+truncated-index gap. Copybara was checked as prior art. It resumes per
+destination ref from its own label and has no cross-branch reuse; its
+`FAKE_MERGE` is the closest precedent for the bridge's shape. Before the change,
+the six report-scenario and bug-2 tests failed for the reported reasons. Four
+existing foreign-marker tests changed from whole-run error to per-branch halt.
+Not test-first, written after the implementation:
+- proof budget, bridge trust, alias order, prefix naming, policy-before-reuse,
+  truncated index, classification horizon (injected limit), import proofs,
+  Step 1 scan;
+- `resolve` start/finish (including finish refusing a `Contradictory`
+  mapping) and conflict continuation after a bridge or a fast-forward alias;
+- fresh-clone reconstruction, configured round-trip after a bridge.
+Mutation checks confirm that the loop-prevention seam test, `resolve`'s
+start/finish refusal tests and the fast-forward alias test fail without the
+code they cover. That doesn't make
+them test-first.
+Jack approved the decision and implementation on 2026-10-13. His sequential,
+independent verification on the final files: `cargo test --workspace
+--all-features --locked` 441 unit + 4 CLI pass, and fmt, clippy `-D warnings`
+and `git diff --check` pass. Earlier failures in his run (`subprocess_runner`,
+umask) didn't reproduce; overlapping builds are a plausible explanation, not a
+proven cause. Still accepted as limitations:
+- the normal-workflow halts;
+- the candidate two-parent restriction;
+- the incomplete-index gap;
+- the cross-branch concurrency boundary.
+Uncommitted.

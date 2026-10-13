@@ -34,14 +34,15 @@ use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 
 use crate::commands::SecretSource;
-use crate::commands::sync::anchor::dest_resume_point_for_branch;
+use crate::commands::sync::anchor::{ResumeRefusal, dest_resume_point_for_branch};
 use crate::commands::sync::filter::filter_tree;
 use crate::commands::sync::policy_check::{
     find_control_file_policy_mismatch, policy_mismatch_message,
 };
 use crate::commands::sync::{
-    build_dest_commit, build_pending_dest_tip, build_source_commit, pending_commits,
-    pending_dest_commits,
+    build_dest_commit, build_pending_dest_tip, build_source_commit, foreign_mirror_marker_message,
+    pending_commits, pending_dest_commits, resolve_finish_reuse_refusal,
+    resolve_start_reuse_refusal,
 };
 use crate::config::Config;
 use crate::exclude;
@@ -359,8 +360,26 @@ fn start_source_to_dest(
         .peel_to_commit()
         .context("resolving fetched dest branch to a commit")?
         .id();
-    let boundary = dest_resume_point_for_branch(repo, source_tip, dest_tip, branch, state_key)?
-        .with_context(|| format!("dest branch {branch:?} is not safe to build on"))?;
+    let boundary =
+        match dest_resume_point_for_branch(repo, source_tip, dest_tip, branch, state_key)? {
+            Ok(boundary) => boundary,
+            Err(ResumeRefusal::ForeignNewestMirrorMarker {
+                branch: foreign,
+                marker,
+            }) => anyhow::bail!(
+                "gitprism resolve: {}",
+                foreign_mirror_marker_message(
+                    branch,
+                    &foreign,
+                    marker,
+                    config.branches.iter().any(|b| b == branch),
+                )
+            ),
+            Err(refusal) => anyhow::bail!(
+                "dest branch {branch:?} is not safe to build on{}",
+                refusal.inconclusive_note()
+            ),
+        };
     let pending = pending_commits(repo, boundary, source_tip)?;
 
     // decisions/0037's addendum (F-03): the same pre-pass `sync` runs before
@@ -375,6 +394,20 @@ fn start_source_to_dest(
             "gitprism resolve: {}",
             policy_mismatch_message(branch, &mismatch)
         );
+    }
+
+    // decisions/0052 Step 9: never replay commits `sync` would reuse.
+    if let Some(refusal) = resolve_start_reuse_refusal(
+        repo,
+        source_root,
+        config,
+        state_key,
+        &pending,
+        boundary,
+        dest_tip,
+        branch,
+    )? {
+        anyhow::bail!("gitprism resolve: {refusal}");
     }
 
     let build = build_pending_dest_tip(
@@ -676,6 +709,23 @@ fn finish_source_to_dest(
         anyhow::bail!(
             "gitprism resolve: {}",
             policy_mismatch_message(branch, &mismatch)
+        );
+    }
+    // decisions/0052 Step 9: another branch may have projected this commit
+    // while the worktree was open. Operator state is left untouched.
+    if let Some(refusal) = resolve_finish_reuse_refusal(
+        repo,
+        source_root,
+        config,
+        state_key,
+        operation.source_commit,
+        dest_base.id(),
+    )? {
+        anyhow::bail!(
+            "gitprism resolve: {refusal}; pushing this resolution would publish a second, \
+             incomparable copy of it. Save your resolution from {worktree}, remove the operation \
+             with `git worktree remove --force {worktree}`, then run `gitprism sync`",
+            worktree = operation.worktree.display()
         );
     }
     let new_dest = build_dest_commit(
@@ -3438,5 +3488,528 @@ mod tests {
             1,
             "only the customer's commit should be reflected into source's release"
         );
+    }
+
+    // decisions/0052 Step 7/9: reuse followed by a real conflict, and
+    // resolve's start/finish checks against shared projections.
+
+    fn tip_of(repo: &Repository, branch: &str) -> Oid {
+        repo.find_branch(branch, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+    }
+
+    fn tree_plus(repo: &Repository, base: Oid, name: &str, body: &str) -> Oid {
+        let base_tree = repo.find_commit(base).unwrap().tree().unwrap();
+        let mut builder = repo.treebuilder(Some(&base_tree)).unwrap();
+        let blob = repo.blob(body.as_bytes()).unwrap();
+        builder
+            .insert(name, blob, git2::FileMode::Blob.into())
+            .unwrap();
+        builder.write().unwrap()
+    }
+
+    /// A gitprism SourceToDest commit written straight into `repo`.
+    fn mirror_commit(
+        repo: &Repository,
+        parent: Oid,
+        tree: Oid,
+        branch: &str,
+        counterpart: Oid,
+    ) -> Oid {
+        let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+        let message = marker::build_message(
+            "mirrored",
+            marker::Direction::SourceToDest,
+            branch,
+            counterpart,
+            "Gitprism-Source-Commit",
+            &[parent],
+            tree,
+            &signature,
+            &signature,
+            &marker::test_key(),
+        );
+        repo.commit(
+            None,
+            &signature,
+            &signature,
+            &message,
+            &repo.find_tree(tree).unwrap(),
+            &[&repo.find_commit(parent).unwrap()],
+        )
+        .unwrap()
+    }
+
+    struct ReuseConflict {
+        _dest_dir: tempfile::TempDir,
+        dest_repo: Repository,
+        source_dir: tempfile::TempDir,
+        source_repo: Repository,
+        _source_remote: tempfile::TempDir,
+        config: tempfile::NamedTempFile,
+        /// main's projection of `shared`, reused by feature.
+        projection: Oid,
+        shared: Oid,
+        conflicting: Oid,
+    }
+
+    /// main has mirrored s0, feature has its 0044 marker. Dest-native Q sets
+    /// f.txt to "dest"; main imported it as N with f.txt "resolved", then
+    /// mirrored s2 on top of Q. feature catches up to s2 and adds a commit
+    /// changing f.txt, which conflicts once reused onto main's projection.
+    fn reuse_then_conflict() -> ReuseConflict {
+        reuse_then_conflict_shaped(false)
+    }
+
+    /// `feature_on_graft`: feature is created at the graft, so its dest tip
+    /// is the shared base itself and reuse is a fast-forward rather than a
+    /// bridge.
+    fn reuse_then_conflict_shaped(feature_on_graft: bool) -> ReuseConflict {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
+        let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("f.txt", "base")]);
+        let source_dir = tempdir().unwrap();
+        let source_repo = source_grafted_onto(source_dir.path(), "main", dest_tip, &dest_repo);
+        let graft = tip_of(&source_repo, "main");
+        let source_remote = bare_source_remote_seeded_at(&source_repo, "main", graft);
+        let config = write_config(
+            &source_remote.path().display().to_string(),
+            &dest_dir.path().display().to_string(),
+            &["main"],
+        );
+
+        let s0 = if feature_on_graft {
+            graft
+        } else {
+            let s0 = add_commit(&source_repo, "main", &[("s0.txt", "s0")]);
+            crate::commands::sync::run(source_dir.path(), config.path()).unwrap();
+            s0
+        };
+        source_repo
+            .branch("feature", &source_repo.find_commit(s0).unwrap(), false)
+            .unwrap();
+        crate::commands::sync::run(source_dir.path(), config.path()).unwrap();
+
+        let q =
+            add_independent_dest_commit(&dest_repo, tip_of(&dest_repo, "main"), ("f.txt", "dest"));
+        let n = {
+            let tree = tree_plus(&source_repo, s0, "f.txt", "resolved");
+            let signature = Signature::now("gitprism", "gitprism@example.com").unwrap();
+            let message = marker::build_message(
+                "gitprism sync: dest -> source",
+                marker::Direction::DestToSource,
+                "main",
+                q,
+                "Gitprism-Dest-Commit",
+                &[s0],
+                tree,
+                &signature,
+                &signature,
+                &marker::test_key(),
+            );
+            source_repo
+                .commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    &message,
+                    &source_repo.find_tree(tree).unwrap(),
+                    &[&source_repo.find_commit(s0).unwrap()],
+                )
+                .unwrap()
+        };
+        let _ = n;
+        checkout_head_exact(&source_repo);
+        let shared = add_commit(&source_repo, "main", &[("s2.txt", "s2")]);
+        let projection = mirror_commit(
+            &dest_repo,
+            q,
+            tree_plus(&dest_repo, q, "s2.txt", "s2"),
+            "main",
+            shared,
+        );
+        dest_repo
+            .reference("refs/heads/main", projection, true, "main mirrors s2")
+            .unwrap();
+
+        source_repo
+            .branch("feature", &source_repo.find_commit(shared).unwrap(), true)
+            .unwrap();
+        source_repo.set_head("refs/heads/feature").unwrap();
+        checkout_head_exact(&source_repo);
+        let conflicting = add_commit(&source_repo, "feature", &[("f.txt", "source")]);
+
+        ReuseConflict {
+            _dest_dir: dest_dir,
+            dest_repo,
+            source_dir,
+            source_repo,
+            _source_remote: source_remote,
+            config,
+            projection,
+            shared,
+            conflicting,
+        }
+    }
+
+    fn counterpart_of(repo: &Repository, dest_commit: Oid) -> Oid {
+        marker::verify_self(
+            &repo.find_commit(dest_commit).unwrap(),
+            &[marker::Direction::SourceToDest],
+            None,
+            &marker::test_key(),
+        )
+        .unwrap()
+        .counterpart
+    }
+
+    fn start_feature_resolution(fx: &ReuseConflict) -> SourceToDestOperation {
+        let error = run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("the conflict must open a resolution");
+        assert!(format!("{error:#}").contains("--continue"), "{error:#}");
+        let operation =
+            find_source_to_dest_operation(&fx.source_repo, "feature", &marker::test_key()).unwrap();
+        assert_eq!(operation.source_commit, fx.conflicting);
+        operation
+    }
+
+    fn stage_resolution(operation: &SourceToDestOperation) {
+        let worktree_repo = Repository::open(&operation.worktree).unwrap();
+        fs::write(operation.worktree.join("f.txt"), "human resolution").unwrap();
+        let mut index = worktree_repo.index().unwrap();
+        index.add_path(Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+    }
+
+    fn sync_publishes_the_bridge_then_conflicts(fx: &ReuseConflict) -> Oid {
+        let error = crate::commands::sync::run(fx.source_dir.path(), fx.config.path())
+            .expect_err("feature's suffix commit must conflict");
+        assert!(
+            format!("{error:#}").contains(&fx.conflicting.to_string()),
+            "{error:#}"
+        );
+        let bridge = tip_of(&fx.dest_repo, "feature");
+        let bridge_commit = fx.dest_repo.find_commit(bridge).unwrap();
+        assert_eq!(
+            bridge_commit.parent_count(),
+            2,
+            "the bridge is pushed before the conflict"
+        );
+        assert_eq!(bridge_commit.parent_id(1).unwrap(), fx.projection);
+        assert_eq!(
+            counterpart_of(&fx.dest_repo, bridge),
+            fx.shared,
+            "the accounting prefix names the shared commit, never the conflicted one"
+        );
+        bridge
+    }
+
+    #[test]
+    fn a_conflict_after_reuse_publishes_the_bridge_and_resolve_continues_from_it() {
+        let fx = reuse_then_conflict();
+        let bridge = sync_publishes_the_bridge_then_conflicts(&fx);
+
+        let operation = start_feature_resolution(&fx);
+        stage_resolution(&operation);
+        run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect("the resolution must push");
+
+        let resolved = fx
+            .dest_repo
+            .find_commit(tip_of(&fx.dest_repo, "feature"))
+            .unwrap();
+        assert_eq!(resolved.parent_id(0).unwrap(), bridge);
+        assert_eq!(counterpart_of(&fx.dest_repo, resolved.id()), fx.conflicting);
+    }
+
+    #[test]
+    fn resolve_finish_refuses_a_commit_another_branch_projected_meanwhile_and_keeps_the_work() {
+        let fx = reuse_then_conflict();
+        let bridge = sync_publishes_the_bridge_then_conflicts(&fx);
+        let operation = start_feature_resolution(&fx);
+        stage_resolution(&operation);
+
+        // Another branch publishes its own projection of the conflicted commit.
+        fx.source_repo
+            .branch(
+                "other",
+                &fx.source_repo.find_commit(fx.conflicting).unwrap(),
+                false,
+            )
+            .unwrap();
+        let elsewhere = mirror_commit(
+            &fx.dest_repo,
+            fx.projection,
+            tree_plus(&fx.dest_repo, fx.projection, "f.txt", "theirs"),
+            "other",
+            fx.conflicting,
+        );
+        fx.dest_repo
+            .reference("refs/heads/other", elsewhere, true, "other projects it")
+            .unwrap();
+
+        let error = run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect_err("a noncontained projection must refuse the finish");
+        let message = format!("{error:#}");
+        assert!(message.contains("second, incomparable copy"), "{message}");
+        assert!(message.contains("gitprism sync"), "{message}");
+        assert_eq!(
+            tip_of(&fx.dest_repo, "feature"),
+            bridge,
+            "nothing is pushed"
+        );
+        assert!(operation.worktree.exists(), "the worktree is kept");
+        let kept = find_source_to_dest_operation(&fx.source_repo, "feature", &marker::test_key())
+            .expect("the operation state is kept");
+        assert_eq!(kept.source_commit, fx.conflicting);
+        let staged = fs::read_to_string(operation.worktree.join("f.txt")).unwrap();
+        assert_eq!(staged, "human resolution", "the operator's edit is kept");
+
+        git::worktree_remove(fx.source_dir.path(), &operation.worktree).unwrap();
+        fx.source_repo
+            .find_reference(&operation.refname)
+            .unwrap()
+            .delete()
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_finish_allows_a_projection_already_contained_in_its_dest_base() {
+        let fx = reuse_then_conflict();
+        let bridge = sync_publishes_the_bridge_then_conflicts(&fx);
+        let operation = start_feature_resolution(&fx);
+        stage_resolution(&operation);
+
+        // An alias naming the conflicted commit, sitting on feature's own
+        // dest base: it canonicalizes to the base itself.
+        fx.source_repo
+            .branch(
+                "other",
+                &fx.source_repo.find_commit(fx.conflicting).unwrap(),
+                false,
+            )
+            .unwrap();
+        let bridge_tree = fx.dest_repo.find_commit(bridge).unwrap().tree_id();
+        let alias = mirror_commit(&fx.dest_repo, bridge, bridge_tree, "other", fx.conflicting);
+        fx.dest_repo
+            .reference(
+                "refs/heads/other",
+                alias,
+                true,
+                "an alias on feature's base",
+            )
+            .unwrap();
+
+        run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect("a mapping contained in the dest base doesn't block the finish");
+        let resolved = fx
+            .dest_repo
+            .find_commit(tip_of(&fx.dest_repo, "feature"))
+            .unwrap();
+        assert_eq!(resolved.parent_id(0).unwrap(), bridge);
+    }
+
+    #[test]
+    fn resolve_start_refuses_commits_sync_would_reuse() {
+        let fx = reuse_then_conflict();
+        // No sync yet: feature's pending range holds main's reusable s2.
+        let error = run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("resolve must not replay a commit sync would reuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("run `gitprism sync`"), "{message}");
+        assert!(
+            find_source_to_dest_operation(&fx.source_repo, "feature", &marker::test_key()).is_err(),
+            "no operation is opened"
+        );
+    }
+
+    #[test]
+    fn resolve_start_reports_the_mapping_diagnostic_when_reuse_must_halt() {
+        let fx = reuse_then_conflict();
+        // A second, incomparable projection of s2 makes its mapping
+        // contradictory.
+        fx.source_repo
+            .branch(
+                "other",
+                &fx.source_repo.find_commit(fx.shared).unwrap(),
+                false,
+            )
+            .unwrap();
+        let q = fx
+            .dest_repo
+            .find_commit(fx.projection)
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        let d_s0 = fx.dest_repo.find_commit(q).unwrap().parent_id(0).unwrap();
+        let rival = mirror_commit(
+            &fx.dest_repo,
+            d_s0,
+            tree_plus(&fx.dest_repo, d_s0, "s2.txt", "s2"),
+            "other",
+            fx.shared,
+        );
+        fx.dest_repo
+            .reference("refs/heads/other", rival, true, "a rival projection")
+            .unwrap();
+
+        let error = run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            false,
+            Direction::SourceToDest,
+        )
+        .expect_err("a contradictory mapping must refuse the start");
+        let message = format!("{error:#}");
+        assert!(message.contains("contradictory"), "{message}");
+        assert!(!message.contains("run `gitprism sync`"), "{message}");
+    }
+
+    #[test]
+    fn a_conflict_after_a_fast_forward_reuse_publishes_an_alias_naming_the_shared_commit() {
+        let fx = reuse_then_conflict_shaped(true);
+        let error = crate::commands::sync::run(fx.source_dir.path(), fx.config.path())
+            .expect_err("feature's suffix commit must conflict");
+        assert!(
+            format!("{error:#}").contains(&fx.conflicting.to_string()),
+            "{error:#}"
+        );
+        let alias = tip_of(&fx.dest_repo, "feature");
+        let alias_commit = fx.dest_repo.find_commit(alias).unwrap();
+        assert_eq!(
+            alias_commit.parent_count(),
+            1,
+            "a fast-forward needs no bridge"
+        );
+        assert_eq!(
+            alias_commit.parent_id(0).unwrap(),
+            fx.projection,
+            "the clean prefix is published before the conflict"
+        );
+        assert_eq!(
+            alias_commit.tree_id(),
+            fx.dest_repo.find_commit(fx.projection).unwrap().tree_id()
+        );
+        assert_eq!(
+            counterpart_of(&fx.dest_repo, alias),
+            fx.shared,
+            "the alias names the shared commit, never the conflicted source tip"
+        );
+
+        let operation = start_feature_resolution(&fx);
+        stage_resolution(&operation);
+        run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect("the resolution must push");
+        let resolved = fx
+            .dest_repo
+            .find_commit(tip_of(&fx.dest_repo, "feature"))
+            .unwrap();
+        assert_eq!(resolved.parent_id(0).unwrap(), alias);
+        assert_eq!(counterpart_of(&fx.dest_repo, resolved.id()), fx.conflicting);
+    }
+
+    #[test]
+    fn resolve_finish_refuses_a_contradictory_mapping_and_keeps_the_work() {
+        let fx = reuse_then_conflict();
+        let bridge = sync_publishes_the_bridge_then_conflicts(&fx);
+        let operation = start_feature_resolution(&fx);
+        stage_resolution(&operation);
+
+        // Two other branches publish incomparable projections of the
+        // conflicted commit.
+        let q = fx
+            .dest_repo
+            .find_commit(fx.projection)
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        for (branch, parent) in [("other-a", fx.projection), ("other-b", q)] {
+            fx.source_repo
+                .branch(
+                    branch,
+                    &fx.source_repo.find_commit(fx.conflicting).unwrap(),
+                    false,
+                )
+                .unwrap();
+            let projection = mirror_commit(
+                &fx.dest_repo,
+                parent,
+                tree_plus(&fx.dest_repo, parent, "f.txt", branch),
+                branch,
+                fx.conflicting,
+            );
+            fx.dest_repo
+                .reference(&format!("refs/heads/{branch}"), projection, true, "rival")
+                .unwrap();
+        }
+
+        let error = run_with_direction_test(
+            fx.source_dir.path(),
+            fx.config.path(),
+            "feature",
+            true,
+            Direction::SourceToDest,
+        )
+        .expect_err("a contradictory mapping must refuse the finish");
+        let message = format!("{error:#}");
+        assert!(message.contains("contradictory"), "{message}");
+        assert_eq!(
+            tip_of(&fx.dest_repo, "feature"),
+            bridge,
+            "nothing is pushed"
+        );
+        assert!(operation.worktree.exists(), "the worktree is kept");
+        find_source_to_dest_operation(&fx.source_repo, "feature", &marker::test_key())
+            .expect("the operation state is kept");
+        let staged = fs::read_to_string(operation.worktree.join("f.txt")).unwrap();
+        assert_eq!(staged, "human resolution", "the operator's edit is kept");
+
+        git::worktree_remove(fx.source_dir.path(), &operation.worktree).unwrap();
+        fx.source_repo
+            .find_reference(&operation.refname)
+            .unwrap()
+            .delete()
+            .unwrap();
     }
 }

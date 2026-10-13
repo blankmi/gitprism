@@ -29,6 +29,7 @@ mod filter;
 // for every submodule that references `limits::MAX_*` unqualified.
 mod limit_tests;
 mod local_advance;
+mod lockstep;
 mod policy_check;
 mod run_entrypoint;
 mod scheduling;

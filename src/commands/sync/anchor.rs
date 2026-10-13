@@ -245,10 +245,12 @@ fn dest_tip_represented_in_source(
 /// (`dest_tip` is itself the newest marker and is branded for `branch`);
 /// case 2 passes when nothing was ever mirrored below the graft. A
 /// `dest_tip` sitting on a foreign-branded newest marker refuses today's
-/// way regardless of how it was accounted for, and the operator's existing
-/// recovery (delete the stray dest ref; the `!dest_ref_exists` arm then
-/// re-anchors it via decisions/0046 and `branch_scoped_dest_tip` writes it
-/// a marker of its own) stands.
+/// way regardless of how it was accounted for. For a mirror-only
+/// (discovered) branch the operator's recovery is deleting the stray dest
+/// ref: the `!dest_ref_exists` arm then re-anchors it via decisions/0046 and
+/// `branch_scoped_dest_tip` writes it a marker of its own. A configured
+/// branch's missing dest ref fails dest→source (decisions/0018), so it needs
+/// manual reconciliation instead (decisions/0052 Part 2).
 fn newest_mirror_marker_belongs_to_branch(
     repo: &Repository,
     dest_tip: Oid,
@@ -328,18 +330,54 @@ fn newest_source_to_dest_marker_branch_between(
     dest_tip: Oid,
     key: &marker::StateKey,
 ) -> Result<Option<String>> {
+    match newest_mirror_marker(repo, dest_tip, key)? {
+        NewestMirrorMarker::None => Ok(None),
+        NewestMirrorMarker::Found { branch, .. } => Ok(Some(branch)),
+        NewestMirrorMarker::Horizon => anyhow::bail!(
+            "source->dest's prior-mirror safety check exceeds the {} commit limit",
+            limits::MAX_MARKER_SCAN_COMMITS
+        ),
+    }
+}
+
+enum NewestMirrorMarker {
+    None,
+    Found { branch: String, marker: Oid },
+    Horizon,
+}
+
+/// The newest self-verified `SourceToDest` marker on `dest_tip`'s whole
+/// first-parent line. Reaching `MAX_MARKER_SCAN_COMMITS` is reported as
+/// [`NewestMirrorMarker::Horizon`] so each caller chooses its own semantics.
+fn newest_mirror_marker(
+    repo: &Repository,
+    dest_tip: Oid,
+    key: &marker::StateKey,
+) -> Result<NewestMirrorMarker> {
+    newest_mirror_marker_bounded(repo, dest_tip, key, limits::MAX_MARKER_SCAN_COMMITS)
+}
+
+fn newest_mirror_marker_bounded(
+    repo: &Repository,
+    dest_tip: Oid,
+    key: &marker::StateKey,
+    scan_limit: usize,
+) -> Result<NewestMirrorMarker> {
     let mut current = dest_tip;
-    for _ in 0..limits::MAX_MARKER_SCAN_COMMITS {
+    for _ in 0..scan_limit {
         let commit = repo.find_commit(current).with_context(|| {
             format!("resolving {current} while checking dest's line for its newest mirror marker")
         })?;
         if let Some(marker) =
             marker::verify_self(&commit, &[MarkerDirection::SourceToDest], None, key)
         {
-            return Ok(Some(marker.branch));
+            return Ok(NewestMirrorMarker::Found {
+                branch: marker.branch,
+                marker: current,
+            });
         }
         if commit.parent_count() == 0 {
-            return Ok(None);
+            return Ok(NewestMirrorMarker::None);
         }
         current = commit.parent_id(0).with_context(|| {
             format!(
@@ -347,9 +385,69 @@ fn newest_source_to_dest_marker_branch_between(
             )
         })?;
     }
-    anyhow::bail!(
-        "source->dest's prior-mirror safety check exceeds the {} commit limit",
-        limits::MAX_MARKER_SCAN_COMMITS
+    Ok(NewestMirrorMarker::Horizon)
+}
+
+/// Why [`dest_resume_point_for_branch`] refused (decisions/0052 Part 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeRefusal {
+    /// The newest mirror marker on dest's line belongs to another branch.
+    ForeignNewestMirrorMarker { branch: String, marker: Oid },
+    /// Any other refusal. `classification_inconclusive` is set when the
+    /// foreign-marker classification walk reached its horizon.
+    Unsafe { classification_inconclusive: bool },
+}
+
+impl ResumeRefusal {
+    /// Extra diagnostic text for an `Unsafe` refusal whose classification
+    /// was inconclusive; empty otherwise.
+    pub(crate) fn inconclusive_note(&self) -> &'static str {
+        match self {
+            Self::Unsafe {
+                classification_inconclusive: true,
+            } => {
+                " (whether another branch's mirror marker caused this couldn't be determined \
+                 within the scan limit)"
+            }
+            _ => "",
+        }
+    }
+}
+
+/// decisions/0052 Part 2: classification only chooses the refusal's
+/// diagnostic; it never accepts. A horizon keeps the original refusal.
+fn classify_refusal(
+    repo: &Repository,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<ResumeRefusal> {
+    classify_refusal_bounded(repo, dest_tip, branch, key, limits::MAX_MARKER_SCAN_COMMITS)
+}
+
+pub(super) fn classify_refusal_bounded(
+    repo: &Repository,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+    scan_limit: usize,
+) -> Result<ResumeRefusal> {
+    Ok(
+        match newest_mirror_marker_bounded(repo, dest_tip, key, scan_limit)? {
+            NewestMirrorMarker::Found {
+                branch: found,
+                marker,
+            } if found != branch => ResumeRefusal::ForeignNewestMirrorMarker {
+                branch: found,
+                marker,
+            },
+            NewestMirrorMarker::Horizon => ResumeRefusal::Unsafe {
+                classification_inconclusive: true,
+            },
+            _ => ResumeRefusal::Unsafe {
+                classification_inconclusive: false,
+            },
+        },
     )
 }
 
@@ -364,8 +462,9 @@ pub(super) fn dest_tip_is_accounted_for(
 }
 
 /// Where source's pending-commit walk ([`super::pending_commits`], feeding
-/// [`super::build_pending_dest_tip`]) resumes from — `None` if dest carries
-/// history gitprism doesn't recognize as safe to build on at all.
+/// [`super::build_pending_dest_tip`]) resumes from — a [`ResumeRefusal`] if
+/// dest carries history gitprism doesn't recognize as safe to build on at
+/// all, classified by decisions/0052 Part 2 for its diagnostic only.
 ///
 /// Two independent questions, computed separately:
 ///
@@ -393,11 +492,24 @@ pub(super) fn dest_tip_is_accounted_for(
 ///
 /// When the newest marker isn't usable — missing from this clone's odb
 /// entirely, or found but not actually an ancestor of `source_tip` — the
-/// answer is to refuse (`Ok(None)`) rather than fall back to an older marker
+/// answer is to refuse (a [`ResumeRefusal`]) rather than fall back to an older marker
 /// or to the graft: an older boundary would make [`super::pending_commits`]
 /// re-yield everything between the two markers, the same bug with a wider
 /// blast radius.
 pub(crate) fn dest_resume_point_for_branch(
+    repo: &Repository,
+    source_tip: Oid,
+    dest_tip: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<std::result::Result<Oid, ResumeRefusal>> {
+    match unclassified_resume_point(repo, source_tip, dest_tip, branch, key)? {
+        Some(boundary) => Ok(Ok(boundary)),
+        None => Ok(Err(classify_refusal(repo, dest_tip, branch, key)?)),
+    }
+}
+
+fn unclassified_resume_point(
     repo: &Repository,
     source_tip: Oid,
     dest_tip: Oid,
@@ -458,14 +570,14 @@ pub(super) fn dest_resume_point(
     dest_tip: Oid,
 ) -> Result<Option<Oid>> {
     let key = marker::test_key();
-    dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)
+    Ok(dest_resume_point_for_branch(repo, source_tip, dest_tip, "main", &key)?.ok())
 }
 
 /// decisions/0039 (amended by decisions/0050): positively identifies a
 /// rewritten mirror-only source branch — a state checked directly by four
 /// conditions here, not inferred from exhausted retries. Callable only once
-/// [`dest_resume_point_for_branch`] has already refused (returned
-/// `Ok(None)`) for this `(source_tip, dest_tip)` pair; the caller is also
+/// [`dest_resume_point_for_branch`] has already refused (returned a
+/// [`ResumeRefusal`]) for this `(source_tip, dest_tip)` pair; the caller is also
 /// responsible for condition 1 (mirror-only — absent from `config.branches`)
 /// and condition 2 (`dest_ref_exists`), since both are already known at the
 /// one call site this is used from. This function checks the remaining two:

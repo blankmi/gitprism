@@ -89,6 +89,7 @@ mod local_advance;
 mod mapping_index;
 mod marker_scan;
 pub(crate) mod policy_check;
+mod reuse;
 
 use std::path::Path;
 
@@ -112,6 +113,7 @@ use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
 use marker_scan::{dest_to_source_boundary, newest_source_marker};
 use policy_check::{find_control_file_policy_mismatch, policy_mismatch_message};
+use reuse::ReusePlan;
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
 /// from scratch this many times before sync gives up and fails loudly. Exact
@@ -435,7 +437,7 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
 
     if any_branch_halted {
         anyhow::bail!(
-            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a discovered branch had contradictory exact dest mappings, or a discovered branch's existing dest ref wasn't safe to build on — see the branch lines above for the affected commit(s)/branch(es) and remedy"
+            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a branch had contradictory exact dest mappings, a discovered branch's existing dest ref wasn't safe to build on, a branch's dest ref carries another branch's newest mirror marker, or reusing another branch's projection couldn't be proven safe — see the branch lines above for the affected commit(s)/branch(es) and remedy"
         );
     }
 
@@ -638,7 +640,7 @@ fn sync_pair_to_dest_with_key(
                 branch,
                 state_key,
             )? {
-                Some(boundary) => (fetched_dest_tip, boundary),
+                Ok(boundary) => (fetched_dest_tip, boundary),
                 // decisions/0039: `round_tripped` is the authority invariant
                 // itself — a mirror-only branch's dest ref is a projection
                 // nothing ever imports back (decisions/0017), so nothing on
@@ -648,14 +650,15 @@ fn sync_pair_to_dest_with_key(
                 // reaches this arm regardless of how the four conditions
                 // otherwise line up, and falls through to the ordinary
                 // refusal below instead.
-                None if !round_tripped
-                    && mirror_only_rewrite_detected(
-                        repo,
-                        source_tip,
-                        fetched_dest_tip,
-                        branch,
-                        state_key,
-                    )? =>
+                Err(_)
+                    if !round_tripped
+                        && mirror_only_rewrite_detected(
+                            repo,
+                            source_tip,
+                            fetched_dest_tip,
+                            branch,
+                            state_key,
+                        )? =>
                 {
                     // decisions/0050 condition 5: a non-descendant local tip
                     // is only evidence source itself was rewritten when this
@@ -773,17 +776,43 @@ fn sync_pair_to_dest_with_key(
                     };
                     (rebuild_dest_tip, boundary)
                 }
-                None if round_tripped => anyhow::bail!(
-                    "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)"
-                ),
-                // decisions/0045: per-branch halt for a discovered branch.
-                None => {
+                // decisions/0052 Part 2 (amends decisions/0045): a
+                // foreign newest mirror marker halts only this branch,
+                // configured or not.
+                Err(anchor::ResumeRefusal::ForeignNewestMirrorMarker {
+                    branch: foreign,
+                    marker,
+                }) => {
                     reporter.complete(
                         Outcome::Error,
                         branch,
                         Direction::SourceToDest,
                         round_tripped,
-                        Some(&unsafe_to_build_on_message(branch)),
+                        Some(&foreign_mirror_marker_message(
+                            branch,
+                            &foreign,
+                            marker,
+                            round_tripped,
+                        )),
+                    );
+                    return Ok(true);
+                }
+                Err(refusal) if round_tripped => anyhow::bail!(
+                    "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first){}",
+                    refusal.inconclusive_note()
+                ),
+                // decisions/0045: per-branch halt for a discovered branch.
+                Err(refusal) => {
+                    reporter.complete(
+                        Outcome::Error,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&format!(
+                            "{}{}",
+                            unsafe_to_build_on_message(branch),
+                            refusal.inconclusive_note()
+                        )),
                     );
                     return Ok(true);
                 }
@@ -920,12 +949,60 @@ fn sync_pair_to_dest_with_key(
             return Ok(false);
         }
 
+        // decisions/0052 Part 1: after the policy check above has covered
+        // the original `boundary..source_tip` range, an existing ref whose
+        // pending commits another branch already projected reuses that
+        // projection instead of replaying a second copy.
+        let reuse = if dest_ref_exists && matches!(push_mode, PushMode::FastForwardOnly) {
+            reuse::plan_projection_reuse(
+                repo,
+                &run_cache.mapping_index,
+                &pending_for_policy_check,
+                boundary,
+                dest_tip,
+                branch,
+                state_key,
+            )?
+        } else {
+            ReusePlan::Replay
+        };
+        let (build_boundary, build_base, bridge) = match reuse {
+            ReusePlan::Replay => (boundary, dest_tip, None),
+            ReusePlan::Halt(diagnostic) => {
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::SourceToDest,
+                    round_tripped,
+                    Some(&format!("{branch:?} halted — {diagnostic}")),
+                );
+                return Ok(true);
+            }
+            ReusePlan::FastForward {
+                shared_source,
+                projection,
+            } => (shared_source, projection, None),
+            ReusePlan::Bridge {
+                shared_source,
+                projection,
+            } => {
+                let shared = repo
+                    .find_commit(shared_source)
+                    .context("resolving the shared source commit")?;
+                let bridge = build_bridge_commit(
+                    repo, config, dest_tip, projection, &shared, branch, state_key,
+                )?;
+                (shared_source, bridge, Some(bridge))
+            }
+        };
+        let reused = build_boundary != boundary;
+
         let build = build_pending_dest_tip(
             repo,
             config,
             exclude_list,
-            boundary,
-            dest_tip,
+            build_boundary,
+            build_base,
             source_tip,
             source_root,
             branch,
@@ -953,6 +1030,22 @@ fn sync_pair_to_dest_with_key(
         let force_rebuild = matches!(push_mode, PushMode::ForceMirrorOnly { .. });
         let new_dest_tip = match build.new_tip {
             Some(tip) => Some(tip),
+            // decisions/0052 Step 7: the accounting prefix names the shared
+            // source commit, never `source_tip`, so it can't certify suffix
+            // commits that were skipped or conflicted.
+            None if reused => Some(match bridge {
+                Some(bridge) => bridge,
+                None => {
+                    let shared = repo
+                        .find_commit(build_boundary)
+                        .context("resolving the shared source commit")?;
+                    let tree = repo
+                        .find_commit(build_base)
+                        .context("resolving the reused projection")?
+                        .tree_id();
+                    build_dest_commit(repo, config, build_base, &shared, tree, branch, state_key)?
+                }
+            }),
             None if force_rebuild || !dest_ref_exists => Some(branch_scoped_dest_tip(
                 repo, config, dest_tip, source_tip, branch, state_key,
             )?),
@@ -1029,6 +1122,12 @@ fn sync_pair_to_dest_with_key(
                             new_dest_tip,
                             state_key,
                         );
+                    } else if let Some(bridge) = bridge {
+                        // decisions/0052 Step 8: an intermediate bridge
+                        // under newly built commits.
+                        run_cache
+                            .mapping_index
+                            .record_pushed_dest_commit(repo, branch, bridge, state_key);
                     }
                 }
                 git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
@@ -1112,6 +1211,109 @@ fn sync_pair_to_dest_with_key(
         );
         return Ok(false);
     }
+}
+
+/// decisions/0052 Step 9: the mapping index `run` would build, for a
+/// `resolve` invocation, which has no run-wide cache of its own.
+fn reconstruct_mapping_index_for_resolve(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    key: &marker::StateKey,
+) -> Result<mapping_index::MappingIndex> {
+    let dest_url = config.dest_url()?;
+    let (source_branches, _) = list_source_branches(repo)?;
+    let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(source_root, &dest_url, &dest_listing.names)?;
+    let mut run_cache = RunCache::default();
+    anchor::reconstruct_mapping_index(
+        repo,
+        source_root,
+        &dest_url,
+        &dest_listing,
+        &source_branches,
+        key,
+        &mut run_cache,
+    )
+}
+
+/// decisions/0052 Step 9, start: `None` when `resolve` may start, otherwise
+/// the reason it must not. Uses the same plan `sync` runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_start_reuse_refusal(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    key: &marker::StateKey,
+    pending: &[Oid],
+    boundary: Oid,
+    dest_tip: Oid,
+    branch: &str,
+) -> Result<Option<String>> {
+    let index = reconstruct_mapping_index_for_resolve(repo, source_root, config, key)?;
+    Ok(
+        match reuse::plan_projection_reuse(repo, &index, pending, boundary, dest_tip, branch, key)?
+        {
+            ReusePlan::Replay => None,
+            ReusePlan::FastForward { shared_source, .. }
+            | ReusePlan::Bridge { shared_source, .. } => Some(format!(
+                "source commit {shared_source} in {branch:?}'s pending range is already projected \
+                 to dest by another branch; run `gitprism sync`, which reuses that projection and \
+                 reports any conflict that remains"
+            )),
+            ReusePlan::Halt(diagnostic) => Some(format!("{branch:?} halted — {diagnostic}")),
+        },
+    )
+}
+
+/// decisions/0052 Step 9, finish: `None` when the resolution of
+/// `source_commit` may be pushed onto `dest_base`, otherwise why not.
+pub(crate) fn resolve_finish_reuse_refusal(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    key: &marker::StateKey,
+    source_commit: Oid,
+    dest_base: Oid,
+) -> Result<Option<String>> {
+    let index = reconstruct_mapping_index_for_resolve(repo, source_root, config, key)?;
+    Ok(
+        match reuse::classify_shared_mapping(repo, &index, source_commit, dest_base)? {
+            reuse::SharedMapping::None | reuse::SharedMapping::Contained => None,
+            reuse::SharedMapping::NotContained(projection) => Some(format!(
+                "source commit {source_commit} is now projected to dest as {projection} by \
+                 another branch"
+            )),
+            reuse::SharedMapping::Contradictory(diagnostic) => Some(diagnostic),
+        },
+    )
+}
+
+/// decisions/0052 Part 2. Deleting the dest ref is offered only for a
+/// discovered branch: a configured branch's missing dest ref fails the
+/// earlier dest→source phase (decisions/0018).
+pub(crate) fn foreign_mirror_marker_message(
+    branch: &str,
+    foreign: &str,
+    marker: Oid,
+    round_tripped: bool,
+) -> String {
+    let remedy = if round_tripped {
+        format!(
+            "reconcile dest's {branch:?} manually, e.g. restore it to a commit whose newest \
+             gitprism mirror marker is {branch:?}'s own (such as its previous tip)"
+        )
+    } else {
+        format!(
+            "delete dest's {branch:?} branch; the next sync recreates it from the nearest \
+             exact mapping with a marker of its own"
+        )
+    };
+    format!(
+        "{branch:?} halted — the newest gitprism mirror marker on dest's {branch:?} line \
+         ({marker}) belongs to branch {foreign:?}, and gitprism doesn't resume a branch on \
+         another branch's projection; {remedy}"
+    )
 }
 
 /// decisions/0045: refusal text for a *discovered* branch. Unlike the
@@ -1505,9 +1707,60 @@ pub(crate) fn build_dest_commit(
     branch: &str,
     key: &marker::StateKey,
 ) -> Result<Oid> {
-    let parent_commit = repo
-        .find_commit(parent)
-        .context("resolving the dest chain's parent commit")?;
+    build_dest_commit_with_parents(
+        repo,
+        config,
+        &[parent],
+        source_commit,
+        filtered_tree_oid,
+        branch,
+        key,
+    )
+}
+
+/// decisions/0052 Step 7's bridge: parents `(dest_tip, projection)`, the
+/// projection's tree. The only producer of an authenticated two-parent
+/// `SourceToDest` commit; call it only after `reuse`'s proof passed.
+fn build_bridge_commit(
+    repo: &Repository,
+    config: &Config,
+    dest_tip: Oid,
+    projection: Oid,
+    shared_source: &git2::Commit,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Oid> {
+    let tree = repo
+        .find_commit(projection)
+        .context("resolving the reused projection")?
+        .tree_id();
+    build_dest_commit_with_parents(
+        repo,
+        config,
+        &[dest_tip, projection],
+        shared_source,
+        tree,
+        branch,
+        key,
+    )
+}
+
+fn build_dest_commit_with_parents(
+    repo: &Repository,
+    config: &Config,
+    parents: &[Oid],
+    source_commit: &git2::Commit,
+    filtered_tree_oid: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Oid> {
+    let parent_commits = parents
+        .iter()
+        .map(|parent| {
+            repo.find_commit(*parent)
+                .context("resolving the dest chain's parent commit")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let tree = repo
         .find_tree(filtered_tree_oid)
         .context("reading the filtered tree")?;
@@ -1519,7 +1772,7 @@ pub(crate) fn build_dest_commit(
         branch,
         source_commit.id(),
         "Gitprism-Source-Commit",
-        &[parent],
+        parents,
         tree.id(),
         &source_commit.author(),
         &committer,
@@ -1532,7 +1785,7 @@ pub(crate) fn build_dest_commit(
         &committer,
         &message,
         &tree,
-        &[&parent_commit],
+        &parent_commits.iter().collect::<Vec<_>>(),
     )
     .with_context(|| {
         format!(
