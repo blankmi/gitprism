@@ -29,7 +29,9 @@ mod filter;
 // for every submodule that references `limits::MAX_*` unqualified.
 mod limit_tests;
 mod local_advance;
+mod lockstep;
 mod policy_check;
+mod recreate;
 mod run_entrypoint;
 mod scheduling;
 mod source_to_dest;
@@ -471,6 +473,7 @@ fn sync_pair_to_dest(
         &exclude_list,
         &ignore_raw,
         run_cache,
+        false,
     )
 }
 
@@ -485,7 +488,7 @@ fn sync_pair_from_dest(
     config: &Config,
     branch: &str,
     reporter: &Reporter,
-) -> Result<()> {
+) -> Result<DestToSourceOutcome> {
     let key = marker::test_key();
     let dest_url = config.dest_url()?;
     let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
@@ -498,6 +501,7 @@ fn sync_pair_from_dest(
         reporter,
         &key,
         &dest_listing,
+        false,
     )
 }
 

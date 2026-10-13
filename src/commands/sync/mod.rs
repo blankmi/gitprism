@@ -89,6 +89,7 @@ mod local_advance;
 mod mapping_index;
 mod marker_scan;
 pub(crate) mod policy_check;
+mod reuse;
 
 use std::path::Path;
 
@@ -112,6 +113,7 @@ use filter::{empty_tree, filter_tree};
 use local_advance::{advance_local_source_branch, preflight_local_source_branch};
 use marker_scan::{dest_to_source_boundary, newest_source_marker};
 use policy_check::{find_control_file_policy_mismatch, policy_mismatch_message};
+use reuse::ReusePlan;
 
 /// A lost fast-forward race (decisions/0009) is refetched and recomputed
 /// from scratch this many times before sync gives up and fails loudly. Exact
@@ -232,7 +234,112 @@ pub(crate) fn run(cwd: &Path, config_path: &Path) -> Result<()> {
     run_with(cwd, config_path, &secrets)
 }
 
+/// Per-invocation operator requests that are not policy (decisions/0053).
+#[derive(Debug, Default)]
+pub(crate) struct SyncOptions {
+    pub(crate) recreate_dest: std::collections::BTreeSet<String>,
+}
+
+impl SyncOptions {
+    pub(crate) fn new(recreate_dest: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            recreate_dest: recreate_dest.into_iter().collect(),
+        }
+    }
+}
+
+/// A configured branch's dest→source result, as far as `run` needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DestToSourceOutcome {
+    Synced,
+    /// Reported; source→dest must skip the branch this run.
+    Halted,
+    /// decisions/0053: dest ref absent and recreation requested.
+    Recreating,
+}
+
+/// [`run`] with `--recreate-dest` for each of `branches`.
+#[cfg(test)]
+pub(crate) fn run_recreating(cwd: &Path, config_path: &Path, branches: &[&str]) -> Result<()> {
+    let source_root = Repository::discover(cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let resolved_config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        source_root.join(config_path)
+    };
+    let secrets = crate::commands::FixedSecrets::for_fixture(
+        &resolved_config_path,
+        &source_root.join(exclude::FILENAME),
+    );
+    run_with_options(
+        cwd,
+        config_path,
+        &secrets,
+        &SyncOptions::new(branches.iter().map(|branch| (*branch).to_owned())),
+    )
+}
+
+pub(crate) fn missing_configured_dest_ref_message(branch: &str) -> String {
+    format!(
+        "{branch:?} halted — round-tripped branch has no ref on dest. gitprism never deletes a \
+         dest ref; if the deletion was intended, run `gitprism sync --recreate-dest <branch>` \
+         for {branch:?} to recreate it from the nearest exact mapping. Dest content not imported into source \
+         before the deletion is not restored — inspect and save it before deleting a \
+         configured branch's dest ref"
+    )
+}
+
+fn appeared_during_recreation_message(branch: &str) -> String {
+    format!(
+        "{branch:?} halted — dest's {branch:?} appeared during `--recreate-dest` and was left \
+         unchanged; rerun without the flag to import and resume"
+    )
+}
+
+/// decisions/0053: every requested name is checked before any lock, fetch
+/// or push.
+fn validate_recreate_requests(
+    repo: &Repository,
+    config: &Config,
+    options: &SyncOptions,
+) -> Result<()> {
+    for branch in &options.recreate_dest {
+        git::validate_branch_name(branch)
+            .with_context(|| format!("`--recreate-dest` value {branch:?}"))?;
+        if !config
+            .branches
+            .iter()
+            .any(|configured| configured == branch)
+        {
+            anyhow::bail!(
+                "`--recreate-dest` value {branch:?}: not in config.branches — a discovered \
+                 branch's dest ref is recreated without the flag"
+            );
+        }
+        if repo.find_branch(branch, git2::BranchType::Local).is_err() {
+            anyhow::bail!(
+                "`--recreate-dest` value {branch:?}: there is no local source branch to \
+                 recreate dest's {branch:?} from"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSource) -> Result<()> {
+    run_with_options(cwd, config_path, secrets, &SyncOptions::default())
+}
+
+pub(crate) fn run_with_options(
+    cwd: &Path,
+    config_path: &Path,
+    secrets: &dyn SecretSource,
+    options: &SyncOptions,
+) -> Result<()> {
     // Repository discovery first, so a wrong cwd reports that, not a
     // missing/malformed state key (F-14) — the pair secret is still
     // validated before fetching or constructing any commits either way.
@@ -263,6 +370,7 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
     // (decisions/0037's amendment): it's verified once, globally, right
     // above by `load_run_policy`, and never re-read per branch or per commit.
     let ignore_raw = verified_policy.ignore_raw;
+    validate_recreate_requests(&repo, &config, options)?;
     let _operation_lock = crate::lock::OperationLock::acquire(&repo)?;
 
     // Checked once per run, not once per merge (decisions/0016) — an
@@ -325,8 +433,9 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
     // per branch, since discovery above only runs once, before either phase
     // (decisions/0017, decisions/0020).
     let mut run_cache = RunCache::default();
+    let mut halted_in_dest_to_source = std::collections::HashSet::new();
     for branch in &config.branches {
-        sync_pair_from_dest_with_key(
+        let outcome = sync_pair_from_dest_with_key(
             &repo,
             &source_root,
             &config,
@@ -334,8 +443,12 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
             &reporter,
             &state_key,
             &dest_listing,
+            options.recreate_dest.contains(branch),
         )
         .with_context(|| format!("syncing {branch:?} dest -> source"))?;
+        if outcome == DestToSourceOutcome::Halted {
+            halted_in_dest_to_source.insert(branch.clone());
+        }
     }
 
     // source→dest discovers every branch that exists on source at run time
@@ -373,6 +486,24 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
     // from the nearest exact mapping so a parent projection is available to
     // its child later in this run (decisions/0046).
     let mut remaining_branches = source_branches.clone();
+    // decisions/0053: removed before scheduling, so a halted branch is
+    // neither recreated implicitly nor a source of secondary errors.
+    if !halted_in_dest_to_source.is_empty() {
+        any_branch_halted = true;
+        remaining_branches.retain(|branch| {
+            if !halted_in_dest_to_source.contains(branch) {
+                return true;
+            }
+            reporter.complete(
+                Outcome::Skipped,
+                branch,
+                Direction::SourceToDest,
+                true,
+                Some("halted in dest→source"),
+            );
+            false
+        });
+    }
     let mut branches_with_no_mapping = std::collections::HashSet::new();
     while !remaining_branches.is_empty() {
         let (halted_by_distance_error, selected) =
@@ -419,6 +550,7 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
             &exclude_list,
             &ignore_raw,
             &mut run_cache,
+            options.recreate_dest.contains(&branch),
         )
         .with_context(|| format!("syncing {branch:?} source -> dest"))?;
         any_branch_halted |= halted;
@@ -435,7 +567,7 @@ pub(crate) fn run_with(cwd: &Path, config_path: &Path, secrets: &dyn SecretSourc
 
     if any_branch_halted {
         anyhow::bail!(
-            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a discovered branch had contradictory exact dest mappings, or a discovered branch's existing dest ref wasn't safe to build on — see the branch lines above for the affected commit(s)/branch(es) and remedy"
+            "gitprism sync: one or more branches halted — a replayed commit's control file disagreed with the pinned policy, a branch had contradictory exact dest mappings, a discovered branch's existing dest ref wasn't safe to build on, a branch's dest ref carries another branch's newest mirror marker, or reusing another branch's projection couldn't be proven safe — see the branch lines above for the affected commit(s)/branch(es) and remedy"
         );
     }
 
@@ -542,6 +674,7 @@ fn sync_pair_to_dest_with_key(
     exclude_list: &ExcludeList,
     ignore_raw: &str,
     run_cache: &mut RunCache,
+    recreate: bool,
 ) -> Result<bool> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating source branch {branch:?}"))?;
@@ -582,6 +715,21 @@ fn sync_pair_to_dest_with_key(
         // override on its own. Every other path through this loop leaves it
         // at the fast-forward-only default.
         let mut push_mode = PushMode::FastForwardOnly;
+        // decisions/0053: a requested recreation only ever creates an absent
+        // ref. Absence was chosen from the listing; the push enforces it.
+        if recreate {
+            if dest_ref_exists {
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::SourceToDest,
+                    round_tripped,
+                    Some(&appeared_during_recreation_message(branch)),
+                );
+                return Ok(true);
+            }
+            push_mode = PushMode::CreateOnly;
+        }
 
         let (dest_tip, boundary) = if dest_ref_exists {
             if round_tripped {
@@ -638,7 +786,7 @@ fn sync_pair_to_dest_with_key(
                 branch,
                 state_key,
             )? {
-                Some(boundary) => (fetched_dest_tip, boundary),
+                Ok(boundary) => (fetched_dest_tip, boundary),
                 // decisions/0039: `round_tripped` is the authority invariant
                 // itself — a mirror-only branch's dest ref is a projection
                 // nothing ever imports back (decisions/0017), so nothing on
@@ -648,14 +796,15 @@ fn sync_pair_to_dest_with_key(
                 // reaches this arm regardless of how the four conditions
                 // otherwise line up, and falls through to the ordinary
                 // refusal below instead.
-                None if !round_tripped
-                    && mirror_only_rewrite_detected(
-                        repo,
-                        source_tip,
-                        fetched_dest_tip,
-                        branch,
-                        state_key,
-                    )? =>
+                Err(_)
+                    if !round_tripped
+                        && mirror_only_rewrite_detected(
+                            repo,
+                            source_tip,
+                            fetched_dest_tip,
+                            branch,
+                            state_key,
+                        )? =>
                 {
                     // decisions/0050 condition 5: a non-descendant local tip
                     // is only evidence source itself was rewritten when this
@@ -773,17 +922,43 @@ fn sync_pair_to_dest_with_key(
                     };
                     (rebuild_dest_tip, boundary)
                 }
-                None if round_tripped => anyhow::bail!(
-                    "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first)"
-                ),
-                // decisions/0045: per-branch halt for a discovered branch.
-                None => {
+                // decisions/0052 Part 2 (amends decisions/0045): a
+                // foreign newest mirror marker halts only this branch,
+                // configured or not.
+                Err(anchor::ResumeRefusal::ForeignNewestMirrorMarker {
+                    branch: foreign,
+                    marker,
+                }) => {
                     reporter.complete(
                         Outcome::Error,
                         branch,
                         Direction::SourceToDest,
                         round_tripped,
-                        Some(&unsafe_to_build_on_message(branch)),
+                        Some(&foreign_mirror_marker_message(
+                            branch,
+                            &foreign,
+                            marker,
+                            round_tripped,
+                        )),
+                    );
+                    return Ok(true);
+                }
+                Err(refusal) if round_tripped => anyhow::bail!(
+                    "gitprism sync: dest branch {branch:?} isn't at a point this clone can safely build on — either dest→source hasn't reflected its content into source yet, or this clone's {branch:?} is behind or diverged from what dest was last synced from (fetch/pull the latest source history first){}",
+                    refusal.inconclusive_note()
+                ),
+                // decisions/0045: per-branch halt for a discovered branch.
+                Err(refusal) => {
+                    reporter.complete(
+                        Outcome::Error,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&format!(
+                            "{}{}",
+                            unsafe_to_build_on_message(branch),
+                            refusal.inconclusive_note()
+                        )),
                     );
                     return Ok(true);
                 }
@@ -836,6 +1011,19 @@ fn sync_pair_to_dest_with_key(
                 // pre-pass could use the same boundary), so a branch with no
                 // marker at all reports this warning even where the older
                 // ordering would have recognized it as already merged.
+                DestAnchor::None if recreate => {
+                    reporter.complete(
+                        Outcome::Error,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&format!(
+                            "{branch:?} halted — no exact authenticated mapping on its \
+                             first-parent source history to recreate dest's {branch:?} from"
+                        )),
+                    );
+                    return Ok(true);
+                }
                 DestAnchor::None => {
                     reporter.complete(
                         Outcome::Warning,
@@ -920,12 +1108,60 @@ fn sync_pair_to_dest_with_key(
             return Ok(false);
         }
 
+        // decisions/0052 Part 1: after the policy check above has covered
+        // the original `boundary..source_tip` range, an existing ref whose
+        // pending commits another branch already projected reuses that
+        // projection instead of replaying a second copy.
+        let reuse = if dest_ref_exists && matches!(push_mode, PushMode::FastForwardOnly) {
+            reuse::plan_projection_reuse(
+                repo,
+                &run_cache.mapping_index,
+                &pending_for_policy_check,
+                boundary,
+                dest_tip,
+                branch,
+                state_key,
+            )?
+        } else {
+            ReusePlan::Replay
+        };
+        let (build_boundary, build_base, bridge) = match reuse {
+            ReusePlan::Replay => (boundary, dest_tip, None),
+            ReusePlan::Halt(diagnostic) => {
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::SourceToDest,
+                    round_tripped,
+                    Some(&format!("{branch:?} halted — {diagnostic}")),
+                );
+                return Ok(true);
+            }
+            ReusePlan::FastForward {
+                shared_source,
+                projection,
+            } => (shared_source, projection, None),
+            ReusePlan::Bridge {
+                shared_source,
+                projection,
+            } => {
+                let shared = repo
+                    .find_commit(shared_source)
+                    .context("resolving the shared source commit")?;
+                let bridge = build_bridge_commit(
+                    repo, config, dest_tip, projection, &shared, branch, state_key,
+                )?;
+                (shared_source, bridge, Some(bridge))
+            }
+        };
+        let reused = build_boundary != boundary;
+
         let build = build_pending_dest_tip(
             repo,
             config,
             exclude_list,
-            boundary,
-            dest_tip,
+            build_boundary,
+            build_base,
             source_tip,
             source_root,
             branch,
@@ -953,8 +1189,35 @@ fn sync_pair_to_dest_with_key(
         let force_rebuild = matches!(push_mode, PushMode::ForceMirrorOnly { .. });
         let new_dest_tip = match build.new_tip {
             Some(tip) => Some(tip),
+            // decisions/0052 Step 7: the accounting prefix names the shared
+            // source commit, never `source_tip`, so it can't certify suffix
+            // commits that were skipped or conflicted.
+            None if reused => Some(match bridge {
+                Some(bridge) => bridge,
+                None => {
+                    let shared = repo
+                        .find_commit(build_boundary)
+                        .context("resolving the shared source commit")?;
+                    let tree = repo
+                        .find_commit(build_base)
+                        .context("resolving the reused projection")?
+                        .tree_id();
+                    build_dest_commit(repo, config, build_base, &shared, tree, branch, state_key)?
+                }
+            }),
+            // decisions/0053: a conflict before anything was built must not
+            // certify `source_tip`, which includes the conflicted commit.
             None if force_rebuild || !dest_ref_exists => Some(branch_scoped_dest_tip(
-                repo, config, dest_tip, source_tip, branch, state_key,
+                repo,
+                config,
+                dest_tip,
+                if build.conflict.is_some() {
+                    boundary
+                } else {
+                    source_tip
+                },
+                branch,
+                state_key,
             )?),
             None => None,
         };
@@ -1029,7 +1292,24 @@ fn sync_pair_to_dest_with_key(
                             new_dest_tip,
                             state_key,
                         );
+                    } else if let Some(bridge) = bridge {
+                        // decisions/0052 Step 8: an intermediate bridge
+                        // under newly built commits.
+                        run_cache
+                            .mapping_index
+                            .record_pushed_dest_commit(repo, branch, bridge, state_key);
                     }
+                }
+                // decisions/0053: never retried into the normal resume path.
+                git::PushOutcome::RejectedRefMoved if push_mode == PushMode::CreateOnly => {
+                    reporter.complete(
+                        Outcome::Error,
+                        branch,
+                        Direction::SourceToDest,
+                        round_tripped,
+                        Some(&appeared_during_recreation_message(branch)),
+                    );
+                    return Ok(true);
                 }
                 git::PushOutcome::RejectedRefMoved if attempt < MAX_RACE_RETRIES => {
                     // dest's tip moved between fetch and push — refetch and
@@ -1112,6 +1392,108 @@ fn sync_pair_to_dest_with_key(
         );
         return Ok(false);
     }
+}
+
+/// decisions/0052 Step 9: the mapping index `run` would build, for a
+/// `resolve` invocation, which has no run-wide cache of its own.
+fn reconstruct_mapping_index_for_resolve(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    key: &marker::StateKey,
+) -> Result<mapping_index::MappingIndex> {
+    let dest_url = config.dest_url()?;
+    let (source_branches, _) = list_source_branches(repo)?;
+    let dest_listing = git::remote_branch_names(source_root, &dest_url)?;
+    git::fetch_heads_into_namespace(source_root, &dest_url, &dest_listing.names)?;
+    let mut run_cache = RunCache::default();
+    anchor::reconstruct_mapping_index(
+        repo,
+        source_root,
+        &dest_url,
+        &dest_listing,
+        &source_branches,
+        key,
+        &mut run_cache,
+    )
+}
+
+/// decisions/0052 Step 9, start: `None` when `resolve` may start, otherwise
+/// the reason it must not. Uses the same plan `sync` runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_start_reuse_refusal(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    key: &marker::StateKey,
+    pending: &[Oid],
+    boundary: Oid,
+    dest_tip: Oid,
+    branch: &str,
+) -> Result<Option<String>> {
+    let index = reconstruct_mapping_index_for_resolve(repo, source_root, config, key)?;
+    Ok(
+        match reuse::plan_projection_reuse(repo, &index, pending, boundary, dest_tip, branch, key)?
+        {
+            ReusePlan::Replay => None,
+            ReusePlan::FastForward { shared_source, .. }
+            | ReusePlan::Bridge { shared_source, .. } => Some(format!(
+                "source commit {shared_source} in {branch:?}'s pending range is already projected \
+                 to dest by another branch; run `gitprism sync`, which reuses that projection and \
+                 reports any conflict that remains"
+            )),
+            ReusePlan::Halt(diagnostic) => Some(format!("{branch:?} halted — {diagnostic}")),
+        },
+    )
+}
+
+/// decisions/0052 Step 9, finish: `None` when the resolution of
+/// `source_commit` may be pushed onto `dest_base`, otherwise why not.
+pub(crate) fn resolve_finish_reuse_refusal(
+    repo: &Repository,
+    source_root: &Path,
+    config: &Config,
+    key: &marker::StateKey,
+    source_commit: Oid,
+    dest_base: Oid,
+) -> Result<Option<String>> {
+    let index = reconstruct_mapping_index_for_resolve(repo, source_root, config, key)?;
+    Ok(
+        match reuse::classify_shared_mapping(repo, &index, source_commit, dest_base)? {
+            reuse::SharedMapping::None | reuse::SharedMapping::Contained => None,
+            reuse::SharedMapping::NotContained(projection) => Some(format!(
+                "source commit {source_commit} is now projected to dest as {projection} by \
+                 another branch"
+            )),
+            reuse::SharedMapping::Contradictory(diagnostic) => Some(diagnostic),
+        },
+    )
+}
+
+/// decisions/0052 Part 2; decisions/0053: a configured branch's deleted dest
+/// ref is recreated only with `--recreate-dest`.
+pub(crate) fn foreign_mirror_marker_message(
+    branch: &str,
+    foreign: &str,
+    marker: Oid,
+    round_tripped: bool,
+) -> String {
+    let remedy = if round_tripped {
+        format!(
+            "inspect and save any unimported dest content, delete dest's {branch:?}, then run \
+             `gitprism sync --recreate-dest <branch>` for {branch:?}"
+        )
+    } else {
+        format!(
+            "delete dest's {branch:?} branch; the next sync recreates it from the nearest \
+             exact mapping with a marker of its own"
+        )
+    };
+    format!(
+        "{branch:?} halted — the newest gitprism mirror marker on dest's {branch:?} line \
+         ({marker}) belongs to branch {foreign:?}, and gitprism doesn't resume a branch on \
+         another branch's projection; {remedy}"
+    )
 }
 
 /// decisions/0045: refusal text for a *discovered* branch. Unlike the
@@ -1505,9 +1887,60 @@ pub(crate) fn build_dest_commit(
     branch: &str,
     key: &marker::StateKey,
 ) -> Result<Oid> {
-    let parent_commit = repo
-        .find_commit(parent)
-        .context("resolving the dest chain's parent commit")?;
+    build_dest_commit_with_parents(
+        repo,
+        config,
+        &[parent],
+        source_commit,
+        filtered_tree_oid,
+        branch,
+        key,
+    )
+}
+
+/// decisions/0052 Step 7's bridge: parents `(dest_tip, projection)`, the
+/// projection's tree. The only producer of an authenticated two-parent
+/// `SourceToDest` commit; call it only after `reuse`'s proof passed.
+fn build_bridge_commit(
+    repo: &Repository,
+    config: &Config,
+    dest_tip: Oid,
+    projection: Oid,
+    shared_source: &git2::Commit,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Oid> {
+    let tree = repo
+        .find_commit(projection)
+        .context("resolving the reused projection")?
+        .tree_id();
+    build_dest_commit_with_parents(
+        repo,
+        config,
+        &[dest_tip, projection],
+        shared_source,
+        tree,
+        branch,
+        key,
+    )
+}
+
+fn build_dest_commit_with_parents(
+    repo: &Repository,
+    config: &Config,
+    parents: &[Oid],
+    source_commit: &git2::Commit,
+    filtered_tree_oid: Oid,
+    branch: &str,
+    key: &marker::StateKey,
+) -> Result<Oid> {
+    let parent_commits = parents
+        .iter()
+        .map(|parent| {
+            repo.find_commit(*parent)
+                .context("resolving the dest chain's parent commit")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let tree = repo
         .find_tree(filtered_tree_oid)
         .context("reading the filtered tree")?;
@@ -1519,7 +1952,7 @@ pub(crate) fn build_dest_commit(
         branch,
         source_commit.id(),
         "Gitprism-Source-Commit",
-        &[parent],
+        parents,
         tree.id(),
         &source_commit.author(),
         &committer,
@@ -1532,7 +1965,7 @@ pub(crate) fn build_dest_commit(
         &committer,
         &message,
         &tree,
-        &[&parent_commit],
+        &parent_commits.iter().collect::<Vec<_>>(),
     )
     .with_context(|| {
         format!(
@@ -1547,21 +1980,21 @@ pub(crate) fn build_dest_commit(
 /// recognizes it for *this* branch, otherwise a content-empty marker commit
 /// on top of it. An inherited anchor carries another branch's marker, so the
 /// branch gets its own content-empty marker when branch accounting requires
-/// it.
+/// it. `source` is the source commit the marker names.
 fn branch_scoped_dest_tip(
     repo: &Repository,
     config: &Config,
     dest_tip: Oid,
-    source_tip: Oid,
+    source: Oid,
     branch: &str,
     key: &marker::StateKey,
 ) -> Result<Oid> {
-    if anchor::dest_tip_is_accounted_for(repo, source_tip, dest_tip, branch, key)? {
+    if anchor::dest_tip_is_accounted_for(repo, source, dest_tip, branch, key)? {
         return Ok(dest_tip);
     }
     let source_commit = repo
-        .find_commit(source_tip)
-        .context("resolving source's tip for a branch-scoped marker commit")?;
+        .find_commit(source)
+        .context("resolving the source commit for a branch-scoped marker commit")?;
     let tree_id = repo
         .find_commit(dest_tip)
         .context("resolving dest's anchor commit for a branch-scoped marker commit")?
@@ -1578,6 +2011,7 @@ fn branch_scoped_dest_tip(
 /// reported with enough detail for `gitprism resolve` (decisions/0008) to act
 /// on later — no trailer is written for the unresolved commit, so the next
 /// run's resume-scan naturally retries it once it's resolved.
+#[allow(clippy::too_many_arguments)]
 fn sync_pair_from_dest_with_key(
     repo: &Repository,
     source_root: &Path,
@@ -1586,7 +2020,8 @@ fn sync_pair_from_dest_with_key(
     reporter: &Reporter,
     state_key: &marker::StateKey,
     dest_listing: &git::RemoteBranchListing,
-) -> Result<()> {
+    recreate: bool,
+) -> Result<DestToSourceOutcome> {
     git::validate_branch_name(branch)
         .with_context(|| format!("validating configured branch {branch:?}"))?;
     let dest_url = config.dest_url()?;
@@ -1598,9 +2033,10 @@ fn sync_pair_from_dest_with_key(
         // `sync_pair_to_dest`'s own `remote_ref_exists` check), there is no
         // legitimate reason for it to have no ref on dest at all — `gitprism
         // setup` (decisions/0006) always grafts every round-tripped branch.
-        // Checked so a deleted dest ref fails with a clear, gitprism-authored
-        // message (decisions/0018) instead of git's own raw "couldn't find
-        // remote ref" subprocess error aborting the run. decisions/0049:
+        // Checked so a deleted dest ref halts this branch with a clear,
+        // gitprism-authored message (decisions/0018, amended by
+        // decisions/0053) instead of git's own raw "couldn't find remote
+        // ref" subprocess error aborting the run. decisions/0049:
         // existence comes from `run`'s own upfront listing whenever it can
         // establish absence; only when the branch-limit horizon blocks that
         // claim (decisions/0047) is a live `remote_ref_exists` check made.
@@ -1612,10 +2048,45 @@ fn sync_pair_from_dest_with_key(
         } else {
             git::remote_ref_exists(source_root, &dest_url, branch)?
         };
-        if !dest_ref_exists {
-            anyhow::bail!(
-                "gitprism sync: round-tripped branch {branch:?} has no ref on dest anymore — source and dest are out of sync (a round-tripped branch's dest ref should never be deleted); investigate before syncing again"
-            );
+        // decisions/0053: per-branch outcomes, never recreated implicitly.
+        // The listing only chooses the attempt; `PushMode::CreateOnly`
+        // enforces absence at push time.
+        match (dest_ref_exists, recreate) {
+            (true, false) => {}
+            (false, false) => {
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::DestToSource,
+                    true,
+                    Some(&missing_configured_dest_ref_message(branch)),
+                );
+                return Ok(DestToSourceOutcome::Halted);
+            }
+            (false, true) => {
+                reporter.complete(
+                    Outcome::Skipped,
+                    branch,
+                    Direction::DestToSource,
+                    true,
+                    Some("dest ref absent, recreating on request"),
+                );
+                return Ok(DestToSourceOutcome::Recreating);
+            }
+            (true, true) => {
+                reporter.complete(
+                    Outcome::Error,
+                    branch,
+                    Direction::DestToSource,
+                    true,
+                    Some(&format!(
+                        "{branch:?} halted — `--recreate-dest` applies only to an absent dest \
+                         ref, and dest's {branch:?} exists; rerun without the flag to import \
+                         and resume"
+                    )),
+                );
+                return Ok(DestToSourceOutcome::Halted);
+            }
         }
 
         reporter.step(
@@ -1826,7 +2297,7 @@ fn sync_pair_from_dest_with_key(
                 .is_none()
                 .then_some("nothing new to reflect back into source"),
         );
-        return Ok(());
+        return Ok(DestToSourceOutcome::Synced);
     }
 }
 

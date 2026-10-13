@@ -2462,12 +2462,12 @@ fn run_does_not_pull_back_independent_content_from_a_non_configured_branch() {
 }
 
 #[test]
-fn run_fails_clearly_when_a_round_tripped_branchs_dest_ref_is_deleted() {
-    // decisions/0018, Case 1: a round-tripped branch (config.branches) always
-    // has a dest ref — gitprism's own `setup` grafted it — so it going missing
-    // is a real error, not a routine "first sync" case. Before the fix,
-    // `sync_pair_from_dest` fetched unconditionally and let git's own raw
-    // "couldn't find remote ref" error leak through.
+fn run_halts_a_round_tripped_branch_whose_dest_ref_is_deleted() {
+    // decisions/0018, Case 1, as amended by decisions/0053: a round-tripped
+    // branch (config.branches) always has a dest ref — gitprism's own `setup`
+    // grafted it — so it going missing halts that branch with a clear
+    // message instead of git's raw "couldn't find remote ref" error, and is
+    // never recreated without `--recreate-dest`.
     let dest_dir = tempdir().unwrap();
     let dest_repo = Repository::init_bare(dest_dir.path()).unwrap();
     let dest_tip = bare_repo_with_a_commit_on(dest_dir.path(), "main", &[("shared.txt", "v1")]);
@@ -2488,20 +2488,22 @@ fn run_fails_clearly_when_a_round_tripped_branchs_dest_ref_is_deleted() {
         .unwrap();
 
     let config = write_config("unused", &dest_dir.path().display().to_string(), &["main"]);
-    let err = run(source_dir.path(), config.path()).expect_err(
-        "a round-tripped branch whose dest ref has vanished must fail clearly, not panic through on git's own raw fetch error",
-    );
+    let err = run(source_dir.path(), config.path())
+        .expect_err("a round-tripped branch whose dest ref has vanished must halt");
 
     let message = format!("{err:#}");
     assert!(
-        message.contains("main") && message.contains("out of sync"),
-        "the error should be gitprism's own clear, actionable message naming the \
-         affected branch and explaining that source/dest are out of sync: {message}"
+        message.contains("one or more branches halted"),
+        "a per-branch halt, reported after every branch ran: {message}"
     );
     assert!(
         !message.contains("git fetch"),
-        "the fix must check existence *before* ever attempting the fetch, so the \
-         raw git-fetch failure text must never appear: {message}"
+        "existence is checked *before* ever attempting the fetch, so the raw \
+         git-fetch failure text must never appear: {message}"
+    );
+    assert!(
+        dest_repo.find_reference("refs/heads/main").is_err(),
+        "the configured ref must not be recreated without --recreate-dest"
     );
 }
 

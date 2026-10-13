@@ -24,9 +24,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Setup => {
             commands::setup::run_with(Path::new("."), &cli.config, &commands::EnvSecrets)
         }
-        Commands::Sync => {
-            commands::sync::run_with(Path::new("."), &cli.config, &commands::EnvSecrets)
-        }
+        Commands::Sync { recreate_dest } => commands::sync::run_with_options(
+            Path::new("."),
+            &cli.config,
+            &commands::EnvSecrets,
+            &commands::sync::SyncOptions::new(recreate_dest.iter().cloned()),
+        ),
         Commands::Resolve {
             branch,
             direction,

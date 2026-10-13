@@ -137,6 +137,18 @@ impl MappingIndex {
         Ok(())
     }
 
+    /// Whether reconstruction or this run observed any mapping for `source`
+    /// (decisions/0052 Step 1), regardless of whether it resolves.
+    pub(crate) fn has_entry(&self, source: Oid) -> bool {
+        self.entries.contains_key(&source)
+    }
+
+    /// decisions/0046 resolution for one exact source commit, with no
+    /// branch excluded.
+    pub(crate) fn resolve_exact(&self, repo: &Repository, source: Oid) -> Result<MappingLookup> {
+        self.resolve_for_anchor(repo, source, None)
+    }
+
     #[cfg(test)]
     pub(crate) fn resolve(
         &self,

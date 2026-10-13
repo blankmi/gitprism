@@ -415,8 +415,8 @@ fn run_fails_clearly_against_a_completely_empty_dest_repo() {
         .expect_err("a round-tripped branch missing from a completely empty dest must fail");
     let message = format!("{error:#}");
     assert!(
-        message.contains("has no ref on dest anymore"),
-        "expected the missing-dest-ref rejection, got: {message}"
+        message.contains("one or more branches halted"),
+        "expected the missing-dest-ref halt (decisions/0053), got: {message}"
     );
 }
 
