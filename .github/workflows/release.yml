@@ -72,6 +72,16 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
 
+  dependency-policy:
+    name: Dependency policy
+    needs: verify-tag
+    permissions:
+      contents: read
+      checks: write
+    uses: ./.github/workflows/dependency-policy.yml
+    with:
+      ref: ${{ needs.verify-tag.outputs.commit }}
+
   build:
     name: Build ${{ matrix.name }}
     needs: verify-tag
@@ -164,6 +174,7 @@ jobs:
     name: Publish release
     needs:
       - verify-tag
+      - dependency-policy
       - build
     runs-on: ubuntu-latest
     permissions:
