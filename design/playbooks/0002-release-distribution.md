@@ -47,5 +47,9 @@ archives, generates `SHA256SUMS`, creates one draft release with all archives
 and the checksum file, and publishes the release after the assets are present.
 A first tagged release still needs to be run and inspected by an operator.
 
+Publication requires the dependency policy (RustSec audit and cargo-deny) to
+pass on the tagged commit; the release workflow runs it and does not publish
+on failure. Tag only from a `main` commit whose CI run succeeded.
+
 Installer and package-manager integrations are optional and are not release
 blockers under this policy.
