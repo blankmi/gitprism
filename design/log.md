@@ -3458,3 +3458,27 @@ on the final files: `cargo test --workspace --all-features --locked` (463 unit
 + 4 CLI), `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets --all-features --locked -- -D warnings` and `git diff --check`
 all pass.
+
+## 2026-10-30 — SEC-001: dependency advisories and release gate
+
+[RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385.html)
+(`ctutils` < 0.4.4, via `digest` ← `hmac`/`sha2`) affected v0.1.9–v0.1.11.
+[RUSTSEC-2026-0418](https://rustsec.org/advisories/RUSTSEC-2026-0418.html)
+(`libz-sys` ≤ 1.1.30, via `libgit2-sys` ← `git2`) affected v0.1.0–v0.1.11.
+Fixed by `ctutils` 0.4.7 (#31) and `libz-sys` 1.1.31 (#32), released in
+v0.1.12; release notes of v0.1.0–v0.1.11 point to it. Tags and artifacts are
+unchanged.
+
+`ctutils`: marker authentication uses `HmacSha256::verify_slice`
+(decision 0025). Source inspection does not show that path reaching the
+advisory's affected operations, and no usable side channel has been
+demonstrated; no key rotation or mapping-history change. `libz-sys`: the
+environment leak requires `cc` ≥ 1.6.0; every release locked `cc` 1.4.2 and
+CI does not cache `target/`.
+
+v0.1.11 was tagged while CI on `main` was failing the audit. `release.yml` now
+runs the reusable `dependency-policy.yml` (RustSec audit and cargo-deny) on the
+tagged commit and `publish` depends on it (#33); a dispatched release of
+v0.1.11 failed the gate and skipped `publish`. Playbook 0002 "Publication"
+updated. Decision 0025 unchanged. Plan:
+`docs/plans/2026-10-29/SEC-001-ctutils-rustsec-2026-0385.md`.
