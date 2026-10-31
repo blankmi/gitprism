@@ -7,7 +7,7 @@
 | Effort | Small |
 | Decision required | No — dependency bump and release operations; playbook 0002 changes |
 | Depends on | — |
-| Status | In progress: step 1 merged (#31); RUSTSEC-2026-0418 fixed (#32) |
+| Status | Done 2026-10-30: #31, #32, #33, v0.1.12, release notes, design log |
 
 ## Problem
 
