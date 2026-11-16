@@ -91,7 +91,7 @@ jobs:
       matrix:
         include:
           - name: Linux x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
           - name: macOS arm64
@@ -133,6 +133,17 @@ jobs:
       - name: Smoke-test binary
         shell: bash
         run: ./target/${{ matrix.target }}/release/gitprism${{ matrix.archive == 'zip' && '.exe' || '' }} --version
+
+      - name: Verify Linux binary needs only baseline x86-64
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$(readelf -n target/${{ matrix.target }}/release/gitprism)"
+          if grep -E 'x86 ISA needed:.*x86-64-v[234]' <<<"$notes"; then
+            echo "::error::binary requires an x86-64 ISA level above baseline"
+            exit 1
+          fi
 
       - name: Package Unix archive
         if: matrix.archive == 'tar.gz'
